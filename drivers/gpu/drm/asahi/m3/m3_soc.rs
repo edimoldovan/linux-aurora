@@ -6,6 +6,8 @@
 //! facts the M3 boundary carries; the register windows, memory layout, firmware images and
 //! admission of the full table stay with the M3 runtime port. Nothing here is read by a probe.
 
+use super::m3_compute_layout::RegisterSet;
+
 /// The HwDataB words of the runtime backend's InitData that are neither its GPU VA layout nor
 /// device-tree values: configuration words where the manager layout keeps 0 or its validated
 /// values (including the A/B pair +0xa98/+0xb40 at 0), and the two unit masks. They are values
@@ -35,6 +37,8 @@ pub(crate) struct Soc {
     pub(crate) name: &'static str,
     /// The runtime InitData's HwDataB configuration words and unit masks.
     pub(crate) hwdata_b: Option<&'static G15RuntimeHwDataB>,
+    /// The register lists the GPU's firmware expects in compute and render commands.
+    pub(crate) registers: RegisterSet,
 }
 
 /// The HwDataB configuration words and unit masks of the T6030 runtime InitData, as checked on
@@ -63,10 +67,12 @@ pub(crate) static SOCS: [&Soc; 2] = [&T6030, &T8122];
 pub(crate) static T6030: Soc = Soc {
     name: "T6030",
     hwdata_b: Some(&T6030_HWDATA_B),
+    registers: RegisterSet::G15S,
 };
 
 /// T8122 (M3, G15G): one die, one cluster of ten core slots (eight or ten of them active).
 pub(crate) static T8122: Soc = Soc {
     name: "T8122",
     hwdata_b: None,
+    registers: RegisterSet::G15G,
 };
