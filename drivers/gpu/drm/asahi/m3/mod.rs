@@ -2,6 +2,9 @@
 
 //! Compile-only M3 backend. No firmware or memory owner is constructed here.
 
+// All imported modules are type-checked; live startup stays gated.
+#![allow(dead_code)]
+
 use kernel::{device::Core, platform, prelude::*};
 
 #[derive(Clone, Copy)]
@@ -29,3 +32,35 @@ pub(crate) fn refuse_probe(pdev: &platform::Device<Core<'_>>, chip: Chip) -> Err
     }
     ENODEV
 }
+
+mod m3_compute_layout;
+
+mod m3_compute_sequence;
+
+mod m3_compute_storage;
+
+mod m3_coverage;
+
+mod m3_init_layout;
+
+mod m3_init_storage;
+
+mod m3_parameter_layout;
+
+mod m3_pass_layout;
+
+mod m3_pool_layout;
+
+mod m3_queue_layout;
+
+mod m3_render_sequence;
+
+mod m3_scene_layout;
+
+mod m3_shared_layout;
+
+mod m3_state_layout;
+
+mod m3_sync_layout;
+
+mod m3_thermal_policy;

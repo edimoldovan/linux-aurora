@@ -38,23 +38,6 @@ pub(crate) mod fragment {
 }
 fn word(out: &mut [u8], off: usize, value: u32) { out[off..off+4].copy_from_slice(&value.to_le_bytes()); }
 fn pointer(out: &mut [u8], off: usize, value: u64) { out[off..off+8].copy_from_slice(&value.to_le_bytes()); }
-/// The stage's work command owns its sequence-length field.
-pub(crate) fn command_length_offset(fragment:bool)->usize {
-    if fragment {super::m3_command_layout::FRAGMENT_SEQUENCE_LENGTH}
-    else {super::m3_command_layout::TILER_SEQUENCE_LENGTH}
-}
-/// Omit measurement packets while retaining engine-idle, finalization and End.
-/// Finalize's relative restart displacement follows its compacted location.
-fn without_timestamps(out:&mut[u8],start:usize,finalize:usize,length:usize,restart:usize)->usize {
-    let next=start+4;
-    let removed=finalize-next;
-    out.copy_within(finalize..length,next);
-    word(out,start,1);
-    word(out,next+restart,(-(next as i32)) as u32);
-    let length=length-removed;
-    out[length..STORAGE].fill(0);
-    length
-}
 /// Resources common to both stages; command, sequence and scene are per-pass.
 /// Stats and notifier belong to Config / Render for the entire submission.
 #[derive(Clone, Copy)]
@@ -91,9 +74,6 @@ pub(crate) struct Tiler {pub(crate) owners:Owners,pub(crate) scratch:FirmwareVa}
 impl Tiler {
     /// Validate every referenced subobject before changing output bytes.
     pub(crate) fn encode(&self,out:&mut[u8])->Result<(),Error> {
-        self.encode_timestamps(out,true).map(|_|())
-    }
-    pub(crate) fn encode_timestamps(&self,out:&mut[u8],timed:bool)->Result<usize,Error> {
         use ta::*;
         let o=self.owners;
         if out.len()<STORAGE {return Err(Error::Size);}
@@ -127,7 +107,7 @@ impl Tiler {
         word(bytes,FINALIZE+0x4c,o.stamp);
         word(bytes,FINALIZE+0x7c,(-(FINALIZE as i32)) as u32);
         word(bytes,LENGTH-4,0x40000002); // End, qualified completion flag
-        Ok(if timed {LENGTH} else {without_timestamps(bytes,TIMESTAMP_START,FINALIZE,LENGTH,0x7c)})
+        Ok(())
     }
 }
 pub(crate) struct Fragment {
@@ -138,9 +118,6 @@ pub(crate) struct Fragment {
 }
 impl Fragment {
     pub(crate) fn encode(&self,out:&mut[u8])->Result<(),Error> {
-        self.encode_timestamps(out,true).map(|_|())
-    }
-    pub(crate) fn encode_timestamps(&self,out:&mut[u8],timed:bool)->Result<usize,Error> {
         use fragment::*;
         let o=self.owners;
         if out.len()<STORAGE {return Err(Error::Size);}
@@ -181,6 +158,6 @@ impl Fragment {
         word(bytes,FINALIZE+0xa4,(-(FINALIZE as i32)) as u32);
         word(bytes,FINALIZE+0xa8,1); // unk_98
         word(bytes,LENGTH-4,0x40000002);
-        Ok(if timed {LENGTH} else {without_timestamps(bytes,TIMESTAMP_START,FINALIZE,LENGTH,0xa4)})
+        Ok(())
     }
 }
