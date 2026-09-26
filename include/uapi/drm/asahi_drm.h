@@ -260,6 +260,24 @@ enum drm_asahi_feature {
 	DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES = (1UL) << 2,
 
 	/**
+	 * @DRM_ASAHI_FEATURE_SCHEDULED_QUEUES: Separate software queue timelines.
+	 * Each DRM queue owns a scheduler entity. An unresolved dependency on
+	 * one queue does not block ready jobs on another queue. Physical GPU
+	 * execution may be serialized; no concurrent hardware engines or
+	 * reserved contexts are promised. QUEUE_CREATE allocates host-side
+	 * scheduling state and may fail for memory exhaustion. This feature
+	 * alone does not imply the hardware QUEUE_LIMITS query is available.
+	 */
+	DRM_ASAHI_FEATURE_SCHEDULED_QUEUES = (1UL) << 3,
+
+	/** @DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY: Render commands may request
+	 * fragment-only dependencies with DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY.
+	 */
+	DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY = (1UL) << 6,
+
+	DRM_ASAHI_FEATURE_COMPUTE_WIDE_VISIBILITY = (1UL) << 8,
+
+	/**
 	 * @DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS: Every hardware command of
 	 * a submission waits for all of the submission's input syncs, including
 	 * their errors, so independent commands need no extra dependency on the
@@ -1047,6 +1065,17 @@ enum drm_asahi_render_flags {
 	DRM_ASAHI_RENDER_RSRC_SPEC_HI = (1U << 4),
 
 	/**
+	 * @DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY: The preceding render's results
+	 * are needed only by fragment processing, not tiling/vertex processing.
+	 * The kernel may overlap tiling with an immediately preceding render
+	 * in the same submitted packet. Fragment order is retained. Compute,
+	 * packet boundaries and timestamp-start dependencies remain ordered.
+	 * Requires DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY. Userspace must retain
+	 * the normal header barriers; this flag changes only their stage scope.
+	 */
+	DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY = (1U << 5),
+
+	/**
 	 * @DRM_ASAHI_RENDER_DBIAS_IS_INT: Use integer depth bias formula.
 	 *
 	 * Graphics specifications contain two alternate formulas for depth
@@ -1480,7 +1509,7 @@ struct drm_asahi_cmd_render {
  * single compute command, although timestamps are at command granularity.
  */
 struct drm_asahi_cmd_compute {
-	/** @flags: MBZ */
+	/** @flags: Combination of drm_asahi_compute_flags. */
 	__u32 flags;
 
 	/** @sampler_count: Number of samplers in the sampler heap. */
@@ -1549,6 +1578,19 @@ struct drm_asahi_cmd_compute {
 	__u64 intersection_default_program;
 	/** @intersection_default_control: Default G17P program control word. */
 	__u64 intersection_default_control;
+};
+
+/**
+ * enum drm_asahi_compute_flags - Compute command flags
+ */
+enum drm_asahi_compute_flags {
+	/**
+	 * @DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF: Reserved. This kernel rejects
+	 * compute commands that set it.
+	 */
+	DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF = (1L << 0),
+
+	DRM_ASAHI_COMPUTE_WIDE_VISIBILITY = (1L << 1),
 };
 
 /**
