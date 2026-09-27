@@ -41,7 +41,6 @@ use crate::{
     },
     file,
     mmu,
-    util::*, //
 };
 
 const DEBUG_CLASS: DebugFlags = DebugFlags::Gem;
@@ -227,10 +226,21 @@ pub(crate) fn new_kernel_object_wc(dev: &AsahiDrmDevice, size: usize) -> Result<
     new_kernel_object_mapped(dev, size, true)
 }
 
+/// Validate before rounding: wrapping a user size can create a much smaller
+/// backing than requested (or panic with overflow checks). Kernel callers use
+/// the same boundary so malformed calculated sizes cannot bypass this check.
+fn checked_object_size(size: usize) -> Result<usize> {
+    if size == 0 { return Err(EINVAL); }
+    size.checked_add(mmu::UAT_PGMSK)
+        .map(|rounded| rounded & !mmu::UAT_PGMSK)
+        .ok_or(EOVERFLOW)
+}
+
+
 fn new_kernel_object_mapped(dev: &AsahiDrmDevice, size: usize, map_wc: bool) -> Result<ObjectRef> {
     let gem = shmem::Object::<AsahiObject>::new(
         dev,
-        align(size, mmu::UAT_PGSZ),
+        checked_object_size(size)?,
         shmem::ObjectConfig::<AsahiObject> {
             reclaimable_cpu_mappings: false,
             map_wc,
@@ -263,7 +273,7 @@ pub(crate) fn new_object(
 
     let gem = shmem::Object::<AsahiObject>::new(
         dev,
-        align(size, mmu::UAT_PGSZ),
+        checked_object_size(size)?,
         shmem::ObjectConfig::<AsahiObject> {
             reclaimable_cpu_mappings: parent_object.is_some() && reclaim_cpu,
             map_wc: flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_WRITEBACK == 0,
