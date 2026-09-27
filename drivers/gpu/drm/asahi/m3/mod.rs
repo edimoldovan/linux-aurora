@@ -64,3 +64,5 @@ mod m3_state_layout;
 mod m3_sync_layout;
 
 mod m3_thermal_policy;
+
+mod agx_host_progress;
