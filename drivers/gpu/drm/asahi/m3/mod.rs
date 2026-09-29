@@ -68,3 +68,5 @@ mod m3_thermal_policy;
 mod agx_host_progress;
 
 mod agx_memory_stats;
+
+mod agx_timing_stats;
