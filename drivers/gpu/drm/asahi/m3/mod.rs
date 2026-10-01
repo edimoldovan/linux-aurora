@@ -70,3 +70,5 @@ mod agx_host_progress;
 mod agx_memory_stats;
 
 mod agx_timing_stats;
+
+mod m3_timeline;
