@@ -46,11 +46,11 @@ pub(crate) struct AsahiPlatformDriverData<'bound> {
     _reg: drm::Registration<'bound, AsahiDrmDriver>,
 }
 
-/// Holds a reference to the top-level `GpuManager` object.
+/// Holds a reference to the top-level GPU object.
 #[pin_data]
 pub(crate) struct AsahiDrmRegistrationData<'drm> {
     #[pin]
-    pub(crate) gpu: Arc<dyn gpu::GpuManager>,
+    pub(crate) gpu: Arc<dyn gpu::Gpu>,
     pub(crate) resources: regs::Resources<'drm>,
 }
 
@@ -180,19 +180,19 @@ impl platform::Driver for AsahiPlatformDriver {
 
         let gpu = match (cfg.gpu_gen, cfg.gpu_variant, compat.as_slice()) {
             (hw::GpuGen::G13, _, &[12, 3, 0]) => {
-                gpu::GpuManagerG13V12_3::new(&drm, &resources, cfg)? as Arc<dyn gpu::GpuManager>
+                gpu::GpuManagerG13V12_3::new(&drm, &resources, cfg)? as Arc<dyn gpu::Gpu>
             }
             (hw::GpuGen::G14, hw::GpuVariant::G, &[12, 4, 0]) => {
-                gpu::GpuManagerG14V12_4::new(&drm, &resources, cfg)? as Arc<dyn gpu::GpuManager>
+                gpu::GpuManagerG14V12_4::new(&drm, &resources, cfg)? as Arc<dyn gpu::Gpu>
             }
             (hw::GpuGen::G13, _, &[13, 5, 0]) => {
-                gpu::GpuManagerG13V13_5::new(&drm, &resources, cfg)? as Arc<dyn gpu::GpuManager>
+                gpu::GpuManagerG13V13_5::new(&drm, &resources, cfg)? as Arc<dyn gpu::Gpu>
             }
             (hw::GpuGen::G14, hw::GpuVariant::G, &[13, 5, 0]) => {
-                gpu::GpuManagerG14V13_5::new(&drm, &resources, cfg)? as Arc<dyn gpu::GpuManager>
+                gpu::GpuManagerG14V13_5::new(&drm, &resources, cfg)? as Arc<dyn gpu::Gpu>
             }
             (hw::GpuGen::G14, _, &[13, 5, 0]) => {
-                gpu::GpuManagerG14XV13_5::new(&drm, &resources, cfg)? as Arc<dyn gpu::GpuManager>
+                gpu::GpuManagerG14XV13_5::new(&drm, &resources, cfg)? as Arc<dyn gpu::Gpu>
             }
             _ => {
                 dev_info!(
