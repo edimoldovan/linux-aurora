@@ -87,7 +87,6 @@ use crate::{
     },
     fw,
     gem,
-    hw,
     mem,
     pgtable,
     slotalloc,
@@ -101,10 +100,9 @@ pub(crate) use pgtable::{
     UatPageTable,
     UAT_PGBIT,
     UAT_PGMSK,
-    UAT_PGSZ, //
+    UAT_PGSZ,
+    UAT_TOP_LEVEL_SHIFT, //
 };
-
-use pgtable::UAT_IAS;
 
 use pin_init;
 
@@ -122,28 +120,54 @@ const UAT_USER_CTX: usize = UAT_NUM_CTX - UAT_USER_CTX_START;
 
 /// Lower/user base VA
 pub(crate) const IOVA_USER_BASE: u64 = UAT_PGSZ as u64;
-/// Lower/user top VA
-pub(crate) const IOVA_USER_TOP: u64 = 1 << (UAT_IAS as u64);
-/// Lower/user VA range
-pub(crate) const IOVA_USER_RANGE: Range<u64> = IOVA_USER_BASE..IOVA_USER_TOP;
 
-/// Upper/kernel base VA
-// const IOVA_TTBR1_BASE: usize = 0xffffff8000000000;
-/// Driver-managed kernel base VA
-const IOVA_KERN_BASE: u64 = 0xffffffa000000000;
-/// Driver-managed kernel top VA
-const IOVA_KERN_TOP: u64 = 0xffffffb000000000;
-/// Lower/user VA range
-const IOVA_KERN_RANGE: Range<u64> = IOVA_KERN_BASE..IOVA_KERN_TOP;
+/// Top-level page table entry of the upper half that holds the driver-managed kernel VA range.
+const IOVA_KERN_TOP_LEVEL_INDEX: u64 = 2;
 
 const TTBR_VALID: u64 = 0x1; // BIT(0)
 const TTBR_ASID_SHIFT: usize = 48;
 
-/// Address of a special dummy page?
-//const IOVA_UNK_PAGE: u64 = 0x6f_ffff8000;
-pub(crate) const IOVA_UNK_PAGE: u64 = IOVA_USER_TOP - 2 * UAT_PGSZ as u64;
-/// User VA range excluding the unk page
-pub(crate) const IOVA_USER_USABLE_RANGE: Range<u64> = IOVA_USER_BASE..IOVA_UNK_PAGE;
+/// UAT address space geometry of a given SoC.
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct UatGeometry {
+    /// Input address bits translated by each page table root.
+    pub(crate) ias: u32,
+    /// Output (physical) address bits.
+    pub(crate) oas: u32,
+}
+
+impl UatGeometry {
+    /// Lower/user top VA
+    const fn user_top(&self) -> u64 {
+        1 << self.ias
+    }
+
+    /// Lower/user VA range
+    pub(crate) const fn user_range(&self) -> Range<u64> {
+        IOVA_USER_BASE..self.user_top()
+    }
+
+    /// Address of a special dummy page?
+    pub(crate) const fn unk_page(&self) -> u64 {
+        self.user_top() - 2 * UAT_PGSZ as u64
+    }
+
+    /// User VA range excluding the unk page
+    pub(crate) const fn user_usable_range(&self) -> Range<u64> {
+        IOVA_USER_BASE..self.unk_page()
+    }
+
+    /// Upper/kernel base VA
+    const fn upper_base(&self) -> u64 {
+        !(self.user_top() - 1)
+    }
+
+    /// Driver-managed kernel VA range
+    pub(crate) const fn kernel_range(&self) -> Range<u64> {
+        let start = self.upper_base() + (IOVA_KERN_TOP_LEVEL_INDEX << UAT_TOP_LEVEL_SHIFT);
+        start..(start + (1 << UAT_TOP_LEVEL_SHIFT))
+    }
+}
 
 /// A pre-allocated memory region for UAT management
 struct UatRegion {
@@ -910,7 +934,7 @@ impl UatInner {
 /// Top-level UAT manager object
 pub(crate) struct Uat {
     dev: driver::AsahiDevRef,
-    cfg: &'static hw::HwConfig,
+    geometry: UatGeometry,
 
     inner: Arc<UatInner>,
     slots: slotalloc::SlotAllocator<SlotInner>,
@@ -1048,7 +1072,7 @@ impl Vm {
         dev: driver::AsahiDevice,
         uat_inner: Arc<UatInner>,
         kernel_range: Range<u64>,
-        cfg: &'static hw::HwConfig,
+        geometry: UatGeometry,
         ttb: Option<PhysicalAddr>,
         id: u64,
     ) -> Result<Vm> {
@@ -1056,15 +1080,15 @@ impl Vm {
         let is_kernel = ttb.is_some();
 
         let page_table = if let Some(ttb) = ttb {
-            UatPageTable::new_with_ttb(ttb, IOVA_KERN_RANGE, cfg.uat_oas)?
+            UatPageTable::new_with_ttb(ttb, geometry.kernel_range(), geometry.ias, geometry.oas)?
         } else {
-            UatPageTable::new(cfg.uat_oas)?
+            UatPageTable::new(geometry.ias, geometry.oas)?
         };
 
         let (va_range, gpuvm_range) = if is_kernel {
-            (IOVA_KERN_RANGE, kernel_range.clone())
+            (geometry.kernel_range(), kernel_range.clone())
         } else {
-            (IOVA_USER_RANGE, IOVA_USER_USABLE_RANGE)
+            (geometry.user_range(), geometry.user_usable_range())
         };
 
         let mm = mm::Allocator::new(va_range.start, va_range.range(), ())?;
@@ -1609,10 +1633,15 @@ impl Uat {
             self.dev.clone(),
             self.inner.clone(),
             kernel_range,
-            self.cfg,
+            self.geometry,
             None,
             id,
         )
+    }
+
+    /// Returns the address space geometry of this UAT.
+    pub(crate) fn geometry(&self) -> UatGeometry {
+        self.geometry
     }
 
     /// Creates the reference-counted inner data for a new `Uat` instance.
@@ -1646,11 +1675,11 @@ impl Uat {
         )
     }
 
-    /// Creates a new `Uat` instance given the relevant hardware config.
+    /// Creates a new `Uat` instance for the given address space geometry.
     #[inline(never)]
     pub(crate) fn new(
         dev: driver::AsahiDevice,
-        cfg: &'static hw::HwConfig,
+        geometry: UatGeometry,
         map_kernel_to_user: bool,
     ) -> Result<Self> {
         dev_info!(dev.as_ref(), "MMU: Initializing...\n");
@@ -1668,12 +1697,19 @@ impl Uat {
         }
 
         dev_info!(dev.as_ref(), "MMU: Creating kernel page tables\n");
-        let kernel_lower_vm = Vm::new(dev.clone(), inner.clone(), IOVA_USER_RANGE, cfg, None, 1)?;
+        let kernel_lower_vm = Vm::new(
+            dev.clone(),
+            inner.clone(),
+            geometry.user_range(),
+            geometry,
+            None,
+            1,
+        )?;
         let kernel_vm = Vm::new(
             dev.clone(),
             inner.clone(),
-            IOVA_KERN_RANGE,
-            cfg,
+            geometry.kernel_range(),
+            geometry,
             Some(ttb1),
             0,
         )?;
@@ -1684,7 +1720,7 @@ impl Uat {
 
         let uat = Self {
             dev: dev.clone(),
-            cfg,
+            geometry,
             kernel_vm,
             kernel_lower_vm,
             inner,

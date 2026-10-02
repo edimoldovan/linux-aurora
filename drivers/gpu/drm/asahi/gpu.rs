@@ -281,6 +281,8 @@ pub(crate) trait Gpu: Send + Sync {
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result;
     /// Frequency of the CPU timer that GPU timestamps are derived from.
     fn base_clock_hz(&self) -> u32;
+    /// Return the GPU address space geometry.
+    fn uat_geometry(&self) -> mmu::UatGeometry;
     /// Create a new `Vm` with the given range reserved for kernel-managed objects.
     fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm>;
     /// Create a new user command queue.
@@ -677,7 +679,14 @@ impl GpuManager::ver {
         let map_kernel_to_user = false;
 
         Ok(KBox::new(
-            mmu::Uat::new(dev.into(), cfg, map_kernel_to_user)?,
+            mmu::Uat::new(
+                dev.into(),
+                mmu::UatGeometry {
+                    ias: cfg.uat_ias,
+                    oas: cfg.uat_oas,
+                },
+                map_kernel_to_user,
+            )?,
             GFP_KERNEL,
         )?)
     }
@@ -1296,6 +1305,10 @@ impl Gpu for GpuManager::ver {
 
     fn base_clock_hz(&self) -> u32 {
         self.cfg.base_clock_hz
+    }
+
+    fn uat_geometry(&self) -> mmu::UatGeometry {
+        self.uat.geometry()
     }
 
     fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm> {
