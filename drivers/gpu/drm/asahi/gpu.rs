@@ -11,7 +11,6 @@
 //! are unified, so that the top level of the driver itself (in `driver`) does not have to concern
 //! itself with version dependence.
 
-use crate::module_parameters;
 use core::any::Any;
 use core::ops::Range;
 use core::slice;
@@ -25,15 +24,11 @@ use kernel::{
     c_str,
     drm::gem::shmem,
     error::code::*,
-    io::{
-        mem::{
-            Mem,
-            MemFlag, //
-        },
-        IoBase,
-        IoSysMap,
-        Region, //
+    io::mem::{
+        Mem,
+        MemFlag, //
     },
+    iosys_map::IoSysMapRef,
     macros::versions,
     new_mutex,
     prelude::*,
@@ -55,13 +50,17 @@ use kernel::{
     types::ForeignOwnable,
     uapi, //
 };
+#[cfg(CONFIG_DEV_COREDUMP)]
+use kernel::{
+    devcoredump,
+    time::msecs_to_jiffies, //
+};
 
 use crate::alloc::Allocator;
 use crate::debug::*;
 use crate::driver::{
     AsahiDevRef,
-    AsahiDevice,
-    AsahiDrmDevice, //
+    AsahiDevice, //
 };
 use crate::fw::channels::{
     ChannelErrorType,
@@ -84,7 +83,6 @@ use crate::{
     mmu,
     queue,
     regs,
-    stats,
     workqueue, //
 };
 
@@ -258,7 +256,6 @@ pub(crate) struct GpuManager {
     fwctl_channel: Mutex<channel::FwCtlChannel>,
     pipes: PipeChannels::ver,
     event_manager: Arc<event::EventManager>,
-    stats: Arc<stats::StatsSnapshot>,
     buffer_mgr: buffer::BufferManager::ver,
     ids: SequenceIDs,
     #[allow(clippy::vec_box)]
@@ -268,9 +265,6 @@ pub(crate) struct GpuManager {
 
 /// Operations the DRM driver performs on a GPU, independent of its firmware interface.
 pub(crate) trait Gpu: Send + Sync {
-    /// The firmware statistics snapshot of this GPU, if its firmware reports any.
-    fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>>;
-
     /// Cast as an Any type.
     fn as_any(&self) -> &dyn Any;
     /// Cast Arc<Self> as an Any type.
@@ -285,59 +279,8 @@ pub(crate) trait Gpu: Send + Sync {
     fn is_crashed(&self) -> bool;
     /// Fill in the hardware description reported to userspace.
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result;
-    /// Whether user VMs retain a sticky error and support a userspace mirror.
-    fn supports_vm_status(&self) -> bool {
-        false
-    }
-    /// Limits for independently executing queues, if supported by this GPU.
-    fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
-        None
-    }
-    /// Shared GET_PARAMS additions, using this backend's feature-number assignments.
-    fn feature_flags(&self) -> u64 {
-        let mut flags = 0;
-        if self.supports_vm_status() {
-            flags |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS as u64
-                | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS_MIRROR as u64;
-        }
-        if self.queue_limits().is_some() {
-            flags |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES as u64;
-        }
-        if self.soft_faults() && *module_parameters::fault_control.value() == 0xb {
-            flags |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
-        }
-        flags
-    }
-    /// Temporary capacity hint and validity in milliseconds for subsequent syncobj waits.
-    fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
-        None
-    }
     /// Frequency of the CPU timer that GPU timestamps are derived from.
     fn base_clock_hz(&self) -> u32;
-    /// Return the GPU address space geometry.
-    fn uat_geometry(&self) -> mmu::UatGeometry;
-    /// Backend-specific user address aperture; other GPUs keep their geometry's range.
-    fn user_range(&self) -> Range<u64> {
-        self.uat_geometry().user_usable_range()
-    }
-    /// Use tracked command publication and sticky VM status on this backend.
-    fn tracked_submission(&self) -> bool {
-        false
-    }
-    /// Whether faults may be reported as recoverable to userspace.
-    fn soft_faults(&self) -> bool {
-        true
-    }
-    /// Populate and clean fresh object backing before any WC CPU mapping.
-    fn prepare_new_objects(&self) -> bool {
-        false
-    }
-    /// Optional backend-specific upper bound for a VM_BIND batch.
-    fn bind_batch_limit(&self) -> Option<u32> {
-        None
-    }
-    /// A userspace VM handle was closed; release backend-only registry references.
-    fn vm_closed(&self) {}
     /// Create a new `Vm` with the given range reserved for kernel-managed objects.
     fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm>;
     /// Create a new user command queue.
@@ -407,7 +350,7 @@ trait GpuManagerPriv {
 }
 
 pub(crate) struct RtkitObject {
-    vmap: shmem::VMapOwned<gem::AsahiObject, 0>,
+    vmap: shmem::VMap<gem::AsahiObject, u8>,
     mapping: mmu::KernelMapping,
 }
 
@@ -415,8 +358,8 @@ impl rtkit::Buffer for RtkitObject {
     fn iova(&self) -> Result<usize> {
         Ok(self.mapping.iova() as usize)
     }
-    fn buf(&mut self) -> Result<IoSysMap<'_, Region>> {
-        Ok(IoSysMap::from(self.vmap.as_view()))
+    fn buf(&mut self) -> Result<IoSysMapRef<'_, u8>> {
+        Ok(self.vmap.get())
     }
 }
 
@@ -443,10 +386,17 @@ impl rtkit::Operations for GpuManager::ver {
         ch.event.poll();
     }
 
-    fn crashed(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _crashlog: Option<&[u8]>) {
+    fn crashed(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, crashlog: Option<&[u8]>) {
         let dev = &data.dev;
 
         data.crashed.store(true, Ordering::Relaxed);
+
+        #[cfg(CONFIG_DEV_COREDUMP)]
+        if let Err(e) = data.generate_crashdump(crashlog) {
+            dev_err!(dev.as_ref(), "Could not generate crashdump: {:?}\n", e);
+        }
+        #[cfg(not(CONFIG_DEV_COREDUMP))]
+        let _ = crashlog;
 
         if debug_enabled(DebugFlags::OopsOnGpuCrash) {
             panic!("GPU firmware crashed");
@@ -464,7 +414,7 @@ impl rtkit::Operations for GpuManager::ver {
         mod_dev_dbg!(dev, "shmem_alloc() {:#x} bytes\n", size);
 
         let mut obj = gem::new_kernel_object(dev, size)?;
-        let vmap = obj.gem.owned_vmap::<0>()?;
+        let vmap = obj.gem.owned_vmap()?;
         let mapping = obj.map_into_range(
             data.uat.kernel_vm(),
             IOVA_KERN_RTKIT_RANGE,
@@ -482,8 +432,8 @@ impl GpuManager::ver {
     /// Create a new GpuManager of this version/GPU combination.
     #[inline(never)]
     pub(crate) fn new(
-        dev: &AsahiDrmDevice,
-        res: &regs::Resources<'_>,
+        dev: &AsahiDevice,
+        res: &regs::Resources,
         cfg: &'static hw::HwConfig,
     ) -> Result<Arc<GpuManager::ver>> {
         let uat = Self::make_uat(dev, cfg)?;
@@ -647,13 +597,10 @@ impl GpuManager::ver {
             let size = cfg.sram_size.unwrap();
             let iova = mgr.as_mut().alloc_mmio_iova(size);
 
-            let mapping = mgr.uat.kernel_vm().map_io(
-                dev.as_ref().as_ref(),
-                iova,
-                base,
-                size,
-                mmu::PROT_FW_SHARED_RW,
-            )?;
+            let mapping = mgr
+                .uat
+                .kernel_vm()
+                .map_io(iova, base, size, mmu::PROT_FW_SHARED_RW)?;
 
             mgr.as_mut()
                 .initdata_mut()
@@ -668,8 +615,7 @@ impl GpuManager::ver {
 
         let mgr = Arc::from(mgr);
 
-        let rtkit =
-            rtkit::RtKit::<GpuManager::ver>::new(dev.as_ref().as_ref(), None, 0, mgr.clone())?;
+        let rtkit = rtkit::RtKit::<GpuManager::ver>::new(dev.as_ref(), None, 0, mgr.clone())?;
 
         *mgr.rtkit.lock() = Some(rtkit);
 
@@ -712,7 +658,7 @@ impl GpuManager::ver {
 
     /// Build the entire GPU InitData structure tree and return it as a boxed GpuObject.
     fn make_initdata(
-        dev: &AsahiDrmDevice,
+        dev: &AsahiDevice,
         cfg: &'static hw::HwConfig,
         dyncfg: &hw::DynConfig,
         alloc: &mut KernelAllocators,
@@ -725,7 +671,7 @@ impl GpuManager::ver {
     ///
     /// Force disable inlining to avoid blowing up the stack.
     #[inline(never)]
-    fn make_uat(dev: &AsahiDrmDevice, cfg: &'static hw::HwConfig) -> Result<KBox<mmu::Uat>> {
+    fn make_uat(dev: &AsahiDevice, cfg: &'static hw::HwConfig) -> Result<KBox<mmu::Uat>> {
         // G14X has a new thing in the Scene structure that unfortunately requires
         // write access from user contexts. Hopefully it's not security-sensitive.
         #[ver(G >= G14X)]
@@ -734,15 +680,7 @@ impl GpuManager::ver {
         let map_kernel_to_user = false;
 
         Ok(KBox::new(
-            mmu::Uat::new(
-                dev.into(),
-                mmu::UatGeometry {
-                    ias: cfg.uat_ias,
-                    oas: cfg.uat_oas,
-                },
-                map_kernel_to_user,
-                mmu::UatFirmware::Handoff,
-            )?,
+            mmu::Uat::new(dev, cfg, map_kernel_to_user)?,
             GFP_KERNEL,
         )?)
     }
@@ -752,7 +690,7 @@ impl GpuManager::ver {
     /// Force disable inlining to avoid blowing up the stack.
     #[inline(never)]
     fn make_mgr(
-        dev: &AsahiDrmDevice,
+        dev: &AsahiDevice,
         cfg: &'static hw::HwConfig,
         dyncfg: KBox<hw::DynConfig>,
         uat: KBox<mmu::Uat>,
@@ -769,10 +707,7 @@ impl GpuManager::ver {
         for _i in 0..=NUM_PIPES - 1 {
             pipes.vtx.push(
                 KBox::pin_init(
-                    new_mutex!(
-                        channel::PipeChannel::ver::new(dev.into(), &mut alloc)?,
-                        "pipe_vtx",
-                    ),
+                    new_mutex!(channel::PipeChannel::ver::new(dev, &mut alloc)?, "pipe_vtx",),
                     GFP_KERNEL,
                 )?,
                 GFP_KERNEL,
@@ -780,7 +715,7 @@ impl GpuManager::ver {
             pipes.frag.push(
                 KBox::pin_init(
                     new_mutex!(
-                        channel::PipeChannel::ver::new(dev.into(), &mut alloc)?,
+                        channel::PipeChannel::ver::new(dev, &mut alloc)?,
                         "pipe_frag",
                     ),
                     GFP_KERNEL,
@@ -790,7 +725,7 @@ impl GpuManager::ver {
             pipes.comp.push(
                 KBox::pin_init(
                     new_mutex!(
-                        channel::PipeChannel::ver::new(dev.into(), &mut alloc)?,
+                        channel::PipeChannel::ver::new(dev, &mut alloc)?,
                         "pipe_comp",
                     ),
                     GFP_KERNEL,
@@ -799,30 +734,23 @@ impl GpuManager::ver {
             )?;
         }
 
-        let fwctl_channel = channel::FwCtlChannel::new(dev.into(), &mut alloc)?;
+        let fwctl_channel = channel::FwCtlChannel::new(dev, &mut alloc)?;
 
         let buffer_mgr = buffer::BufferManager::ver::new()?;
         let event_manager_clone = event_manager.clone();
         let buffer_mgr_clone = buffer_mgr.clone();
-        let stats_snap = Arc::new(stats::StatsSnapshot::default(), GFP_KERNEL)?;
-        let stats_snap_clone = stats_snap.clone();
         let alloc_ref = &mut alloc;
         let rx_channels = KBox::init(
             try_init!(RxChannels::ver {
                 event: channel::EventChannel::ver::new(
-                    dev.into(),
+                    dev,
                     alloc_ref,
                     event_manager_clone,
                     buffer_mgr_clone,
                 )?,
-                fw_log: channel::FwLogChannel::new(dev.into(), alloc_ref)?,
-                ktrace: channel::KTraceChannel::new(dev.into(), alloc_ref)?,
-                stats: channel::StatsChannel::ver::new(
-                    dev.into(),
-                    alloc_ref,
-                    stats_snap_clone,
-                    u64::from(cfg.base_clock_hz),
-                )?,
+                fw_log: channel::FwLogChannel::new(dev, alloc_ref)?,
+                ktrace: channel::KTraceChannel::new(dev, alloc_ref)?,
+                stats: channel::StatsChannel::ver::new(dev, alloc_ref)?,
             }),
             GFP_KERNEL,
         )?;
@@ -830,7 +758,7 @@ impl GpuManager::ver {
         let alloc_ref = &mut alloc;
         let tx_channels = KBox::init(
             try_init!(TxChannels::ver {
-                device_control: channel::DeviceControlChannel::ver::new(dev.into(), alloc_ref)?,
+                device_control: channel::DeviceControlChannel::ver::new(dev, alloc_ref)?,
             }),
             GFP_KERNEL,
         )?;
@@ -847,7 +775,6 @@ impl GpuManager::ver {
                 rtkit <- new_mutex!(None, "rtkit"),
                 crashed: AtomicBool::new(false),
                 event_manager,
-                stats: stats_snap.clone(),
                 alloc <- new_mutex!(alloc, "alloc"),
                 fwctl_channel <- new_mutex!(fwctl_channel, "fwctl_channel"),
                 rx_channels <- new_mutex!(KBox::<RxChannels::ver>::into_inner(rx_channels), "rx_channels"),
@@ -863,10 +790,9 @@ impl GpuManager::ver {
         Ok(x)
     }
 
-    fn load_hwdata_blob(dev: AsahiDevice, name: &CStr, size_name: &CStr) -> Result<KVVec<u8>> {
-        let of_node = dev.as_ref().as_ref().of_node().ok_or(EINVAL)?;
+    fn load_hwdata_blob(dev: &AsahiDevice, name: &CStr, size_name: &CStr) -> Result<KVVec<u8>> {
+        let of_node = dev.as_ref().of_node().ok_or(EINVAL)?;
         let size: usize = dev
-            .as_ref()
             .as_ref()
             .fwnode()
             .ok_or(ENOENT)?
@@ -891,8 +817,8 @@ impl GpuManager::ver {
     /// Force disable inlining to avoid blowing up the stack.
     #[inline(never)]
     fn make_dyncfg(
-        dev: &AsahiDrmDevice,
-        res: &regs::Resources<'_>,
+        dev: &AsahiDevice,
+        res: &regs::Resources,
         cfg: &'static hw::HwConfig,
         uat: &mmu::Uat,
     ) -> Result<KBox<hw::DynConfig>> {
@@ -932,7 +858,7 @@ impl GpuManager::ver {
         );
 
         dev_info!(dev.as_ref(), "Getting configuration from device tree...\n");
-        let pwr_cfg = hw::PwrConfig::load(dev.as_ref().as_ref(), cfg)?;
+        let pwr_cfg = hw::PwrConfig::load(dev, cfg)?;
         dev_info!(dev.as_ref(), "Dynamic configuration fetched\n");
 
         if gpu_id.gpu_gen != cfg.gpu_gen || gpu_id.gpu_variant != cfg.gpu_variant {
@@ -983,7 +909,7 @@ impl GpuManager::ver {
             return Err(EIO);
         }
 
-        let fwnode = dev.as_ref().as_ref().fwnode().ok_or(ENOENT)?;
+        let fwnode = dev.as_ref().fwnode().ok_or(ENOENT)?;
 
         Ok(KBox::new(
             hw::DynConfig {
@@ -995,19 +921,19 @@ impl GpuManager::ver {
                     .or(kernel::kvec![0; 3]?),
 
                 hw_data_a: Self::load_hwdata_blob(
-                    dev.into(),
+                    dev,
                     c_str!("hw-cal-a"),
                     c_str!("debug,hw-cal-a-size"),
                 )
                 .unwrap_or(KVVec::new()),
                 hw_data_b: Self::load_hwdata_blob(
-                    dev.into(),
+                    dev,
                     c_str!("hw-cal-b"),
                     c_str!("debug,hw-cal-b-size"),
                 )
                 .unwrap_or(KVVec::new()),
                 hw_globals: Self::load_hwdata_blob(
-                    dev.into(),
+                    dev,
                     c_str!("globals"),
                     c_str!("debug,globals-size"),
                 )
@@ -1053,7 +979,6 @@ impl GpuManager::ver {
                 let phys_off = die * 0x20_0000_0000 + i * map.stride;
 
                 let mapping = this.uat.kernel_vm().map_io(
-                    this.dev.as_ref().as_ref(),
                     cur_iova,
                     base + phys_off,
                     map_size,
@@ -1128,24 +1053,17 @@ impl GpuManager::ver {
 
     /// Fetch the GPU MMU fault information from the hardware registers.
     fn get_fault_info(&self) -> Option<regs::FaultInfo> {
-        // TODO: handle differently
-        let Some(guard) = self.dev.registration_guard() else {
-            return None;
-        };
+        let res = &(*self.dev).resources;
 
-        guard.registration_data_with(|reg_data| {
-            let res = &reg_data.resources;
-
-            let info = res.get_fault_info(self.cfg);
-            if info.is_some() {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "  Fault info: {:#x?}\n",
-                    info.as_ref().unwrap()
-                );
-            }
-            info
-        })
+        let info = res.get_fault_info(self.cfg);
+        if info.is_some() {
+            dev_err!(
+                self.dev.as_ref(),
+                "  Fault info: {:#x?}\n",
+                info.as_ref().unwrap()
+            );
+        }
+        info
     }
 
     /// Resume the GPU firmware after it halts (due to a timeout, fault, or request).
@@ -1232,9 +1150,8 @@ impl GpuManager::ver {
             .with(|raw, _inner| raw.pending_submissions.fetch_add(1, Ordering::Acquire));
 
         mod_dev_dbg!(self.dev, "OP start (pending: {})\n", val + 1);
-        let guard = OpGuard(self.clone());
         self.kick_firmware()?;
-        Ok(guard)
+        Ok(OpGuard(self.clone()))
     }
 
     fn invalidate_context(
@@ -1301,14 +1218,36 @@ impl GpuManager::ver {
 
         Ok(())
     }
+
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    fn generate_crashdump(&self, crashlog: Option<&[u8]>) -> Result {
+        // Lock the allocators, to block kernel/FW memory mutations (mostly)
+        let kalloc = self.alloc();
+        let pages = self.uat.dump_kernel_pages()?;
+        core::mem::drop(kalloc);
+
+        let mut crashdump = crate::crashdump::CrashDumpBuilder::new(pages)?;
+        let initdata_addr = self.initdata.gpu_va().get();
+        crashdump.add_agx_info(self.cfg, &self.dyncfg, initdata_addr)?;
+        if let Some(crashlog) = crashlog {
+            crashdump.add_crashlog(crashlog)?;
+        }
+        let crashdump = KBox::new(crashdump.finalize()?, GFP_KERNEL)?;
+
+        devcoredump::dev_coredump(
+            self.dev.as_ref(),
+            &crate::THIS_MODULE,
+            crashdump,
+            GFP_KERNEL,
+            msecs_to_jiffies(60 * 60 * 1000),
+        );
+
+        Ok(())
+    }
 }
 
 #[versions(AGX)]
 impl Gpu for GpuManager::ver {
-    fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>> {
-        Some(self.stats.clone())
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1376,10 +1315,6 @@ impl Gpu for GpuManager::ver {
         self.cfg.base_clock_hz
     }
 
-    fn uat_geometry(&self) -> mmu::UatGeometry {
-        self.uat.geometry()
-    }
-
     fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm> {
         self.uat.new_vm(self.ids.vm.next(), kernel_range)
     }
@@ -1396,14 +1331,13 @@ impl Gpu for GpuManager::ver {
         let id = self.ids.queue.next();
         Ok(KBox::new(
             queue::Queue::ver::new(
-                self.dev.clone(),
+                &self.dev,
                 self,
                 vm,
                 &mut kalloc,
                 ualloc,
                 ualloc_priv,
                 self.event_manager.clone(),
-                self.stats.clone(),
                 &self.buffer_mgr,
                 id,
                 priority,

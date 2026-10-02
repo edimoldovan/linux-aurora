@@ -20,7 +20,6 @@ use crate::fw::channels::{
 };
 use crate::fw::types::*;
 use crate::fw::workqueue::*;
-use crate::module_parameters;
 use crate::no_debug;
 use crate::object::OpaqueGpuObject;
 use crate::{
@@ -97,7 +96,7 @@ impl From<WorkError> for kernel::error::Error {
 
 /// A GPU context tracking structure, which must be explicitly invalidated when dropped.
 pub(crate) struct GpuContext {
-    dev: driver::AsahiDevice,
+    dev: driver::AsahiDevRef,
     data: Option<KBox<GpuObject<fw::workqueue::GpuContextData>>>,
 }
 no_debug!(GpuContext);
@@ -105,12 +104,12 @@ no_debug!(GpuContext);
 impl GpuContext {
     /// Allocate a new GPU context.
     pub(crate) fn new(
-        dev: driver::AsahiDevice,
+        dev: &driver::AsahiDevice,
         alloc: &mut gpu::KernelAllocators,
         buffer: Arc<dyn core::any::Any + Send + Sync>,
     ) -> Result<GpuContext> {
         Ok(GpuContext {
-            dev,
+            dev: dev.into(),
             data: Some(KBox::new(
                 alloc.shared.new_object(
                     fw::workqueue::GpuContextData { _buffer: buffer },
@@ -129,18 +128,13 @@ impl GpuContext {
 
 impl Drop for GpuContext {
     fn drop(&mut self) {
-        let Some(guard) = self.dev.registration_guard() else {
-            return;
-        };
-
-        guard.registration_data_with(|reg_data| {
-            let data = self.data.take().unwrap();
-            // A context only exists for the manager whose allocators created it, so the manager is
-            // always present.
-            if let Some(gpu) = reg_data.gpu.manager() {
-                gpu.free_context(data);
-            }
-        })
+        mod_dev_dbg!(self.dev, "GpuContext: Freeing GPU context\n");
+        let data = self.data.take().unwrap();
+        // A context only exists for the manager whose allocators created it, so the manager is
+        // always present.
+        if let Some(gpu) = (*self.dev).gpu.manager() {
+            gpu.free_context(data);
+        }
     }
 }
 
@@ -235,7 +229,7 @@ impl<O: OpaqueCommandObject, C: FnOnce(Option<WorkError>) + Send + Sync> GenSubm
 /// Inner data for managing a single work queue.
 #[versions(AGX)]
 struct WorkQueueInner {
-    dev: driver::AsahiDevice,
+    dev: driver::AsahiDevRef,
     event_manager: Arc<event::EventManager>,
     info: GpuObject<QueueInfo::ver>,
     new: bool,
@@ -643,8 +637,7 @@ impl WorkQueue::ver {
     /// Create a new WorkQueue of a given type and priority.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        dev: driver::AsahiDevice,
-        cfg: &crate::hw::HwConfig,
+        dev: &driver::AsahiDevice,
         alloc: &mut gpu::KernelAllocators,
         event_manager: Arc<event::EventManager>,
         gpu_context: Arc<GpuContext>,
@@ -659,23 +652,8 @@ impl WorkQueue::ver {
         let ring = alloc.shared.array_empty(size as usize)?;
         let mut prio = *raw::PRIORITY.get(priority as usize).ok_or(EINVAL)?;
 
-        #[ver(G == G14X)]
-        let preempt_auto = cfg.chip_id == 0x6021;
-        #[ver(G != G14X)]
-        let preempt_auto = {
-            let _ = cfg;
-            false
-        };
-        let preempt = match *module_parameters::compute_preempt.value() {
-            -1 => preempt_auto || debug_enabled(DebugFlags::Debug0),
-            value => value != 0,
-        };
-
-        // Without preemption the compute queue takes priority fields 0 and 5 of the highest
-        // priority entry. The firmware then cannot switch compute work out when another client
-        // needs the GPU, and on G14X it kills the work when the context-switch and kill
-        // timeouts expire.
-        if pipe_type == PipeType::Compute && !preempt {
+        if pipe_type == PipeType::Compute && !debug_enabled(DebugFlags::Debug0) {
+            // Hack to disable compute preemption until we fix it
             prio.0 = 0;
             prio.5 = 1;
         }
@@ -940,7 +918,7 @@ impl WorkQueue for WorkQueue::ver {
                 cmd.inner.gpu_va()
             );
             cmd.as_mut().inner_mut().complete();
-            workqueue::system_dfl().enqueue(cmd);
+            workqueue::system().enqueue(cmd);
         }
 
         mod_pr_debug!(
