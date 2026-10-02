@@ -2,6 +2,8 @@
 
 //! Top-level GPU driver implementation.
 
+use crate::module_parameters;
+use kernel::bindings;
 use kernel::{
     device::{
         Core,
@@ -47,7 +49,15 @@ pub(crate) struct AsahiPlatformDriverData<'bound> {
     _reg: drm::Registration<'bound, AsahiDrmDriver>,
     /// The G17 GPU, whose coprocessors must be stopped when the driver is unbound.
     g17: Option<Arc<g17::Gpu>>,
+    /// Raw `struct device *` of the platform device. Stored once at probe
+    /// time so the `Drop` impl can find the sysfs file on unregister.
+    raw_dev: *mut bindings::device,
 }
+
+// SAFETY: `raw_dev` is only passed back to the sysfs shim, which serializes its own state.
+unsafe impl Send for AsahiPlatformDriverData<'_> {}
+// SAFETY: As above.
+unsafe impl Sync for AsahiPlatformDriverData<'_> {}
 
 /// Holds a reference to the top-level GPU object.
 #[pin_data]
@@ -248,10 +258,16 @@ impl platform::Driver for AsahiPlatformDriver {
         // unbound; it is never forgotten.
         let reg = unsafe { drm::Registration::new(pdev.as_ref(), drm, data, 0)? };
 
+        // Register the sysfs file on the platform device. Must happen after
+        // the DRM device is registered so the device is fully bound.
+        let raw_dev = pdev.as_ref().as_raw();
+        crate::sysfs_exports::register(raw_dev, *module_parameters::stats_export.value() != 0)?;
+
         let driver = AsahiPlatformDriverData {
             _device: reg.device().into(),
             _reg: reg,
             g17: None,
+            raw_dev,
         };
 
         Ok(driver)
@@ -287,12 +303,18 @@ impl AsahiPlatformDriver {
             _device: reg.device().into(),
             _reg: reg,
             g17: Some(gpu),
+            raw_dev: core::ptr::null_mut(),
         })
     }
 }
 
 impl Drop for AsahiPlatformDriverData<'_> {
     fn drop(&mut self) {
+        // SAFETY: `self.raw_dev` was set in `probe` from the platform
+        // device's `as_raw()`, valid for the lifetime of the bound driver.
+        if !self.raw_dev.is_null() {
+            crate::sysfs_exports::unregister(self.raw_dev);
+        }
         if let Some(gpu) = self.g17.as_ref() {
             // Also covers failure to allocate platform driver data after the probe body returned.
             gpu.shutdown();

@@ -83,6 +83,8 @@ use crate::{
     mmu,
     queue,
     regs,
+    stats,
+    sysfs_exports,
     workqueue, //
 };
 
@@ -256,6 +258,7 @@ pub(crate) struct GpuManager {
     fwctl_channel: Mutex<channel::FwCtlChannel>,
     pipes: PipeChannels::ver,
     event_manager: Arc<event::EventManager>,
+    stats: Arc<stats::StatsSnapshot>,
     buffer_mgr: buffer::BufferManager::ver,
     ids: SequenceIDs,
     #[allow(clippy::vec_box)]
@@ -761,6 +764,12 @@ impl GpuManager::ver {
         let buffer_mgr = buffer::BufferManager::ver::new()?;
         let event_manager_clone = event_manager.clone();
         let buffer_mgr_clone = buffer_mgr.clone();
+        let stats_snap = Arc::new(stats::StatsSnapshot::default(), GFP_KERNEL)?;
+        // Publish the snapshot pointer to the C sysfs shim. It is cleared
+        // (by the same shim) on registration removal; until then readers see
+        // a stable pointer and AtomicU* races that govern.
+        sysfs_exports::set_snapshot_ptr(Arc::as_ptr(&stats_snap));
+        let stats_snap_clone = stats_snap.clone();
         let alloc_ref = &mut alloc;
         let rx_channels = KBox::init(
             try_init!(RxChannels::ver {
@@ -772,7 +781,12 @@ impl GpuManager::ver {
                 )?,
                 fw_log: channel::FwLogChannel::new(dev.into(), alloc_ref)?,
                 ktrace: channel::KTraceChannel::new(dev.into(), alloc_ref)?,
-                stats: channel::StatsChannel::ver::new(dev.into(), alloc_ref)?,
+                stats: channel::StatsChannel::ver::new(
+                    dev.into(),
+                    alloc_ref,
+                    stats_snap_clone,
+                    u64::from(cfg.base_clock_hz),
+                )?,
             }),
             GFP_KERNEL,
         )?;
@@ -797,6 +811,7 @@ impl GpuManager::ver {
                 rtkit <- new_mutex!(None, "rtkit"),
                 crashed: AtomicBool::new(false),
                 event_manager,
+                stats: stats_snap.clone(),
                 alloc <- new_mutex!(alloc, "alloc"),
                 fwctl_channel <- new_mutex!(fwctl_channel, "fwctl_channel"),
                 rx_channels <- new_mutex!(KBox::<RxChannels::ver>::into_inner(rx_channels), "rx_channels"),
@@ -1348,6 +1363,7 @@ impl Gpu for GpuManager::ver {
                 ualloc,
                 ualloc_priv,
                 self.event_manager.clone(),
+                self.stats.clone(),
                 &self.buffer_mgr,
                 id,
                 priority,
