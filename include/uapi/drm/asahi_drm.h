@@ -93,9 +93,6 @@ enum drm_asahi_ioctl_id {
 
 	/** @DRM_ASAHI_SUBMIT: Submit commands to a queue. */
 	DRM_ASAHI_SUBMIT,
-
-	/** @DRM_ASAHI_GEM_MADVISE: Mark a VM-private object purgeable or needed. */
-	DRM_ASAHI_GEM_MADVISE,
 };
 
 #define DRM_ASAHI_MAX_CLUSTERS	64
@@ -196,38 +193,32 @@ struct drm_asahi_params_global {
 	__u64 command_timestamp_frequency_hz;
 
 	/**
-	 * @usc_generation: Unified shader core (USC) ISA generation.
-	 *
-	 * This is 2 for G13/G14 and 3 for G15. It does not distinguish the
-	 * binary encoding groups within AGX3.
+	 * @usc_generation: Instruction set generation of the unified shader
+	 * cores: 2 for G13 and G14, 3 for G15 and newer.
 	 */
 	__u32 usc_generation;
 
 	/**
-	 * @gpu_hal_generation: Apple GPU HAL/command-stream generation, a value
-	 * of enum drm_asahi_gpu_hal_generation.
-	 *
-	 * G13-G15 on 14.x report DRM_ASAHI_GPU_HAL_LEGACY.
-	 * The exact J613 25G83 runtime and the G17P runtime report
-	 * DRM_ASAHI_GPU_HAL_200.
+	 * @gpu_hal_generation: Command stream generation, from
+	 * enum drm_asahi_gpu_hal_generation.
 	 */
 	__u32 gpu_hal_generation;
 };
 
 /**
- * enum drm_asahi_gpu_hal_generation - GPU HAL/command-stream generation
+ * enum drm_asahi_gpu_hal_generation - GPU command stream generation
+ *
+ * The command stream generation determines the layout of the control streams
+ * and descriptors that userspace builds for the GPU.
  */
 enum drm_asahi_gpu_hal_generation {
-	/** @DRM_ASAHI_GPU_HAL_LEGACY: GPU predates the numbered HAL generations. */
+	/** @DRM_ASAHI_GPU_HAL_LEGACY: Unnumbered generation of G13 to G15. */
 	DRM_ASAHI_GPU_HAL_LEGACY = 0,
 
-	/**
-	 * @DRM_ASAHI_GPU_HAL_200: HAL200 command stream, reported by the J613
-	 * 25G83 runtime and by the G17P runtime.
-	 */
+	/** @DRM_ASAHI_GPU_HAL_200: Generation 200, used by G17P. */
 	DRM_ASAHI_GPU_HAL_200 = 200,
 
-	/** @DRM_ASAHI_GPU_HAL_300: HAL300 command stream. Never reported by this kernel. */
+	/** @DRM_ASAHI_GPU_HAL_300: Generation 300. */
 	DRM_ASAHI_GPU_HAL_300 = 300,
 };
 
@@ -238,18 +229,6 @@ enum drm_asahi_gpu_hal_generation {
  * version. Most features don't need to be here.
  */
 enum drm_asahi_feature {
-	/** @DRM_ASAHI_FEATURE_RENDER_TIMESTAMP_COPIES: Firmware runtime capability. */
-	DRM_ASAHI_FEATURE_RENDER_TIMESTAMP_COPIES = (1UL) << 4,
-
-	/** @DRM_ASAHI_FEATURE_COMPUTE_TIMESTAMP_COPIES: Firmware runtime capability. */
-	DRM_ASAHI_FEATURE_COMPUTE_TIMESTAMP_COPIES = (1UL) << 5,
-
-	/** @DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY_COMPUTE: Firmware runtime capability. */
-	DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY_COMPUTE = (1UL) << 7,
-
-	/** @DRM_ASAHI_FEATURE_CACHED_PROGRAM_PROBE: Firmware runtime capability. */
-	DRM_ASAHI_FEATURE_CACHED_PROGRAM_PROBE = (1UL) << 9,
-
 	/**
 	 * @DRM_ASAHI_FEATURE_SOFT_FAULTS: GPU has "soft fault" enabled. Shader
 	 * loads of unmapped memory will return zero. Shader stores to unmapped
@@ -264,43 +243,18 @@ enum drm_asahi_feature {
 	 */
 	DRM_ASAHI_FEATURE_SOFT_FAULTS = (1UL) << 0,
 
-	/** @DRM_ASAHI_FEATURE_VM_STATUS: GET_PARAMS VM_STATUS is supported. */
+	/**
+	 * @DRM_ASAHI_FEATURE_VM_STATUS: GET_PARAMS supports
+	 * DRM_ASAHI_PARAM_GROUP_VM_STATUS.
+	 */
 	DRM_ASAHI_FEATURE_VM_STATUS = (1UL) << 1,
 
 	/**
-	 * @DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES: GET_PARAMS group
-	 * DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS is available, and each queue
-	 * reserves its own hardware execution state when it is created. Only
-	 * the G17P runtime sets this bit.
+	 * @DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES: Each queue reserves its own
+	 * hardware execution state when it is created, and GET_PARAMS
+	 * supports DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS.
 	 */
 	DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES = (1UL) << 2,
-
-	/**
-	 * @DRM_ASAHI_FEATURE_SCHEDULED_QUEUES: Separate software queue timelines.
-	 * Each DRM queue owns a scheduler entity. An unresolved dependency on
-	 * one queue does not block ready jobs on another queue. Physical GPU
-	 * execution may be serialized; no concurrent hardware engines or
-	 * reserved contexts are promised. QUEUE_CREATE allocates host-side
-	 * scheduling state and may fail for memory exhaustion. This feature
-	 * alone does not imply the hardware QUEUE_LIMITS query is available.
-	 */
-	DRM_ASAHI_FEATURE_SCHEDULED_QUEUES = (1UL) << 3,
-
-	/*
-	 * Bits 4, 5 and 7 are reported only by the J613 25G83 HAL200 runtime.
-	 * Bit 9 remains a diagnostic and is not advertised.
-	 */
-
-	/** @DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY: Render commands may request
-	 * fragment-only dependencies with DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY.
-	 */
-	DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY = (1UL) << 6,
-
-	DRM_ASAHI_FEATURE_COMPUTE_WIDE_VISIBILITY = (1UL) << 8,
-
-	/*
-	 * Bits 10 to 15 are reported only by the G17P runtime.
-	 */
 
 	/**
 	 * @DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS: Every hardware command of
@@ -310,7 +264,7 @@ enum drm_asahi_feature {
 	 * submissions and relies on this must pass its input syncs to each of
 	 * them.
 	 */
-	DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS = (1UL) << 10,
+	DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS = (1UL) << 3,
 
 	/**
 	 * @DRM_ASAHI_FEATURE_VM_STATUS_MIRROR: GET_PARAMS supports
@@ -321,88 +275,91 @@ enum drm_asahi_feature {
 	 * a successful wait a load of the word replaces the VM_STATUS query.
 	 * Registration may still be refused.
 	 */
-	DRM_ASAHI_FEATURE_VM_STATUS_MIRROR = (1UL) << 11,
-
-	/**
-	 * @DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS: Render and compute payloads
-	 * support exact queue-local historical prefixes in prior_vdm/prior_cdm.
-	 * These fields supplement the header barriers.
-	 */
-	DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS = (1UL) << 12,
-
-	/**
-	 * @DRM_ASAHI_FEATURE_FEW_PRIMITIVES: Render commands accept
-	 * DRM_ASAHI_RENDER_FEW_PRIMITIVES.
-	 */
-	DRM_ASAHI_FEATURE_FEW_PRIMITIVES = (1UL) << 13,
-
-	/**
-	 * @DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS: Render commands accept
-	 * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS.
-	 */
-	DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS = (1UL) << 14,
-
-	/**
-	 * @DRM_ASAHI_FEATURE_RENDER_RAY_QUERY: Render commands accept per-stage
-	 * ray query state (struct drm_asahi_render_ray_query_stage) and queues
-	 * accept render_scs_layout.
-	 */
-	DRM_ASAHI_FEATURE_RENDER_RAY_QUERY = (1UL) << 15,
+	DRM_ASAHI_FEATURE_VM_STATUS_MIRROR = (1UL) << 4,
 };
 
+/**
+ * define DRM_ASAHI_PARAM_GROUP_VM_STATUS - GET_PARAMS group for
+ * struct drm_asahi_vm_status
+ */
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
+
+/**
+ * define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS - GET_PARAMS group for
+ * struct drm_asahi_queue_limits
+ */
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
 
 /**
  * define DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR - GET_PARAMS group for
- * struct drm_asahi_vm_status_mirror, available with
- * DRM_ASAHI_FEATURE_VM_STATUS_MIRROR
+ * struct drm_asahi_vm_status_mirror
  */
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR 3
 
-/* GET_PARAMS group VM_STATUS is an in/out query on the calling file's VM.
- * Set pointer to this structure and size to sizeof(structure).
- * vm_id selects the VM; flags and pad must be zero. error is output only.
- * error == 0 means no observed submission error; a negative Linux errno is
- * sticky for this VM's lifetime. The first error is retained. Creating a new
- * queue or successfully waiting another fence does not clear it.
- * An execution-domain failure also marks other queried VMs lost when their
- * hardware owner cannot progress. A query never recovers/resets firmware.
- * The driver publishes an accepted job's failure before signaling its fence.
- * Thus userspace must query after a successful DRM syncobj wait/poll before
- * treating that fence as successful execution. Syncobj signal alone is not
- * an execution-success indication.
- * The feature bit is the availability contract; older kernels leave it zero.
- * Kernel errors for invalid requests: EINVAL flags/pad/size, ENOENT foreign or
- * missing vm_id, EFAULT inaccessible pointer. No output on invalid request.
+/**
+ * struct drm_asahi_vm_status - VM status, GET_PARAMS group
+ * DRM_ASAHI_PARAM_GROUP_VM_STATUS
+ *
+ * This is an in/out query on a VM of the calling file. Userspace sets
+ * &drm_asahi_get_params.pointer to this structure and
+ * &drm_asahi_get_params.size to its size.
+ *
+ * The kernel records the failure of an accepted job before it signals the
+ * job's fences, so userspace must query the status after a successful syncobj
+ * wait before it treats the work as successfully executed. A signalled
+ * syncobj alone does not indicate successful execution. An execution failure
+ * also marks other VMs whose work can no longer make progress. A query never
+ * resets or recovers the GPU.
+ *
+ * Invalid requests fail with EINVAL (non-zero @flags or @pad, wrong size),
+ * ENOENT (@vm_id unknown to the calling file) or EFAULT, and write nothing.
  */
 struct drm_asahi_vm_status {
-   __u32 vm_id;
-   __u32 flags;
-   __s32 error;
-   __u32 pad;
+	/** @vm_id: VM to query */
+	__u32 vm_id;
+
+	/** @flags: MBZ */
+	__u32 flags;
+
+	/**
+	 * @error: Output: 0 if no submission error was observed, otherwise the
+	 * first error as a negative errno. The error is sticky for the lifetime
+	 * of the VM: neither creating queues nor waiting on other fences clears
+	 * it.
+	 */
+	__s32 error;
+
+	/** @pad: MBZ */
+	__u32 pad;
 };
 
 /**
- * struct drm_asahi_queue_limits - GET_PARAMS group2 output, feature bit2.
- * @max_queues: Maximum independent DRM queues on the physical device. This is
- * a hardware resource bound, shared by all files/VMs; it is not a promise that
- * all slots are currently free. QUEUE_CREATE reserves a queue's hardware state
- * and execution context, returning an allocation error if resources run out.
- * @max_in_flight_per_queue: Hardware scheduler credits per queue. Software
- * may enqueue additional jobs, which wait behind preceding work/dependencies.
- * @flags: Reserved, zero.
- * @pad: Reserved, zero.
+ * struct drm_asahi_queue_limits - Queue limits, GET_PARAMS group
+ * DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS
  *
- * The query is available only when DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES is
- * set, which only the G17P runtime does; otherwise it fails with EINVAL. A
- * query does not allocate or reset anything.
+ * The query neither allocates nor resets anything.
  */
 struct drm_asahi_queue_limits {
-    __u32 max_queues;
-    __u32 max_in_flight_per_queue;
-    __u32 flags;
-    __u32 pad;
+	/**
+	 * @max_queues: Maximum number of queues on the device, shared by all
+	 * files and VMs. This is a hardware bound, not a promise that as many
+	 * are currently available: QUEUE_CREATE reserves a queue's hardware
+	 * state and fails once it runs out.
+	 */
+	__u32 max_queues;
+
+	/**
+	 * @max_in_flight_per_queue: Number of jobs of a queue that the
+	 * hardware may run at once. Further jobs wait behind the preceding work
+	 * and their dependencies.
+	 */
+	__u32 max_in_flight_per_queue;
+
+	/** @flags: Reserved, zero */
+	__u32 flags;
+
+	/** @pad: Reserved, zero */
+	__u32 pad;
 };
 
 /**
@@ -435,14 +392,8 @@ struct drm_asahi_vm_status_mirror {
  */
 struct drm_asahi_get_params {
 	/**
-	 * @param_group: Parameter group to fetch: 0 for struct
-	 * drm_asahi_params_global, DRM_ASAHI_PARAM_GROUP_VM_STATUS when
-	 * DRM_ASAHI_FEATURE_VM_STATUS is set, or
-	 * DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS when
-	 * DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES is set, or
-	 * DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR when
-	 * DRM_ASAHI_FEATURE_VM_STATUS_MIRROR is set. Any other group, or a
-	 * group whose feature bit is clear, fails with EINVAL.
+	 * @param_group: Parameter group: 0 for struct drm_asahi_params_global,
+	 * otherwise one of DRM_ASAHI_PARAM_GROUP_*.
 	 */
 	__u32 param_group;
 
@@ -450,8 +401,8 @@ struct drm_asahi_get_params {
 	__u32 pad;
 
 	/**
-	 * @pointer: User pointer to parameter struct. The VM status groups also
-	 * read their input from it.
+	 * @pointer: User pointer to the parameter struct. The VM status groups
+	 * also read their input from it.
 	 */
 	__u64 pointer;
 
@@ -461,12 +412,6 @@ struct drm_asahi_get_params {
 	 * not write past the length specified here, allowing extensibility.
 	 */
 	__u64 size;
-};
-
-/** VM creation flags. */
-enum drm_asahi_vm_create_flags {
-	/** @DRM_ASAHI_VM_CREATE_HAL200: Acknowledge the queried HAL200 command ABI. */
-	DRM_ASAHI_VM_CREATE_HAL200 = (1U << 0),
 };
 
 /**
@@ -497,8 +442,8 @@ struct drm_asahi_vm_create {
 	/** @vm_id: Returned VM ID */
 	__u32 vm_id;
 
-	/** @flags: HAL200 acknowledgement; zero on legacy devices. */
-	__u32 flags;
+	/** @pad: MBZ */
+	__u32 pad;
 };
 
 /**
@@ -565,41 +510,6 @@ struct drm_asahi_gem_mmap_offset {
 
 	/** @offset: The fake offset to use for subsequent mmap call */
 	__u64 offset;
-};
-
-/**
- * enum drm_asahi_gem_madv - Advice for DRM_IOCTL_ASAHI_GEM_MADVISE
- */
-enum drm_asahi_gem_madv {
-	/** @DRM_ASAHI_GEM_MADV_WILLNEED: The object's contents are needed. */
-	DRM_ASAHI_GEM_MADV_WILLNEED = 0,
-	/**
-	 * @DRM_ASAHI_GEM_MADV_DONTNEED: The object is not referenced by any
-	 * pending or future GPU work until the next WILLNEED. The kernel may
-	 * discard its contents under memory pressure.
-	 */
-	DRM_ASAHI_GEM_MADV_DONTNEED = 1,
-};
-
-/**
- * struct drm_asahi_gem_madvise - Arguments passed to
- * DRM_IOCTL_ASAHI_GEM_MADVISE
- *
- * Only VM-private objects accept advice. A purged object keeps its handle
- * and mappings but has no contents; userspace must not use it again.
- */
-struct drm_asahi_gem_madvise {
-	/** @handle: Handle of the object. */
-	__u32 handle;
-
-	/** @madv: One of enum drm_asahi_gem_madv. */
-	__u32 madv;
-
-	/** @retained: Set by the kernel: 1 if the contents are retained, 0 if purged. */
-	__u32 retained;
-
-	/** @pad: Must be zero. */
-	__u32 pad;
 };
 
 /**
@@ -850,13 +760,6 @@ struct drm_asahi_queue_create {
 	 * fix a 4GiB VA carveout for USC memory and pass its base address here.
 	 */
 	__u64 usc_exec_base;
-
-	/**
-	 * @render_scs_layout: Largest ray query scratch layouts of the vertex and
-	 * fragment stages this queue will submit, used to size its render pool.
-	 * Requires DRM_ASAHI_FEATURE_RENDER_RAY_QUERY; zero otherwise.
-	 */
-	__u64 render_scs_layout[2];
 };
 
 /**
@@ -1043,10 +946,6 @@ struct drm_asahi_attachment {
 };
 
 enum drm_asahi_render_flags {
-	/** @DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY_COMPUTE: Requires the corresponding runtime feature. */
-	DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY_COMPUTE = (1U << 6),
-	/** @DRM_ASAHI_RENDER_CACHED_PROGRAM_PROBE: Bounded immutable firmware program diagnostic. */
-	DRM_ASAHI_RENDER_CACHED_PROGRAM_PROBE = (1U << 7),
 	/**
 	 * @DRM_ASAHI_RENDER_VERTEX_SCRATCH: A vertex stage shader uses scratch
 	 * memory.
@@ -1069,28 +968,13 @@ enum drm_asahi_render_flags {
 	DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING = (1U << 2),
 
 	/**
-	 * @DRM_ASAHI_RENDER_RSRC_SPEC_HI: The appended resource-specifier high
-	 * dwords are present. A kernel that cannot use them rejects the flag
-	 * instead of silently truncating the values. This kernel accepts it
-	 * from the G17P runtime only.
+	 * @DRM_ASAHI_RENDER_RSRC_SPEC_HI: The command carries the high halves
+	 * of the background and end-of-tile resource specifiers
+	 * (&drm_asahi_cmd_render.bg_rsrc_spec_hi and the following fields).
+	 * Kernels that do not know the flag reject the command instead of
+	 * silently truncating the specifiers.
 	 */
 	DRM_ASAHI_RENDER_RSRC_SPEC_HI = (1U << 4),
-
-	/**
-	 * @DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY: The preceding render's results
-	 * are needed only by fragment processing, not tiling/vertex processing.
-	 * The kernel may overlap tiling with an immediately preceding render
-	 * in the same submitted packet. Fragment order is retained. Compute,
-	 * packet boundaries and timestamp-start dependencies remain ordered.
-	 * Requires DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY. Userspace must retain
-	 * the normal header barriers; this flag changes only their stage scope.
-	 */
-	DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY = (1U << 5),
-
-	/*
-	 * Bits 6 and 7 are supported only by the J613 25G83 HAL200 runtime.
-	 * The legacy and G17P runtimes reject render commands that set them.
-	 */
 
 	/**
 	 * @DRM_ASAHI_RENDER_DBIAS_IS_INT: Use integer depth bias formula.
@@ -1105,40 +989,6 @@ enum drm_asahi_render_flags {
 	 * so we match that here for efficiency.
 	 */
 	DRM_ASAHI_RENDER_DBIAS_IS_INT = (1U << 18),
-
-	/**
-	 * @DRM_ASAHI_RENDER_FEW_PRIMITIVES: The render pass is known to rasterize
-	 * at most four primitives in total.
-	 *
-	 * The count includes every primitive the pass generates: topology-derived
-	 * primitive counts of all draws multiplied by their instance counts, plus
-	 * internal work (clears, visibility, scissor/state generated work). Passes
-	 * with indirect draws, mesh work or any work whose primitive count is not
-	 * known at record time must not set this flag. The flag sets bit 0 of the
-	 * auxiliary framebuffer control word for the fragment stage; the hardware
-	 * effect is an optimization for small known passes and its omission is
-	 * always safe. Requires DRM_ASAHI_FEATURE_FEW_PRIMITIVES.
-	 */
-	DRM_ASAHI_RENDER_FEW_PRIMITIVES = (1U << 19),
-
-	/**
-	 * @DRM_ASAHI_RENDER_FRAGMENT_BARRIERS: Only the fragment stage waits for
-	 * this command's barriers.
-	 *
-	 * The render dependencies resolved from @vdm_barrier and @prior_vdm are
-	 * attached to the fragment half of the render instead of its vertex
-	 * (tiling) half, so vertex processing may start while the renders this
-	 * command depends on are still executing their fragment work. The
-	 * fragment half still waits for its own vertex half and for the previous
-	 * fragment work of its physical queue; the compute dependencies from
-	 * @cdm_barrier and @prior_cdm keep ordering the vertex half. Set this
-	 * only when every render dependency into the command is consumed by
-	 * fragment-stage or attachment accesses alone: nothing the vertex stage
-	 * reads (vertex/index/indirect buffers, vertex, tessellation or geometry
-	 * shader resources, transform feedback, conditional-rendering predicates)
-	 * may depend on it. Requires DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS.
-	 */
-	DRM_ASAHI_RENDER_FRAGMENT_BARRIERS = (1U << 20),
 };
 
 /**
@@ -1275,42 +1125,6 @@ struct drm_asahi_bg_eot {
 	 * uniforms, bound textures, and bound samplers.
 	 */
 	__u32 rsrc_spec;
-};
-
-/**
- * struct drm_asahi_render_ray_query_stage - Ray query state of one render stage
- *
- * Index 0 describes the vertex (tiling) stage and index 1 the fragment stage
- * of a render command. An all-zero entry disables ray queries in that stage.
- * Requires DRM_ASAHI_FEATURE_RENDER_RAY_QUERY.
- */
-struct drm_asahi_render_ray_query_stage {
-	/** @scs_layout: Per-thread ray query scratch layout, as for compute. */
-	__u64 scs_layout;
-
-	/** @intersection_aux: Auxiliary intersection table word. */
-	__u32 intersection_aux;
-
-	/** @intersection_pad: MBZ */
-	__u32 intersection_pad;
-
-	/** @intersection_pool: GPU VA of the intersection program pool. */
-	__u64 intersection_pool;
-
-	/** @intersection_pool_bytes: Size of the intersection program pool. */
-	__u64 intersection_pool_bytes;
-
-	/** @intersection_first: First intersection table entry. */
-	__u32 intersection_first;
-
-	/** @intersection_count: Number of intersection table entries. */
-	__u32 intersection_count;
-
-	/** @intersection_default: GPU VA of the default intersection program. */
-	__u64 intersection_default;
-
-	/** @intersection_default_control: Control word of the default program. */
-	__u64 intersection_default_control;
 };
 
 /**
@@ -1481,44 +1295,17 @@ struct drm_asahi_cmd_render {
 	/** @ts_frag: Timestamps for the fragment portion of the render */
 	struct drm_asahi_timestamps ts_frag;
 
-	/** @bg_eot_rsrc_spec_hi: High dword of @eot.rsrc_spec */
+	/** @bg_eot_rsrc_spec_hi: High half of @eot.rsrc_spec */
 	__u32 bg_eot_rsrc_spec_hi;
 
-	/** @bg_eot_partial_rsrc_spec_hi: High dword of @partial_eot.rsrc_spec */
+	/** @bg_eot_partial_rsrc_spec_hi: High half of @partial_eot.rsrc_spec */
 	__u32 bg_eot_partial_rsrc_spec_hi;
 
-	/** @bg_rsrc_spec_hi: High dword of @bg.rsrc_spec */
+	/** @bg_rsrc_spec_hi: High half of @bg.rsrc_spec */
 	__u32 bg_rsrc_spec_hi;
 
-	/** @bg_partial_rsrc_spec_hi: High dword of @partial_bg.rsrc_spec */
+	/** @bg_partial_rsrc_spec_hi: High half of @partial_bg.rsrc_spec */
 	__u32 bg_partial_rsrc_spec_hi;
-
-	/** @ts_frag_end_copies: End timestamp copies, requiring the corresponding feature bit. */
-	struct drm_asahi_timestamp ts_frag_end_copies[8];
-
-	/**
-	 * @prior_vdm: Historical render prefix, or zero for no added dependency.
-	 *
-	 * Requires DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS. Counts hardware render
-	 * commands accepted on this queue since creation, starting at one. A
-	 * nonzero value must not exceed the render count at this ioctl's entry;
-	 * it waits for every render command through that ordinal. The effective
-	 * dependency is the maximum of this prefix and the header's resolved
-	 * vdm_barrier. Header NONE does not suppress this field.
-	 */
-	__u64 prior_vdm;
-
-	/**
-	 * @prior_cdm: Historical compute prefix; see @prior_vdm, using the
-	 * queue's compute command count and the header's cdm_barrier instead.
-	 */
-	__u64 prior_cdm;
-
-	/**
-	 * @ray_query: Ray query state of the vertex and fragment stages. Older
-	 * userspace omits it; a shorter command is read with both stages zeroed.
-	 */
-	struct drm_asahi_render_ray_query_stage ray_query[2];
 };
 
 /**
@@ -1529,7 +1316,7 @@ struct drm_asahi_cmd_render {
  * single compute command, although timestamps are at command granularity.
  */
 struct drm_asahi_cmd_compute {
-	/** @flags: Combination of drm_asahi_compute_flags. */
+	/** @flags: MBZ */
 	__u32 flags;
 
 	/** @sampler_count: Number of samplers in the sampler heap. */
@@ -1556,64 +1343,6 @@ struct drm_asahi_cmd_compute {
 
 	/** @ts: Timestamps for the compute command */
 	struct drm_asahi_timestamps ts;
-
-	/** @ts_end_copies: End timestamp copies, requiring the corresponding feature bit. */
-	struct drm_asahi_timestamp ts_end_copies[8];
-
-	/**
-	 * @scs_layout: Packed G17P Gen1 shader-context scratch layout, or zero.
-	 * Bits 0:15 contain stack depth, 16:23 levels, 24:31 cliques,
-	 * 32:47 user bytes and 48:63 driver bytes. Non-G17P paths require zero.
-	 */
-	__u64 scs_layout;
-
-	/**
-	 * @prior_vdm: Historical render prefix, or zero for no added dependency.
-	 *
-	 * Requires DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS. Counts hardware render
-	 * commands accepted on this queue since creation, starting at one. A
-	 * nonzero value must not exceed the render count at this ioctl's entry;
-	 * it waits for every render command through that ordinal. The effective
-	 * dependency is the maximum of this prefix and the header's resolved
-	 * vdm_barrier. Header NONE does not suppress this field.
-	 */
-	__u64 prior_vdm;
-
-	/**
-	 * @prior_cdm: Historical compute prefix; see @prior_vdm, using the
-	 * queue's compute command count and the header's cdm_barrier instead.
-	 */
-	__u64 prior_cdm;
-
-	/** @cdm_auxiliary_allocation: G17P auxiliary allocation, zero or 8..32. */
-	__u32 cdm_auxiliary_allocation;
-	/** @reserved: MBZ. */
-	__u32 reserved;
-	/** @intersection_pool: 16-KiB aligned G17P intersection-table address. */
-	__u64 intersection_pool;
-	/** @intersection_pool_bytes: Mapped pool size in bytes, a multiple of 16 KiB. */
-	__u64 intersection_pool_bytes;
-	/** @intersection_first: First 128-byte entry in @intersection_pool. */
-	__u32 intersection_first;
-	/** @intersection_count: Number of 128-byte entries, less than 2^18. */
-	__u32 intersection_count;
-	/** @intersection_default_program: Encoded default G17P program address. */
-	__u64 intersection_default_program;
-	/** @intersection_default_control: Default G17P program control word. */
-	__u64 intersection_default_control;
-};
-
-/**
- * enum drm_asahi_compute_flags - Compute command flags
- */
-enum drm_asahi_compute_flags {
-	/**
-	 * @DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF: Reserved. This kernel rejects
-	 * compute commands that set it.
-	 */
-	DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF = (1L << 0),
-
-	DRM_ASAHI_COMPUTE_WIDE_VISIBILITY = (1L << 1),
 };
 
 /**
@@ -1655,7 +1384,6 @@ enum {
 	DRM_IOCTL_ASAHI_QUEUE_CREATE     = DRM_IOCTL_ASAHI(WR, QUEUE_CREATE, queue_create),
 	DRM_IOCTL_ASAHI_QUEUE_DESTROY    = DRM_IOCTL_ASAHI(W, QUEUE_DESTROY, queue_destroy),
 	DRM_IOCTL_ASAHI_SUBMIT           = DRM_IOCTL_ASAHI(W, SUBMIT, submit),
-	DRM_IOCTL_ASAHI_GEM_MADVISE      = DRM_IOCTL_ASAHI(WR, GEM_MADVISE, gem_madvise),
 };
 
 #if defined(__cplusplus)
