@@ -5,8 +5,7 @@
 
 struct device;
 
-int asahi_sysfs_register(struct device *dev, const void *snapshot,
-			 int export_enabled, void **handle);
-void asahi_sysfs_unregister(struct device *dev, void *handle);
+int asahi_sysfs_register(struct device *dev);
+void asahi_sysfs_unregister(struct device *dev);
 
 #endif /* _ASAHI_SYSFS_H */
