@@ -93,9 +93,6 @@ enum drm_asahi_ioctl_id {
 
 	/** @DRM_ASAHI_SUBMIT: Submit commands to a queue. */
 	DRM_ASAHI_SUBMIT,
-
-	/** @DRM_ASAHI_GEM_MADVISE: Mark a VM-private object purgeable or needed. */
-	DRM_ASAHI_GEM_MADVISE,
 };
 
 #define DRM_ASAHI_MAX_CLUSTERS	64
@@ -279,31 +276,6 @@ enum drm_asahi_feature {
 	 * Registration may still be refused.
 	 */
 	DRM_ASAHI_FEATURE_VM_STATUS_MIRROR = (1UL) << 4,
-
-	/**
-	 * @DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS: Render and compute payloads
-	 * support exact queue-local historical prefixes in prior_vdm/prior_cdm.
-	 * These fields supplement the header barriers.
-	 */
-	DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS = (1UL) << 5,
-
-	/**
-	 * @DRM_ASAHI_FEATURE_FEW_PRIMITIVES: Render commands accept
-	 * DRM_ASAHI_RENDER_FEW_PRIMITIVES.
-	 */
-	DRM_ASAHI_FEATURE_FEW_PRIMITIVES = (1UL) << 6,
-
-	/**
-	 * @DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS: Render commands accept
-	 * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS.
-	 */
-	DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS = (1UL) << 7,
-	/**
-	 * @DRM_ASAHI_FEATURE_RENDER_RAY_QUERY: Render commands accept per-stage
-	 * ray query state (struct drm_asahi_render_ray_query_stage) and queues
-	 * accept render_scs_layout.
-	 */
-	DRM_ASAHI_FEATURE_RENDER_RAY_QUERY = (1UL) << 8,
 };
 
 /**
@@ -538,41 +510,6 @@ struct drm_asahi_gem_mmap_offset {
 
 	/** @offset: The fake offset to use for subsequent mmap call */
 	__u64 offset;
-};
-
-/**
- * enum drm_asahi_gem_madv - Advice for DRM_IOCTL_ASAHI_GEM_MADVISE
- */
-enum drm_asahi_gem_madv {
-	/** @DRM_ASAHI_GEM_MADV_WILLNEED: The object's contents are needed. */
-	DRM_ASAHI_GEM_MADV_WILLNEED = 0,
-	/**
-	 * @DRM_ASAHI_GEM_MADV_DONTNEED: The object is not referenced by any
-	 * pending or future GPU work until the next WILLNEED. The kernel may
-	 * discard its contents under memory pressure.
-	 */
-	DRM_ASAHI_GEM_MADV_DONTNEED = 1,
-};
-
-/**
- * struct drm_asahi_gem_madvise - Arguments passed to
- * DRM_IOCTL_ASAHI_GEM_MADVISE
- *
- * Only VM-private objects accept advice. A purged object keeps its handle
- * and mappings but has no contents; userspace must not use it again.
- */
-struct drm_asahi_gem_madvise {
-	/** @handle: Handle of the object. */
-	__u32 handle;
-
-	/** @madv: One of enum drm_asahi_gem_madv. */
-	__u32 madv;
-
-	/** @retained: Set by the kernel: 1 if the contents are retained, 0 if purged. */
-	__u32 retained;
-
-	/** @pad: Must be zero. */
-	__u32 pad;
 };
 
 /**
@@ -823,13 +760,6 @@ struct drm_asahi_queue_create {
 	 * fix a 4GiB VA carveout for USC memory and pass its base address here.
 	 */
 	__u64 usc_exec_base;
-
-	/**
-	 * @render_scs_layout: Largest ray query scratch layouts of the vertex and
-	 * fragment stages this queue will submit, used to size its render pool.
-	 * Requires DRM_ASAHI_FEATURE_RENDER_RAY_QUERY; zero otherwise.
-	 */
-	__u64 render_scs_layout[2];
 };
 
 /**
@@ -1059,40 +989,6 @@ enum drm_asahi_render_flags {
 	 * so we match that here for efficiency.
 	 */
 	DRM_ASAHI_RENDER_DBIAS_IS_INT = (1U << 18),
-
-	/**
-	 * @DRM_ASAHI_RENDER_FEW_PRIMITIVES: The render pass is known to rasterize
-	 * at most four primitives in total.
-	 *
-	 * The count includes every primitive the pass generates: topology-derived
-	 * primitive counts of all draws multiplied by their instance counts, plus
-	 * internal work (clears, visibility, scissor/state generated work). Passes
-	 * with indirect draws, mesh work or any work whose primitive count is not
-	 * known at record time must not set this flag. The flag sets bit 0 of the
-	 * auxiliary framebuffer control word for the fragment stage; the hardware
-	 * effect is an optimization for small known passes and its omission is
-	 * always safe. Requires DRM_ASAHI_FEATURE_FEW_PRIMITIVES.
-	 */
-	DRM_ASAHI_RENDER_FEW_PRIMITIVES = (1U << 19),
-
-	/**
-	 * @DRM_ASAHI_RENDER_FRAGMENT_BARRIERS: Only the fragment stage waits for
-	 * this command's barriers.
-	 *
-	 * The render dependencies resolved from @vdm_barrier and @prior_vdm are
-	 * attached to the fragment half of the render instead of its vertex
-	 * (tiling) half, so vertex processing may start while the renders this
-	 * command depends on are still executing their fragment work. The
-	 * fragment half still waits for its own vertex half and for the previous
-	 * fragment work of its physical queue; the compute dependencies from
-	 * @cdm_barrier and @prior_cdm keep ordering the vertex half. Set this
-	 * only when every render dependency into the command is consumed by
-	 * fragment-stage or attachment accesses alone: nothing the vertex stage
-	 * reads (vertex/index/indirect buffers, vertex, tessellation or geometry
-	 * shader resources, transform feedback, conditional-rendering predicates)
-	 * may depend on it. Requires DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS.
-	 */
-	DRM_ASAHI_RENDER_FRAGMENT_BARRIERS = (1U << 20),
 };
 
 /**
@@ -1229,42 +1125,6 @@ struct drm_asahi_bg_eot {
 	 * uniforms, bound textures, and bound samplers.
 	 */
 	__u32 rsrc_spec;
-};
-
-/**
- * struct drm_asahi_render_ray_query_stage - Ray query state of one render stage
- *
- * Index 0 describes the vertex (tiling) stage and index 1 the fragment stage
- * of a render command. An all-zero entry disables ray queries in that stage.
- * Requires DRM_ASAHI_FEATURE_RENDER_RAY_QUERY.
- */
-struct drm_asahi_render_ray_query_stage {
-	/** @scs_layout: Per-thread ray query scratch layout, as for compute. */
-	__u64 scs_layout;
-
-	/** @intersection_aux: Auxiliary intersection table word. */
-	__u32 intersection_aux;
-
-	/** @intersection_pad: MBZ */
-	__u32 intersection_pad;
-
-	/** @intersection_pool: GPU VA of the intersection program pool. */
-	__u64 intersection_pool;
-
-	/** @intersection_pool_bytes: Size of the intersection program pool. */
-	__u64 intersection_pool_bytes;
-
-	/** @intersection_first: First intersection table entry. */
-	__u32 intersection_first;
-
-	/** @intersection_count: Number of intersection table entries. */
-	__u32 intersection_count;
-
-	/** @intersection_default: GPU VA of the default intersection program. */
-	__u64 intersection_default;
-
-	/** @intersection_default_control: Control word of the default program. */
-	__u64 intersection_default_control;
 };
 
 /**
@@ -1446,30 +1306,6 @@ struct drm_asahi_cmd_render {
 
 	/** @bg_partial_rsrc_spec_hi: High half of @partial_bg.rsrc_spec */
 	__u32 bg_partial_rsrc_spec_hi;
-
-	/**
-	 * @prior_vdm: Historical render prefix, or zero for no added dependency.
-	 *
-	 * Requires DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS. Counts hardware render
-	 * commands accepted on this queue since creation, starting at one. A
-	 * nonzero value must not exceed the render count at this ioctl's entry;
-	 * it waits for every render command through that ordinal. The effective
-	 * dependency is the maximum of this prefix and the header's resolved
-	 * vdm_barrier. Header NONE does not suppress this field.
-	 */
-	__u64 prior_vdm;
-
-	/**
-	 * @prior_cdm: Historical compute prefix; see @prior_vdm, using the
-	 * queue's compute command count and the header's cdm_barrier instead.
-	 */
-	__u64 prior_cdm;
-
-	/**
-	 * @ray_query: Ray query state of the vertex and fragment stages. Older
-	 * userspace omits it; a shorter command is read with both stages zeroed.
-	 */
-	struct drm_asahi_render_ray_query_stage ray_query[2];
 };
 
 /**
@@ -1507,48 +1343,6 @@ struct drm_asahi_cmd_compute {
 
 	/** @ts: Timestamps for the compute command */
 	struct drm_asahi_timestamps ts;
-
-	/**
-	 * @scs_layout: Packed G17P Gen1 shader-context scratch layout, or zero.
-	 * Bits 0:15 contain stack depth, 16:23 levels, 24:31 cliques,
-	 * 32:47 user bytes and 48:63 driver bytes. Non-G17P paths require zero.
-	 */
-	__u64 scs_layout;
-
-	/**
-	 * @prior_vdm: Historical render prefix, or zero for no added dependency.
-	 *
-	 * Requires DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS. Counts hardware render
-	 * commands accepted on this queue since creation, starting at one. A
-	 * nonzero value must not exceed the render count at this ioctl's entry;
-	 * it waits for every render command through that ordinal. The effective
-	 * dependency is the maximum of this prefix and the header's resolved
-	 * vdm_barrier. Header NONE does not suppress this field.
-	 */
-	__u64 prior_vdm;
-
-	/**
-	 * @prior_cdm: Historical compute prefix; see @prior_vdm, using the
-	 * queue's compute command count and the header's cdm_barrier instead.
-	 */
-	__u64 prior_cdm;
-
-	/** @cdm_auxiliary_allocation: G17P auxiliary allocation, zero or 8..32. */
-	__u32 cdm_auxiliary_allocation;
-	/** @reserved: MBZ. */
-	__u32 reserved;
-	/** @intersection_pool: 16-KiB aligned G17P intersection-table address. */
-	__u64 intersection_pool;
-	/** @intersection_pool_bytes: Mapped pool size in bytes, a multiple of 16 KiB. */
-	__u64 intersection_pool_bytes;
-	/** @intersection_first: First 128-byte entry in @intersection_pool. */
-	__u32 intersection_first;
-	/** @intersection_count: Number of 128-byte entries, less than 2^18. */
-	__u32 intersection_count;
-	/** @intersection_default_program: Encoded default G17P program address. */
-	__u64 intersection_default_program;
-	/** @intersection_default_control: Default G17P program control word. */
-	__u64 intersection_default_control;
 };
 
 /**
@@ -1590,7 +1384,6 @@ enum {
 	DRM_IOCTL_ASAHI_QUEUE_CREATE     = DRM_IOCTL_ASAHI(WR, QUEUE_CREATE, queue_create),
 	DRM_IOCTL_ASAHI_QUEUE_DESTROY    = DRM_IOCTL_ASAHI(W, QUEUE_DESTROY, queue_destroy),
 	DRM_IOCTL_ASAHI_SUBMIT           = DRM_IOCTL_ASAHI(W, SUBMIT, submit),
-	DRM_IOCTL_ASAHI_GEM_MADVISE      = DRM_IOCTL_ASAHI(WR, GEM_MADVISE, gem_madvise),
 };
 
 #if defined(__cplusplus)
