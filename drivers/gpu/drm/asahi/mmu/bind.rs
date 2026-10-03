@@ -15,6 +15,7 @@ pub(crate) struct PreparedUserMap {
     size: u64,
     offset: u64,
     single_page: bool,
+    context: context::PreparedBinding,
 }
 
 pub(crate) struct PreparedUserUnmap {
@@ -60,6 +61,7 @@ impl Vm {
         prot: Prot,
         single_page: bool,
     ) -> Result<PreparedUserMap> {
+        let context = self.prepare_context_binding(addr, size, offset)?;
         let resources = VmOpResources {
             preallocated_gpuvas: [
                 Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
@@ -92,6 +94,7 @@ impl Vm {
             size,
             offset,
             single_page,
+            context,
         })
     }
 
@@ -144,7 +147,8 @@ impl Vm {
                                 context: &mut ctx,
                                 flags,
                             });
-                            if result.is_ok() {
+                            let retired = result.is_ok().then(|| {
+                                let retired = self.commit_context_binding(&map.gem, &map.context);
                                 self.track_shared_binding(
                                     &map.gem,
                                     map.addr,
@@ -152,9 +156,11 @@ impl Vm {
                                     map.offset,
                                     map.single_page,
                                 );
-                            }
+                                retired
+                            });
                             drop(inner);
                             drop(commit);
+                            drop(retired);
                             Some(result)
                         }
                         Err(error) if error == EIO => {
@@ -175,11 +181,16 @@ impl Vm {
                                 inner
                                     .unique_gpuvm
                                     .sm_unmap(unmap.iova, unmap.size, &mut ctx);
-                            if result.is_ok() {
+                            let retired = result.is_ok().then(|| {
+                                let retired = self.untrack_context_ranges(core::iter::once(
+                                    unmap.iova..unmap.iova + unmap.size,
+                                ));
                                 self.untrack_shared_range(unmap.iova, unmap.size);
-                            }
+                                retired
+                            });
                             drop(inner);
                             drop(commit);
+                            drop(retired);
                             Some(result)
                         }
                         Err(error) if error == EIO => {
