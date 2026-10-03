@@ -25,6 +25,7 @@ use kernel::{
 use crate::{
     debug,
     file,
+    g17,
     gem::AsahiObject,
     gpu,
     hw,
@@ -44,6 +45,8 @@ pub(crate) struct AsahiPlatformDriver;
 pub(crate) struct AsahiPlatformDriverData<'bound> {
     _device: ARef<AsahiDrmDevice>,
     _reg: drm::Registration<'bound, AsahiDrmDriver>,
+    /// The G17 GPU, whose coprocessors must be stopped when the driver is unbound.
+    g17: Option<Arc<g17::Gpu>>,
 }
 
 /// Holds a reference to the top-level GPU object.
@@ -110,45 +113,71 @@ impl drm::driver::Driver for AsahiDrmDriver {
     }
 }
 
-// OF Device ID table.s
+/// Firmware interface selected by the hardware compatible.
+pub(crate) enum ProbeConfig {
+    Legacy(&'static hw::HwConfig),
+    G17(&'static g17::Config),
+}
+
+// OF Device ID table.
 kernel::of_device_table!(
     OF_TABLE,
     <AsahiPlatformDriver as platform::Driver>::IdInfo,
     [
-        (of::DeviceId::new(c"apple,agx-t8103"), &hw::t8103::HWCONFIG),
-        (of::DeviceId::new(c"apple,agx-t8112"), &hw::t8112::HWCONFIG),
+        (
+            of::DeviceId::new(c"apple,agx-t8140"),
+            ProbeConfig::G17(&hw::t8140::CONFIG)
+        ),
+        (
+            of::DeviceId::new(c"apple,agx-t8103"),
+            ProbeConfig::Legacy(&hw::t8103::HWCONFIG)
+        ),
+        (
+            of::DeviceId::new(c"apple,agx-t8112"),
+            ProbeConfig::Legacy(&hw::t8112::HWCONFIG)
+        ),
         (
             of::DeviceId::new(c"apple,agx-t6000"),
-            &hw::t600x::HWCONFIG_T6000
+            ProbeConfig::Legacy(&hw::t600x::HWCONFIG_T6000)
         ),
         (
             of::DeviceId::new(c"apple,agx-t6001"),
-            &hw::t600x::HWCONFIG_T6001
+            ProbeConfig::Legacy(&hw::t600x::HWCONFIG_T6001)
         ),
         (
             of::DeviceId::new(c"apple,agx-t6002"),
-            &hw::t600x::HWCONFIG_T6002
+            ProbeConfig::Legacy(&hw::t600x::HWCONFIG_T6002)
         ),
         (
             of::DeviceId::new(c"apple,agx-t6020"),
-            &hw::t602x::HWCONFIG_T6020
+            ProbeConfig::Legacy(&hw::t602x::HWCONFIG_T6020)
         ),
         (
             of::DeviceId::new(c"apple,agx-t6021"),
-            &hw::t602x::HWCONFIG_T6021
+            ProbeConfig::Legacy(&hw::t602x::HWCONFIG_T6021)
         ),
         (
             of::DeviceId::new(c"apple,agx-t6022"),
-            &hw::t602x::HWCONFIG_T6022
+            ProbeConfig::Legacy(&hw::t602x::HWCONFIG_T6022)
         ),
     ]
 );
 
 /// Platform Driver implementation for `AsahiDriver`.
 impl platform::Driver for AsahiPlatformDriver {
-    type IdInfo = &'static hw::HwConfig;
+    type IdInfo = ProbeConfig;
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
     type Data<'bound> = AsahiPlatformDriverData<'bound>;
+
+    fn unbind<'bound>(
+        _pdev: &'bound platform::Device<Core<'_>>,
+        this: Pin<&Self::Data<'bound>>,
+    ) {
+        if let Some(gpu) = this.g17.as_ref() {
+            // Driver data is dropped after devres, so CPU control must happen in unbind.
+            gpu.shutdown();
+        }
+    }
 
     /// Device probe function.
     fn probe<'bound>(
@@ -159,7 +188,10 @@ impl platform::Driver for AsahiPlatformDriver {
 
         dev_info!(pdev.as_ref(), "Probing...\n");
 
-        let cfg = info.ok_or(ENODEV)?;
+        let cfg = match info.ok_or(ENODEV)? {
+            ProbeConfig::Legacy(cfg) => *cfg,
+            ProbeConfig::G17(cfg) => return AsahiPlatformDriver::probe_g17(pdev, cfg),
+        };
 
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
 
@@ -216,8 +248,51 @@ impl platform::Driver for AsahiPlatformDriver {
         let driver = AsahiPlatformDriverData {
             _device: reg.device().into(),
             _reg: reg,
+            g17: None,
         };
 
         Ok(driver)
+    }
+}
+
+impl AsahiPlatformDriver {
+    fn probe_g17<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+        cfg: &'static g17::Config,
+    ) -> Result<AsahiPlatformDriverData<'bound>> {
+        // SAFETY: The GPU performs DMA through a UAT whose output width is part of the SoC config.
+        unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
+        let resources = regs::Resources::new(pdev)?;
+        let res = regs::G17Resources::new(pdev)?;
+        let drm = drm::UnregisteredDevice::<AsahiDrmDriver>::new(pdev, Ok(()))?;
+        let gpu = g17::Gpu::new(pdev, &drm, cfg, res)?;
+        let data_gpu = gpu.clone() as Arc<dyn gpu::Gpu>;
+        let data = try_pin_init!(AsahiDrmRegistrationData {
+            gpu: data_gpu,
+            resources,
+        });
+        // SAFETY: `reg` is stored in `AsahiPlatformDriverData` and dropped when the driver is
+        // unbound; it is never forgotten.
+        let reg = match unsafe { drm::Registration::new(pdev.as_ref(), drm, data, 0) } {
+            Ok(reg) => reg,
+            Err(error) => {
+                gpu.shutdown();
+                return Err(error);
+            }
+        };
+        Ok(AsahiPlatformDriverData {
+            _device: reg.device().into(),
+            _reg: reg,
+            g17: Some(gpu),
+        })
+    }
+}
+
+impl Drop for AsahiPlatformDriverData<'_> {
+    fn drop(&mut self) {
+        if let Some(gpu) = self.g17.as_ref() {
+            // Also covers failure to allocate platform driver data after the probe body returned.
+            gpu.shutdown();
+        }
     }
 }

@@ -99,7 +99,6 @@ impl<'a> Lane<'a> {
                     DataMaster::Fragment
                 },
                 timestamp,
-                config.priority as u8,
             )?,
             announce_destination,
             prefix: count as usize - 1,

@@ -66,7 +66,7 @@ impl Backend {
             }
             let work_state = {
                 let preparation = self.shared.preparations.enter(interruptible)?;
-                let result = packet.completion.work_state().and_then(|state| state.acquire());
+                let result = packet.completion.work_state().acquire();
                 if preparation.is_current() {
                     result
                 } else {
@@ -177,38 +177,26 @@ impl Registry {
         owner: u64,
         packet: &Arc<Packet>,
         state: u32,
-    ) -> Result<crate::g17::queue::render::RenderDependencies> {
-        let mut dependencies = crate::g17::queue::render::RenderDependencies::EMPTY;
+        dependencies: &mut [crate::g17::fw::kick::KickDependency; 3],
+    ) -> Result<usize> {
+        let mut count = 0;
         let frontier = self.render_prefix(owner, packet)?;
         for dependency in frontier.as_slice() {
-            *dependencies
-                .render
-                .get_mut(dependencies.render_count)
-                .ok_or(EOVERFLOW)? = *dependency;
-            dependencies.render_count += 1;
-        }
-        if dependencies.render_count != 0
-            && matches!(&packet.command, crate::g17::command::Validated::Render { pass, .. }
-                if pass.fragment_barriers)
-        {
-            let tiling = self.tiling_prefix(owner, packet)?;
-            for dependency in tiling.as_slice() {
-                *dependencies
-                    .tiling
-                    .get_mut(dependencies.tiling_count)
-                    .ok_or(EOVERFLOW)? = *dependency;
-                dependencies.tiling_count += 1;
-            }
+            *dependencies.get_mut(count).ok_or(EOVERFLOW)? = *dependency;
+            count += 1;
         }
         if let Some(queue) = self.compute(owner) {
-            dependencies.compute = queue.dependency(
+            if let Some(dependency) = queue.dependency(
                 owner,
                 packet.completion.status(),
                 packet.order.wait_through[1],
                 state,
-            )?;
+            )? {
+                *dependencies.get_mut(count).ok_or(EOVERFLOW)? = dependency;
+                count += 1;
+            }
         }
-        Ok(dependencies)
+        Ok(count)
     }
 }
 
@@ -218,20 +206,6 @@ impl crate::g17::Firmware {
         slot: u8,
         deferred: &mut DeferredBatch,
     ) -> Result {
-        let observe_before_failure = {
-            let entry = self.queues.render.entry_mut(slot)?;
-            let pair = entry.pair.as_ref().ok_or(EIO)?;
-            entry.pending_error.as_ref().is_some_and(|(status, _)| {
-                Arc::ptr_eq(pair.context().status(), status)
-            })
-        };
-        if observe_before_failure {
-            // VM failure could not observe this pair while preparation owned
-            // it. Restore the same final-observation boundary used by
-            // settle_render_vm before quarantining any still-owned commands.
-            // Keep pending_error intact if observation itself fails.
-            self.retire_render_slot(usize::from(slot), None, deferred)?;
-        }
         let entry = self.queues.render.entry_mut(slot)?;
         let pair = entry.pair.as_mut().ok_or(EIO)?;
         if let Some((status, error)) = entry.pending_error.take() {
@@ -278,7 +252,7 @@ impl crate::g17::Firmware {
         packet: &Arc<Packet>,
         deferred: &mut DeferredBatch,
     ) -> Result {
-        use crate::g17::queue::render::PublicationLease;
+        use crate::g17::{fw::kick::KickDependency, queue::render::PublicationLease};
         let state = crate::g17::recovery::Memory::recovery_state(&self.init)?;
         if self.recovery.pending() || state != 0 {
             return Err(EAGAIN);
@@ -286,15 +260,10 @@ impl crate::g17::Firmware {
         if packet.completion.status().get() != 0 {
             return Err(EIO);
         }
-        // Both outer destinations must have room before pool accounting or
-        // either inner queue becomes visible. All host producers share this lock.
-        let priority = packet.context.policy().priority();
-        if !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Fragment)?
-            || !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Tiling)?
-        {
-            return Err(EBUSY);
-        }
-        let dependencies = self.queues.render_dependencies(owner, packet, state)?;
+        let mut dependencies = [KickDependency::ZERO; 3];
+        let count = self
+            .queues
+            .render_dependencies(owner, packet, state, &mut dependencies)?;
         let pair = self.queues.render.entry(slot)?.pair.as_ref().ok_or(EIO)?;
         let pool = pair.pool().clone();
         let buffer_id = pair.buffer_id();
@@ -313,7 +282,7 @@ impl crate::g17::Firmware {
         let result = self.with_render(usize::from(slot), |pair, host| {
             pair.publish(
                 packet.clone(),
-                &dependencies,
+                &dependencies[..count],
                 lease,
                 host,
                 &mut |event| deferred.push(event),

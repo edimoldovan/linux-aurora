@@ -9,17 +9,46 @@ use kernel::{prelude::*, sync::Arc};
 pub(crate) const POLL_NS: u64 = 2_500_000_000;
 const QUARANTINED_DELAY_NS: u64 = 250_000_000;
 const CANCELLED_DELAY_NS: u64 = 2_000_000_000;
+const ACK_SLOTS: usize = 16;
 
 // Firmware-visible cookie namespace persists for the loaded module's lifetime.
 static NEXT_COOKIE: AtomicU32 = AtomicU32::new(1);
 
-pub(crate) fn next_cookie() -> Result<u64> {
-    // Never reuse an identity while a delayed firmware ACK can still exist.
-    // The final counter value is an exhaustion marker, not a wrapping cookie.
-    NEXT_COOKIE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
-        .map(u64::from)
-        .map_err(|_| EOVERFLOW)
+pub(crate) fn next_cookie() -> u64 {
+    loop {
+        let cookie = NEXT_COOKIE.fetch_add(1, Ordering::Relaxed);
+        if cookie != 0 {
+            return cookie.into();
+        }
+    }
+}
+
+pub(crate) struct Acks([u64; ACK_SLOTS]);
+impl Acks {
+    pub(crate) fn new() -> Self {
+        Self([0; ACK_SLOTS])
+    }
+    pub(crate) fn note(&mut self, cookie: u64) {
+        if cookie == 0 || self.contains(cookie) {
+            return;
+        }
+        if let Some(slot) = self.0.iter_mut().find(|slot| **slot == 0) {
+            *slot = cookie;
+        }
+    }
+    pub(crate) fn contains(&self, cookie: u64) -> bool {
+        cookie != 0 && self.0.contains(&cookie)
+    }
+    pub(crate) fn forget(&mut self, cookie: u64) {
+        for slot in &mut self.0 {
+            if *slot == cookie {
+                *slot = 0;
+            }
+        }
+    }
+    pub(crate) fn snapshot(&self) -> [u64; ACK_SLOTS] {
+        self.0
+    }
 }
 
 pub(crate) struct State {
@@ -72,36 +101,14 @@ pub(super) struct Transaction {
     cookie: u64,
     published: u64,
     phase: Phase,
-    announced: Option<u64>,
-}
-
-impl Transaction {
-    /// The firmware acknowledged the kill and the killed commands were settled.
-    pub(super) fn released(&self) -> bool {
-        self.phase == Phase::Released
-    }
 }
 
 impl Queue {
-    /// A command with ray traversal scratch is never killed. On Neo, killing a
-    /// traversal that stopped making progress either crashed the GPU firmware
-    /// when the queue's pool was then released, or stalled every later render
-    /// when it was retained; left alone, the rest of the GPU kept working. Such
-    /// a queue stays quarantined and retained until its commands retire.
-    fn active_traversal(&self) -> bool {
-        self.active.iter().any(|active| {
-            matches!(
-                &active.packet.command,
-                crate::g17::command::Validated::Compute { scratch, .. } if scratch.enabled()
-            )
-        })
-    }
     pub(crate) fn exit_candidate(&self, context: &Arc<Context>, age: u64) -> bool {
-        self.context().is_some_and(|bound| Arc::ptr_eq(bound, context))
+        Arc::ptr_eq(self.context(), context)
             && self.released
             && self.active.len != 0
             && self.exit.is_none()
-            && !self.active_traversal()
             && (self.quarantined || self.retired_by_teardown)
             && age
                 >= if self.quarantined {
@@ -129,64 +136,37 @@ impl Queue {
             cookie,
             published: now,
             phase: Phase::Published,
-            announced: None,
         });
-    }
-    /// A failed doorbell does not undo the published kill or consume its retry.
-    /// The caller retries under the device mutex; only the original record exists.
-    pub(crate) fn announce_exit(&mut self, now: u64, notify: impl FnOnce() -> Result) -> Result {
-        let Some(exit) = self.exit.as_mut() else {
-            return Ok(());
-        };
-        if exit.phase != Phase::Published || exit.announced.is_some() {
-            return Ok(());
-        }
-        notify()?;
-        exit.announced = Some(now);
-        Ok(())
     }
     pub(crate) fn exit_polling(&self, now: u64) -> bool {
         self.exit.as_ref().is_some_and(|exit| {
-            exit.phase == Phase::Published
-                && now.saturating_sub(exit.announced.unwrap_or(exit.published)) < POLL_NS
+            exit.phase == Phase::Published && now.saturating_sub(exit.published) < POLL_NS
         })
     }
-    /// Event consumption and record_exit are serialized by the device mutex.
-    /// A kill pins this exact queue transaction through its final witness;
-    /// duplicate, unknown and terminal cookies cannot acknowledge another owner.
-    pub(crate) fn acknowledge_exit(&mut self, cookie: u64) -> bool {
-        let Some(exit) = self.exit.as_mut() else {
-            return false;
-        };
-        if cookie == 0 || exit.cookie != cookie || exit.phase != Phase::Published {
-            return false;
-        }
-        exit.phase = Phase::Acknowledged;
-        true
+    pub(crate) fn exit_cookie(&self) -> Option<u64> {
+        self.exit
+            .as_ref()
+            .filter(|exit| matches!(exit.phase, Phase::Published | Phase::Acknowledged))
+            .map(|exit| exit.cookie)
     }
     pub(crate) fn settle_exit(
         &mut self,
+        acks: &Acks,
         recovery_closed: bool,
-        complete_qos: &mut impl FnMut(crate::g17::qos::Owner) -> Result,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
-        let Some(phase) = self.exit.as_ref().map(|exit| exit.phase) else {
+        let Some(cookie) = self.exit_cookie() else {
             return Ok(());
         };
-        if !matches!(phase, Phase::Acknowledged | Phase::Unproven) {
+        if !acks.contains(cookie) {
             return Ok(());
         }
-        // An unproven kill (acknowledged before the scheduler page showed the killed
-        // state) is re-read on later passes and settles only once the page proves it,
-        // even after its commands were retired by other means.
-        if self.active.len != 0 || phase == Phase::Unproven {
+        self.exit.as_mut().ok_or(EIO)?.phase = Phase::Acknowledged;
+        if self.active.len != 0 {
             if !recovery_closed {
                 return Ok(());
             }
-            let Some(context) = self.context() else {
-                return Ok(());
-            };
-            let state = match State::read(context) {
+            let state = match State::read(self.context()) {
                 Ok(state) => state,
                 Err(_) => return Ok(()),
             };
@@ -205,11 +185,6 @@ impl Queue {
             }
         }
         while let Some(active) = self.active.front() {
-            if active.qos_pending {
-                complete_qos(self.qos_owner())?;
-                self.active.iter_mut().next().ok_or(EIO)?.qos_pending = false;
-            }
-            let active = self.active.front().ok_or(EIO)?;
             defer(Deferred::Retired(
                 active.packet.completion.clone(),
                 Err(if self.spared_deferred {

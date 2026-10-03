@@ -23,7 +23,7 @@ use super::kick::{
 use super::queue::CommandTag;
 use super::{
     clear, offset_va, sampler_max, stamp_value, timestamp_end_va, work_key, ObjectIds, UNK_0A599,
-    UNK_0D411, UNK_101D9, UNK_1C8F8,
+    UNK_0D411, UNK_101D9, UNK_10791, UNK_1A0E9, UNK_1C8F8,
 };
 
 /// Size of a tiling descriptor.
@@ -54,11 +54,7 @@ const DEFLAKE_20: u64 = 0x20;
 const DEFLAKE_2A0: u64 = 0x2a0;
 
 const TA_REGISTERS: usize = 73;
-const TA_REGISTERS_MAX: usize = TA_REGISTERS + 1;
-const TA_SCS_ENABLE_INDEX: usize = 1;
 const FRAGMENT_REGISTERS: usize = 89;
-const FRAGMENT_REGISTERS_MAX: usize = FRAGMENT_REGISTERS + 1;
-const FRAGMENT_SCS_ENABLE_INDEX: usize = 1;
 const PARTIAL_STORE_REGISTERS: usize = 16;
 const PARTIAL_RESUME_REGISTERS: usize = 23;
 const PARTIAL_LOAD_REGISTERS: usize = 10;
@@ -89,8 +85,6 @@ const TILE_CONFIG_BASE: u64 = 0x280;
 const TILE_CONFIG_LAYERED: u64 = 1 << 0;
 const TILE_CONFIG_PROCESS_EMPTY_TILES: u64 = 1 << 16;
 const AUX_FB_FLAGS_BASE: u64 = 0xc000;
-/// The pass rasterizes at most four known primitives (userspace's promise).
-const AUX_FB_FLAGS_FEW_PRIMITIVES: u64 = 1 << 0;
 const AUX_FB_FLAGS_DBIAS_INT: u64 = 1 << 18;
 /// Tiling layer mode: layer count less one, bit 15, and for layered targets
 /// bit 14 plus the empty-tile policy. The second copy keeps only the count and
@@ -126,6 +120,8 @@ const UNK_15359_PARTIAL: u64 = 0x20;
 /// Required value of register 0x15049 and of fragment descriptor field
 /// +0x1f50.
 const UNK_15049: u64 = 0x10_0000;
+/// Value of the fragment register 0x10791.
+const UNK_10791_FRAGMENT: u64 = UNK_10791 | 1 << 9;
 /// USC program offsets carry tag bits that are not part of the address.
 const USC_OFFSET_TAG_MASK: u32 = 7;
 
@@ -182,10 +178,6 @@ pub(crate) struct RenderPass {
     pub(crate) depth_bias_va: u64,
     /// Depth-bias values are integers.
     pub(crate) depth_bias_is_int: bool,
-    /// At most four known primitives; sets the auxiliary framebuffer bit 0.
-    pub(crate) few_primitives: bool,
-    /// Host-only: the resolved barriers order the fragment kick, not the tiling kick.
-    pub(crate) fragment_barriers: bool,
     /// GPU address of the occlusion-query results, or zero.
     pub(crate) occlusion_query_va: u64,
     /// GPU address of the sampler heap, or zero.
@@ -214,14 +206,11 @@ pub(crate) struct RenderPass {
     pub(crate) bg: UscProgram,
     /// Partial-render background program.
     pub(crate) partial_bg: UscProgram,
-    /// Tagged USC offset of the end-of-tile program.
+    /// Tagged USC offset of the end-of-tile program. Its resource specifier
+    /// is always written as zero.
     pub(crate) eot_offset: u32,
-    /// Resource specifier of the end-of-tile program.
-    pub(crate) eot_rsrc_spec: u64,
     /// Tagged USC offset of the partial-render end-of-tile program.
     pub(crate) partial_eot_offset: u32,
-    /// Resource specifier of the partial-render end-of-tile program.
-    pub(crate) partial_eot_rsrc_spec: u64,
     /// The resource specifiers have their high 32 bits.
     pub(crate) rsrc_spec_hi: bool,
 }
@@ -305,7 +294,6 @@ pub(crate) struct RenderStage {
 pub(crate) struct RenderArgs<'a> {
     /// Render-pass state.
     pub(crate) pass: &'a RenderPass,
-    pub(crate) ray_query: [super::render_rt::RayQueryStage; 2],
     /// Kernel-owned objects.
     pub(crate) resources: &'a RenderResources,
     /// Submission ordinal of the render queue pair, from zero.
@@ -395,9 +383,7 @@ struct PassWords {
     partial_bg_rsrc_spec: u64,
     partial_bg_va: u64,
     eot_va: u64,
-    eot_rsrc_spec: u64,
     partial_eot_va: u64,
-    partial_eot_rsrc_spec: u64,
 }
 
 impl PassWords {
@@ -432,13 +418,10 @@ impl PassWords {
             partial_zls_control |= ZLS_PARTIAL_STENCIL;
         }
 
-        let mut aux_fb_flags = AUX_FB_FLAGS_BASE;
-        if pass.depth_bias_is_int {
-            aux_fb_flags |= AUX_FB_FLAGS_DBIAS_INT;
-        }
-        if pass.few_primitives {
-            aux_fb_flags |= AUX_FB_FLAGS_FEW_PRIMITIVES;
-        }
+        let aux_fb_flags = match pass.depth_bias_is_int {
+            true => AUX_FB_FLAGS_BASE | AUX_FB_FLAGS_DBIAS_INT,
+            false => AUX_FB_FLAGS_BASE,
+        };
         let rsrc_spec = |spec: u64| match pass.rsrc_spec_hi {
             true => spec,
             false => spec & u32::MAX as u64,
@@ -463,9 +446,7 @@ impl PassWords {
             partial_bg_rsrc_spec: rsrc_spec(pass.partial_bg.rsrc_spec),
             partial_bg_va: usc(pass.partial_bg.offset)?,
             eot_va: usc(pass.eot_offset)?,
-            eot_rsrc_spec: rsrc_spec(pass.eot_rsrc_spec),
             partial_eot_va: usc(pass.partial_eot_offset)?,
-            partial_eot_rsrc_spec: rsrc_spec(pass.partial_eot_rsrc_spec),
         })
     }
 }
@@ -484,7 +465,7 @@ fn ta_registers(
     args: &RenderArgs<'_>,
     g: &Geometry,
     w: &PassWords,
-) -> Result<[RegisterWrite; TA_REGISTERS_MAX]> {
+) -> Result<[RegisterWrite; TA_REGISTERS]> {
     let p = args.pass;
     let r = args.resources;
     let tilemap = user_offset(r.tilemap_va)?;
@@ -500,12 +481,9 @@ fn ta_registers(
     }
     let key = work_key(r.context_id, args.ta.state_word);
     let ids = r.ta_ids.word();
-    let rt = args.ray_query[0];
-    let ift = rt.intersection.words();
 
     Ok([
         RegisterWrite::new(0x01748, 1),
-        RegisterWrite::new(0x017d9, 1),
         RegisterWrite::new(0x10141, 0x200),
         RegisterWrite::new(0x1c039, tilemap),
         RegisterWrite::new(0x1c9c8, tilemap),
@@ -551,16 +529,16 @@ fn ta_registers(
         RegisterWrite::new(0x1c898, 0),
         RegisterWrite::new(0x101e1, UNK_101D9),
         RegisterWrite::new(0x1c9e8, w.layer_mode & LAYER_MODE_PIPE_MASK),
-        RegisterWrite::new(0x1a099, ift[0]),
-        RegisterWrite::new(0x1a0a1, ift[1]),
-        RegisterWrite::new(0x1a069, ift[2]),
-        RegisterWrite::new(0x1a071, ift[3]),
-        RegisterWrite::new(0x1a0c9, ift[4]),
-        RegisterWrite::new(0x1a0d1, ift[5]),
-        RegisterWrite::new(0x101c9, rt.scratch.size_word()),
-        RegisterWrite::new(0x0d471, rt.scratch.tail_word()),
-        RegisterWrite::new(0x1a0f1, rt.scratch.stack_word()),
-        RegisterWrite::new(0x10799, rt.scratch.window_word()),
+        RegisterWrite::new(0x1a099, 0),
+        RegisterWrite::new(0x1a0a1, 0),
+        RegisterWrite::new(0x1a069, 0),
+        RegisterWrite::new(0x1a071, 0),
+        RegisterWrite::new(0x1a0c9, 0),
+        RegisterWrite::new(0x1a0d1, 0),
+        RegisterWrite::new(0x101c9, 0),
+        RegisterWrite::new(0x0d471, 0),
+        RegisterWrite::new(0x1a0f1, UNK_1A0E9),
+        RegisterWrite::new(0x10799, UNK_10791),
         RegisterWrite::new(0x1c830, r.pb_slot as u64),
         RegisterWrite::new(0x1ca30, r.pm_scratch),
         RegisterWrite::new(0x16c39, r.pm_scratch),
@@ -585,7 +563,7 @@ fn fragment_registers(
     args: &RenderArgs<'_>,
     g: &Geometry,
     w: &PassWords,
-) -> [RegisterWrite; FRAGMENT_REGISTERS_MAX] {
+) -> [RegisterWrite; FRAGMENT_REGISTERS] {
     let p = args.pass;
     let r = args.resources;
     let mut tile_state = TILE_STATE_BASE
@@ -597,15 +575,12 @@ fn fragment_registers(
     }
     let key = work_key(r.context_id, args.fragment.state_word);
     let ids = r.fragment_ids.word();
-    let rt = args.ray_query[1];
-    let ift = rt.intersection.words();
 
     [
         RegisterWrite::new(0x01739, 1),
-        RegisterWrite::new(0x017d9, 1),
         RegisterWrite::new(0x10009, w.utile_config),
         // End-of-tile resource specifier.
-        RegisterWrite::new(0x15379, w.eot_rsrc_spec),
+        RegisterWrite::new(0x15379, 0),
         RegisterWrite::new(0x15381, w.eot_va),
         RegisterWrite::new(0x15369, w.bg_rsrc_spec),
         RegisterWrite::new(0x15371, w.bg_va),
@@ -620,7 +595,7 @@ fn fragment_registers(
         RegisterWrite::new(0x16030, g.macro_size),
         RegisterWrite::new(0x100d9, g.screen),
         RegisterWrite::new(0x0a301, 0),
-        RegisterWrite::new(0x10791, rt.scratch.window_word() | 1 << 9),
+        RegisterWrite::new(0x10791, UNK_10791_FRAGMENT),
         RegisterWrite::new(0x16098, r.heapmeta_va),
         RegisterWrite::new(0x15109, p.scissor_va),
         RegisterWrite::new(0x15101, p.depth_bias_va),
@@ -668,15 +643,15 @@ fn fragment_registers(
         RegisterWrite::new(0x101e9, UNK_101D9),
         RegisterWrite::new(0x160a8, 0),
         RegisterWrite::new(0x16068, tile_state),
-        RegisterWrite::new(0x1a0a9, ift[0]),
-        RegisterWrite::new(0x1a0b1, ift[1]),
-        RegisterWrite::new(0x1a079, ift[2]),
-        RegisterWrite::new(0x1a081, ift[3]),
-        RegisterWrite::new(0x1a0d9, ift[4]),
-        RegisterWrite::new(0x1a0e1, ift[5]),
-        RegisterWrite::new(0x101c1, rt.scratch.size_word()),
-        RegisterWrite::new(0x0d469, rt.scratch.tail_word()),
-        RegisterWrite::new(0x1a0f9, rt.scratch.stack_word()),
+        RegisterWrite::new(0x1a0a9, 0),
+        RegisterWrite::new(0x1a0b1, 0),
+        RegisterWrite::new(0x1a079, 0),
+        RegisterWrite::new(0x1a081, 0),
+        RegisterWrite::new(0x1a0d9, 0),
+        RegisterWrite::new(0x1a0e1, 0),
+        RegisterWrite::new(0x101c1, 0),
+        RegisterWrite::new(0x0d469, 0),
+        RegisterWrite::new(0x1a0f9, UNK_1A0E9),
         RegisterWrite::new(0x0a5a9, UNK_0A599),
         RegisterWrite::new(0x0d429, UNK_0D411),
         RegisterWrite::new(0x160e0, ids),
@@ -701,7 +676,7 @@ fn partial_store_registers(
 ) -> [RegisterWrite; PARTIAL_STORE_REGISTERS] {
     [
         // End-of-tile resource specifier.
-        RegisterWrite::new(0x15379, w.partial_eot_rsrc_spec),
+        RegisterWrite::new(0x15379, 0),
         RegisterWrite::new(0x15381, w.partial_eot_va),
         RegisterWrite::new(0x10039, w.tile_config),
         RegisterWrite::new(0x15359, UNK_15359_PARTIAL),
@@ -726,7 +701,7 @@ fn partial_resume_registers(
 ) -> [RegisterWrite; PARTIAL_RESUME_REGISTERS] {
     [
         // End-of-tile resource specifier.
-        RegisterWrite::new(0x15379, w.partial_eot_rsrc_spec),
+        RegisterWrite::new(0x15379, 0),
         RegisterWrite::new(0x15381, w.partial_eot_va),
         RegisterWrite::new(0x15369, w.partial_bg_rsrc_spec),
         RegisterWrite::new(0x15371, w.partial_bg_va),
@@ -916,16 +891,9 @@ impl TaDescriptor {
         self.pb_va = resources.pb_va;
         self.scene_va = resources.scene_va;
         self.scene_end_va = resources.scene_end_va;
-        let scs_register = args.ray_query[0].scratch.enabled();
-        self.checkpoints = TA_CHECKPOINTS.map(|count| count + u16::from(scs_register));
+        self.checkpoints = TA_CHECKPOINTS;
         self.unk_48 = (args.ordinal as u32).wrapping_add((args.ordinal / 2) as u32);
-        if scs_register {
-            self.registers.set(array_va, &registers)?;
-        } else {
-            let mut trimmed = [registers[0]; TA_REGISTERS];
-            trimmed[TA_SCS_ENABLE_INDEX..].copy_from_slice(&registers[TA_SCS_ENABLE_INDEX + 1..]);
-            self.registers.set(array_va, &trimmed)?;
-        }
+        self.registers.set(array_va, &registers)?;
         self.tpc_va = resources.tpc_va;
         self.tpc_size = resources.tpc_size;
         self.fragment_qid = args.fragment.qid.into();
@@ -979,11 +947,10 @@ impl TaDescriptor {
     /// descriptor's address as seen by the pass's VM.
     pub(crate) fn register_bindings(
         descriptor_va: u64,
-        scs_register: bool,
     ) -> Result<[Option<RegisterArrayBinding>; 4]> {
         let array = RegisterArrayBinding::new(
             offset_va(descriptor_va, Self::ARRAY_OFFSET)?,
-            TA_CHECKPOINTS[0] as u8 + u8::from(scs_register),
+            TA_CHECKPOINTS[0] as u8,
         )?;
         Ok([Some(array), None, None, None])
     }
@@ -1069,14 +1036,12 @@ pub(crate) struct FragmentDescriptor {
     pub(crate) unk_1f50: u64,
     /// Tile configuration.
     pub(crate) tile_config: u64,
-    pub(crate) unk_1f60: [u8; 0x18],
-    /// Low word of the end-of-tile resource specifier.
-    pub(crate) eot_rsrc_spec: u32,
+    /// Ends with the end-of-tile resource specifier, which is zero.
+    pub(crate) unk_1f60: [u8; 0x1c],
     /// GPU address of the end-of-tile program.
     pub(crate) eot_va: u64,
-    pub(crate) unk_1f84: [u8; 0x14],
-    /// Low word of the partial-render end-of-tile resource specifier.
-    pub(crate) partial_eot_rsrc_spec: u32,
+    /// Ends with the partial end-of-tile resource specifier, which is zero.
+    pub(crate) unk_1f84: [u8; 0x18],
     /// GPU address of the partial-render end-of-tile program.
     pub(crate) partial_eot_va: u64,
     pub(crate) unk_1fa4: u32,
@@ -1170,14 +1135,13 @@ impl FragmentDescriptor {
     /// the descriptor's address as seen by the pass's VM.
     pub(crate) fn register_bindings(
         descriptor_va: u64,
-        scs_register: bool,
     ) -> Result<[Option<RegisterArrayBinding>; 4]> {
         let array = |index, checkpoint: usize| -> Result<Option<RegisterArrayBinding>> {
             let va = offset_va(descriptor_va, Self::array_offset(index))?;
             Ok(Some(RegisterArrayBinding::new(va, checkpoint as u8)?))
         };
         Ok([
-            array(0, FRAGMENT_CHECKPOINTS[0] as usize + usize::from(scs_register))?,
+            array(0, FRAGMENT_CHECKPOINTS[0] as usize)?,
             array(1, PARTIAL_STORE_REGISTERS)?,
             array(2, PARTIAL_RESUME_REGISTERS)?,
             array(3, PARTIAL_LOAD_REGISTERS)?,
@@ -1244,19 +1208,9 @@ impl FragmentSlot {
         desc.merge_upper_x = pass.merge_upper_x;
         desc.merge_upper_y = pass.merge_upper_y;
         desc.tiles = geometry.tiles_x * geometry.tiles_y;
-        let scs_register = args.ray_query[1].scratch.enabled();
-        let extra = u16::from(scs_register);
-        desc.checkpoints = FRAGMENT_CHECKPOINTS.map(|count| count + extra);
-        desc.entries = FRAGMENT_REGISTERS as u16 + extra;
-        let registers = fragment_registers(args, &geometry, &words);
-        if scs_register {
-            desc.arrays[0].set(arrays[0], &registers)?;
-        } else {
-            let mut trimmed = [registers[0]; FRAGMENT_REGISTERS];
-            trimmed[FRAGMENT_SCS_ENABLE_INDEX..]
-                .copy_from_slice(&registers[FRAGMENT_SCS_ENABLE_INDEX + 1..]);
-            desc.arrays[0].set(arrays[0], &trimmed)?;
-        }
+        desc.checkpoints = FRAGMENT_CHECKPOINTS;
+        desc.entries = FRAGMENT_REGISTERS as u16;
+        desc.arrays[0].set(arrays[0], &fragment_registers(args, &geometry, &words))?;
         desc.arrays[1].set(arrays[1], &partial_store_registers(pass, &words))?;
         desc.arrays[2].set(arrays[2], &partial_resume_registers(pass, &words))?;
         desc.arrays[3].set(arrays[3], &partial_load_registers(pass, &words))?;
@@ -1274,9 +1228,7 @@ impl FragmentSlot {
         desc.height = pass.height;
         desc.unk_1f50 = UNK_15049;
         desc.tile_config = words.tile_config;
-        desc.eot_rsrc_spec = words.eot_rsrc_spec as u32;
         desc.eot_va = words.eot_va;
-        desc.partial_eot_rsrc_spec = words.partial_eot_rsrc_spec as u32;
         desc.partial_eot_va = words.partial_eot_va;
         desc.depth_clear = pass.depth_clear;
         desc.unk_1fac = words.tib_blocks << Self::UNK_1FAC_TIB_SHIFT | Self::UNK_1FAC_BASE;

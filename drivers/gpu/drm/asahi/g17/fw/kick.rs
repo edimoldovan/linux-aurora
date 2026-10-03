@@ -20,7 +20,7 @@
 
 use kernel::prelude::*;
 
-use super::queue::Policy;
+use super::queue::QUEUE_PRIORITY;
 
 /// Number of entries in a kick ring.
 pub(crate) const KICK_SLOTS: usize = 256;
@@ -369,10 +369,6 @@ pub(crate) struct KickArgs<'a> {
     pub(crate) event_mask: [u64; 4],
     /// Register arrays bound to the kick.
     pub(crate) register_arrays: [Option<RegisterArrayBinding>; 4],
-    /// The compute register program includes a shader-context scratch request.
-    pub(crate) scs_enabled: bool,
-    /// Priority class of the queue.
-    pub(crate) priority: u8,
 }
 
 /// One kick ring entry.
@@ -383,7 +379,7 @@ pub(crate) struct KickArgs<'a> {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct KickEntry {
     /// Timestamp in bits 41:2, QID in bits 48:42, MCache table present in bit
-    /// 58, queue priority in bits 60:59 and compute scratch enabled in bit 61.
+    /// 58 and queue priority in bits 60:59.
     pub(crate) header: u64,
     /// MCache table: address >> 5 in bits 43:6, count - 1 in bits 59:54.
     pub(crate) mcache: u64,
@@ -423,7 +419,6 @@ impl KickEntry {
     const QID_SHIFT: u32 = 42;
     const MCACHE_PRESENT: u64 = 1 << 58;
     const PRIORITY_SHIFT: u32 = 59;
-    const SCS_ENABLED: u64 = 1 << 61;
     const QOS_SLOT_SHIFT: u32 = 32;
     const QOS_CLASS_SHIFT: u32 = 40;
     const QOS_CLASS_MAX: u8 = 0x1f;
@@ -438,17 +433,13 @@ impl KickEntry {
         if args.qid > QID_MAX
             || barriers > KICK_BARRIERS_MAX
             || args.qos.class > Self::QOS_CLASS_MAX
-            || args.priority >= Policy::PRIORITIES
         {
             return Err(EINVAL);
         }
 
         let mut header = args.timestamp.get() << Self::TIMESTAMP_SHIFT
             | (args.qid as u64) << Self::QID_SHIFT
-            | (args.priority as u64) << Self::PRIORITY_SHIFT;
-        if args.scs_enabled {
-            header |= Self::SCS_ENABLED;
-        }
+            | (QUEUE_PRIORITY as u64) << Self::PRIORITY_SHIFT;
         let mcache = match args.mcache {
             Some(table) => {
                 header |= Self::MCACHE_PRESENT;
@@ -509,10 +500,9 @@ impl RenderRegistration {
 
     /// Validates both queues without touching MMIO. The resulting transaction
     /// writes fragment configuration and validity before tiling configuration
-    /// and validity. Each validity mask is stored high before low. Both queues
-    /// are registered at priority class `priority`.
-    pub(crate) fn new(fragment: (u8, u64), tiling: (u8, u64), priority: u8) -> Result<Self> {
-        if fragment.0 == tiling.0 || priority >= Policy::PRIORITIES {
+    /// and validity. Each validity mask is stored high before low.
+    pub(crate) fn new(fragment: (u8, u64), tiling: (u8, u64)) -> Result<Self> {
+        if fragment.0 == tiling.0 {
             return Err(EINVAL);
         }
         let mut writes = [(0, 0); 8];
@@ -526,7 +516,7 @@ impl RenderRegistration {
             if qid > QID_MAX || va & !Self::ADDRESS_MASK != 0 {
                 return Err(EINVAL);
             }
-            let completion = (3 * (4 - u64::from(priority)) + 0x3fe).wrapping_shl(54);
+            let completion = (3 * (4 - u64::from(QUEUE_PRIORITY)) + 0x3fe).wrapping_shl(54);
             let payload = ((engine as u64 + 1) << 60) | va | completion;
             let (low, high) = if qid < 64 {
                 (1u64 << qid, 0)

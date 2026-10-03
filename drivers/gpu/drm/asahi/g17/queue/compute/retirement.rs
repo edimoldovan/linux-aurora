@@ -3,7 +3,6 @@
 //! Exact identities and visibility witnesses for a physical compute queue.
 //! A shared work-state counter can include other engines and cannot prove this queue retired.
 
-use crate::g17::initdata::ComputeCompletion;
 use kernel::prelude::*;
 
 pub(crate) const IN_FLIGHT: usize = 16;
@@ -65,32 +64,8 @@ pub(crate) enum Recordless {
     CrossedRecovery,
 }
 
-/// How long a command whose exact completion record is present waits for its completion stamp
-/// before it retires on the record alone. The firmware stores the stamp after the cache
-/// maintenance that follows the record; it occasionally never stores it for a command, most
-/// visibly while a render of the same VM is running.
-pub(crate) const STAMP_GRACE_NS: u64 = 1_000_000;
-
-static STAMPLESS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Counts a command that retired on its record without its completion stamp; logs the first and
-/// every 64th.
-pub(crate) fn note_stampless(qid: u8, kick: u64) {
-    let count = STAMPLESS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-    if count == 1 || count % 64 == 0 {
-        pr_info!(
-            "G17: {} compute commands retired on their completion record without a completion stamp (latest: queue {} kick {:#x})\n",
-            count,
-            qid,
-            kick
-        );
-    }
-}
-
 /// A zero-duration record fails before visibility polling. It proves execution did not occur;
 /// ownership still requires a separate retirement witness before mappings can be released.
-/// The command is complete when its stamp covers it, or when its exact completion record has
-/// been present for [`STAMP_GRACE_NS`] (`record_aged`); in both cases its items must be consumed.
 pub(crate) fn poll(
     ticket: &Ticket,
     observed: Option<Observation>,
@@ -99,13 +74,13 @@ pub(crate) fn poll(
     recordless: Recordless,
     floor: u64,
     next_end: Option<u64>,
-    record_aged: bool,
 ) -> Result<Option<[u64; 2]>> {
     if observed.is_some_and(|record| record.timestamps[0] == record.timestamps[1]) {
         return Err(ENODATA);
     }
-    let completed = stamp_covers(stamp, ticket.kick) || (observed.is_some() && record_aged);
-    if !completed || !cursors.consumed(ticket.item_producer, ticket.item_count)? {
+    if !stamp_covers(stamp, ticket.kick)
+        || !cursors.consumed(ticket.item_producer, ticket.item_count)?
+    {
         return Ok(None);
     }
     Ok(Some(match observed {
@@ -195,20 +170,17 @@ impl Batch {
         self.open = Some(ticket.qid);
         Ok(())
     }
-    /// Capture the control word once, then read only a requested identity's payload.
-    /// Records can be overwritten during a scan: incomplete or older identities are skipped.
-    pub(crate) fn fold(&mut self, record: ComputeCompletion<'_>) -> Result {
-        let control = record.read(0)?;
-        let qid = ((control >> 9) & 0x7f) as usize;
+    /// The transport reads eight aligned words from a 0x40-byte firmware record. Records can be
+    /// overwritten during a scan: incomplete or older identities are skipped, never consumed.
+    pub(crate) fn fold(&mut self, words: [u64; 8]) -> Result {
+        let qid = ((words[0] >> 9) & 0x7f) as usize;
         let (start, count) = self.slots[qid];
-        if count == 0 {
+        if count == 0 || words[6] & !1 == 0 || words[7] == 0 {
             return Ok(());
         }
-        let descriptor = record.read(6)? & !1;
-        if descriptor == 0 || record.read(7)? == 0 {
-            return Ok(());
-        }
-        let kick = (((control >> 8) & 0xffff_ffff_00) | ((control >> 48) & 0xff)) & 0xff_ffff_ffff;
+        let descriptor = words[6] & !1;
+        let kick =
+            (((words[0] >> 8) & 0xffff_ffff_00) | ((words[0] >> 48) & 0xff)) & 0xff_ffff_ffff;
         let requests = self.requests.get_mut(start..start + count).ok_or(EIO)?;
         let Some(request) = requests
             .iter_mut()
@@ -216,7 +188,7 @@ impl Batch {
         else {
             return Ok(());
         };
-        let timestamps = [record.read(2)? & TIME_MASK, record.read(5)? & TIME_MASK];
+        let timestamps = [words[2] & TIME_MASK, words[5] & TIME_MASK];
         if timestamps[0] == 0
             || timestamps[1] == 0
             || request

@@ -8,26 +8,20 @@ use super::*;
 
 pub(crate) struct PreparedUserMap {
     gem: ARef<gem::Object>,
-    ctx: StepContext,
+    vm_bo: ARef<gpuvm::GpuVmBo<VmInner>>,
+    resources: VmOpResources,
+    prot: Prot,
     addr: u64,
     size: u64,
     offset: u64,
     single_page: bool,
-    context: context::PreparedBinding,
-    _residency: Option<residency::Lease>,
 }
 
 pub(crate) struct PreparedUserUnmap {
-    _residency: Option<residency::Lease>,
     pub(super) iova: u64,
     pub(super) size: u64,
-    pub(super) ctx: StepContext,
+    resources: VmOpResources,
 }
-
-// SAFETY: This owns a thread-safe residency lease, a numeric range and unused,
-// unlinked split-node allocations; step_remap moves each node out of ctx before
-// linking it, so a retained ctx never owns a linked GPUVA.
-unsafe impl Send for PreparedUserUnmap {}
 
 pub(super) enum PreparedUserBindOp {
     Map(PreparedUserMap),
@@ -56,6 +50,7 @@ impl PreparedUserBindBatch {
 
 impl Vm {
     /// Prepares host state without taking DMA reservations or changing any leaf.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_bind_object(
         &self,
         gem: &gem::Object,
@@ -65,72 +60,51 @@ impl Vm {
         prot: Prot,
         single_page: bool,
     ) -> Result<PreparedUserMap> {
-        gem::validate_vm_binding(gem, self)?;
-        let residency = self.enter_residency_metadata()?;
-        let context = self.prepare_context_binding(addr, size, offset)?;
-        let mut ctx = StepContext {
-            new_va: Some(gpuvm::GpuVa::<VmInner>::new(pin_init::default())?),
-            prev_va: Some(gpuvm::GpuVa::<VmInner>::new(pin_init::default())?),
-            next_va: Some(gpuvm::GpuVa::<VmInner>::new(pin_init::default())?),
-            prot,
-            ..Default::default()
+        let resources = VmOpResources {
+            preallocated_gpuvas: [
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
+            ],
         };
-        let vm_bo = self.inner.obtain_bo(gem)?;
+        // SAFETY: As in `Vm::bind_object()`, the device is bound while its file can issue binds.
+        let dev = unsafe { self.dev.as_bound() };
+        // Populate the scatter-gather table before any GPUVM lock is taken.
+        gem.sg_table(dev)?;
+        let vm_bo = self
+            .gpuvm
+            .obtain(gem, pin_init!(VmBoData { segments <- new_mutex!(None) }))?;
         {
-            let needs_sgt = vm_bo.inner().inner.lock().sgt.is_none();
-            if needs_sgt {
-                // Pin without the BO mutex: alias construction can hold the GEM
-                // reservation while acquiring this mutex.
-                let sgt = crate::gem::held_sg_table(&gem)?;
-                let mut bo = vm_bo.inner().inner.lock();
-                if bo.sgt.is_none() {
-                    if bo.sg_vec.is_none() {
-                        let mut segments = KVVec::new();
-                        let mut offset = 0;
-                        for range in sgt.iter() {
-                            let address = range.dma_address() as usize;
-                            let length = range.dma_len() as usize;
-                            segments.push((offset, address..address + length), GFP_KERNEL)?;
-                            offset += length;
-                        }
-                        bo.sg_vec = Some(segments);
-                    }
-                    bo.sgt = Some(sgt);
-                }
-                // Release the mutex before a losing initializer drops its SG
-                // owner. The declaration order also preserves this on errors.
-                drop(bo);
+            let mut segments = vm_bo.data().segments.lock();
+            if segments.is_none() {
+                segments.replace(prefetch_sgt_segments(dev, gem)?);
             }
         }
-        ctx.vm_bo = Some(vm_bo);
         if (addr | size | offset) & UAT_PGMSK as u64 != 0 {
             return Err(EINVAL);
         }
         Ok(PreparedUserMap {
-            _residency: residency,
             gem: gem.into(),
-            ctx,
+            vm_bo,
+            resources,
+            prot,
             addr,
             size,
             offset,
             single_page,
-            context,
         })
     }
 
     pub(crate) fn prepare_user_unmap(&self, iova: u64, size: u64) -> Result<PreparedUserUnmap> {
-        if (iova | size) & UAT_PGMSK as u64 != 0 || !self.inner.range_valid(iova, size) {
-            return Err(EINVAL);
-        }
-        let residency = self.enter_residency_metadata()?;
         Ok(PreparedUserUnmap {
-            _residency: residency,
             iova,
             size,
-            ctx: StepContext {
-                prev_va: Some(gpuvm::GpuVa::<VmInner>::new(pin_init::default())?),
-                next_va: Some(gpuvm::GpuVa::<VmInner>::new(pin_init::default())?),
-                ..Default::default()
+            resources: VmOpResources {
+                preallocated_gpuvas: [
+                    Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
+                    Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
+                    None,
+                ],
             },
         })
     }
@@ -141,31 +115,36 @@ impl Vm {
         &self,
         batch: &mut PreparedUserBindBatch,
     ) -> Result {
-        if self.defer_bind_batch(batch, 0)? {
+        if self.defer_bind_batch(batch)? {
             return Ok(());
         }
         let mut index = 0;
         while index < batch.ops.len() {
             let result = match &mut batch.ops[index] {
                 PreparedUserBindOp::Map(map) => {
-                    let mut inner = self.inner.exec_lock(Some(&map.gem), true)?;
+                    // SAFETY: See `lock_vm()`. As in `Vm::bind_object()`, the object itself is
+                    // not locked: the map step may still populate its pages.
+                    let mut inner = unsafe { self.gpuvm.exec_lock(None, true)? };
                     match self.mapping_commit() {
                         Ok(commit) => {
                             let (flags, repeat) = if map.single_page {
-                                (gpuvm::GpuVaFlags::REPEAT, UAT_PGSZ as u32)
+                                (GpuVaFlag::REPEAT.into(), UAT_PGSZ as u32)
                             } else {
-                                (gpuvm::GpuVaFlags::NONE, 0)
+                                (GpuVaFlags::empty(), 0)
                             };
-                            let result = inner.sm_map(
-                                &mut map.ctx,
-                                map.addr,
-                                map.size,
-                                map.offset,
-                                repeat,
+                            // SAFETY: As in `Vm::bind_object()`.
+                            let dev = unsafe { self.dev.as_bound() };
+                            let mut ctx = StepContext::new(Some(dev), map.prot, &mut map.resources)?;
+                            let result = inner.unique_gpuvm.sm_map(OpMapRequest {
+                                addr: map.addr,
+                                range: map.size,
+                                gem_offset: map.offset,
+                                gem_range: repeat,
+                                vm_bo: &map.vm_bo,
+                                context: &mut ctx,
                                 flags,
-                            );
-                            let retired = result.is_ok().then(|| {
-                                let retired = self.commit_context_binding(&map.gem, &map.context);
+                            });
+                            if result.is_ok() {
                                 self.track_shared_binding(
                                     &map.gem,
                                     map.addr,
@@ -173,11 +152,9 @@ impl Vm {
                                     map.offset,
                                     map.single_page,
                                 );
-                                retired
-                            });
+                            }
                             drop(inner);
                             drop(commit);
-                            drop(retired);
                             Some(result)
                         }
                         Err(error) if error == EIO => {
@@ -188,20 +165,21 @@ impl Vm {
                     }
                 }
                 PreparedUserBindOp::Unmap(unmap) => {
-                    let mut inner = self.inner.exec_lock(None, true)?;
+                    // SAFETY: See `lock_vm()`.
+                    let mut inner = unsafe { self.gpuvm.exec_lock(None, true)? };
                     match self.mapping_commit() {
                         Ok(commit) => {
-                            let result = inner.sm_unmap(&mut unmap.ctx, unmap.iova, unmap.size);
-                            let retired = result.is_ok().then(|| {
-                                let retired = self.untrack_context_ranges(core::iter::once(
-                                    unmap.iova..unmap.iova + unmap.size,
-                                ));
+                            let mut ctx =
+                                StepContext::new(None, Prot::default(), &mut unmap.resources)?;
+                            let result =
+                                inner
+                                    .unique_gpuvm
+                                    .sm_unmap(unmap.iova, unmap.size, &mut ctx);
+                            if result.is_ok() {
                                 self.untrack_shared_range(unmap.iova, unmap.size);
-                                retired
-                            });
+                            }
                             drop(inner);
                             drop(commit);
-                            drop(retired);
                             Some(result)
                         }
                         Err(error) if error == EIO => {
@@ -215,7 +193,7 @@ impl Vm {
             if let Some(result) = result {
                 result?;
                 index += 1;
-            } else if self.defer_bind_batch(batch, index)? {
+            } else if self.defer_bind_batch(batch)? {
                 return Ok(());
             }
         }

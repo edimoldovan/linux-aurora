@@ -10,8 +10,7 @@ use super::{
     object::{CpuMap, KernelObject, Placement},
     Config, Role,
 };
-use crate::{driver::AsahiDevice, hw::t8140, mmu};
-use core::ops::Range;
+use crate::{driver::AsahiDrmDevice, hw::t8140, mmu};
 use core::sync::atomic::{fence, AtomicU32, Ordering};
 use kernel::{c_str, prelude::*};
 use t8140::{kernel_window as high, low};
@@ -23,31 +22,12 @@ const CONTEXT_SIZE: usize = 0x20000;
 const REGION_A_SIZE: usize = core::mem::size_of::<abi::RegionA>();
 const REGION_C_SIZE: usize = 0x1000;
 
+const COMPUTE_BLOCKS_ALLOCATED: usize = 23;
 const COMPUTE_BLOCKS_MAPPED: usize = 22;
 const COMPUTE_BLOCKS_POPULATED: usize = 21;
 const COMPUTE_CONTROL_BLOCKS: u32 = 25;
 const COMPUTE_CONTROL_CURSOR: u32 = 0x18;
 const COMPUTE_RUN_ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
-
-/// A borrowed completion slot. Read the identity before requesting its timestamps;
-/// unrelated QIDs need only the control word. Each access is an aligned live load.
-pub(crate) struct ComputeCompletion<'a> {
-    object: &'a KernelObject,
-    offset: usize,
-}
-
-impl ComputeCompletion<'_> {
-    pub(crate) fn read(&self, word: usize) -> Result<u64> {
-        if word >= 8 {
-            return Err(EINVAL);
-        }
-        // The scanner bounds offset to a 0x40-byte slot in the completion ring.
-        Ok(self
-            .object
-            .dword(self.offset + word * 8)?
-            .load(Ordering::Relaxed))
-    }
-}
 
 /// Unpublished device-wide compute backing, prepared without the device mutex. The cache
 /// identity belongs to this allocation, not to any one physical queue or client VM.
@@ -64,8 +44,8 @@ impl ComputeShared {
             KernelObject::backing(alloc.dev, low::RENDER_PAGE_LIST_SIZE, CpuMap::WriteCombined)?;
         let runs =
             KernelObject::backing(alloc.dev, low::RENDER_RUN_LIST_SIZE, CpuMap::WriteCombined)?;
-        let mut blocks = KVec::with_capacity(COMPUTE_BLOCKS_MAPPED, GFP_KERNEL)?;
-        for _ in 0..COMPUTE_BLOCKS_MAPPED {
+        let mut blocks = KVec::with_capacity(COMPUTE_BLOCKS_ALLOCATED, GFP_KERNEL)?;
+        for _ in 0..COMPUTE_BLOCKS_ALLOCATED {
             blocks.push(
                 KernelObject::backing(alloc.dev, abi::FREE_LIST_BLOCK_SIZE, CpuMap::WriteCombined)?,
                 GFP_KERNEL,
@@ -166,57 +146,6 @@ pub(super) struct InitData {
     render_blocks: core::ops::Range<usize>,
 }
 
-/// Placement inputs shared by the build steps.
-struct BuildEnv<'a> {
-    dev: &'a AsahiDevice,
-    vm: &'a mmu::Vm,
-    lower: &'a mmu::Vm,
-    render: &'a mmu::Vm,
-    base: u64,
-    dynamic: Range<u64>,
-}
-
-impl BuildEnv<'_> {
-    /// An object at a fixed offset of the kernel window.
-    fn fixed(&self, offset: u64, size: usize, prot: mmu::Prot, cpu: CpuMap) -> Result<KernelObject> {
-        KernelObject::new(
-            self.dev,
-            self.vm,
-            Placement::At(self.base + offset),
-            size,
-            prot,
-            cpu,
-        )
-    }
-
-    /// An object placed in the dynamic part of the kernel window.
-    fn dynamic(&self, size: usize, align: u64, prot: mmu::Prot, cpu: CpuMap) -> Result<KernelObject> {
-        KernelObject::new(
-            self.dev,
-            self.vm,
-            Placement::In(self.dynamic.clone(), align),
-            size,
-            prot,
-            cpu,
-        )
-    }
-}
-
-/// Object indices the firmware-object initialization needs from the table step.
-struct DescriptorTables {
-    pb: usize,
-    page_pool: usize,
-    fwctl: usize,
-}
-
-/// Object indices and ring addresses the firmware-object initialization needs from the bundle step.
-struct BundleObjects {
-    zero: usize,
-    completion_rings: [abi::CompletionRing; 2],
-    region_a: usize,
-    qos: usize,
-}
-
 impl InitData {
     /// Empty construction state, retained even if graph construction fails.
     pub(super) fn new() -> Self {
@@ -285,12 +214,11 @@ impl InitData {
 
     /// Initialize a fresh physical compute QID's row before exposing its queue. An installed
     /// or rebound queue keeps the row's firmware-owned counters and must never call this again.
-    /// Called for a fresh row or after its free-list release was consumed.
-    pub(super) fn initialize_compute_pool_blocks(&self, slot: u16, page_list_va: u64, blocks: usize) -> Result {
+    pub(super) fn initialize_compute_pool(&self, slot: u16, page_list_va: u64) -> Result {
         if slot == 0 || slot > u16::from(super::fw::kick::QID_MAX) + 1 {
             return Err(EINVAL);
         }
-        let entry = abi::PagePoolDescriptor::compute_blocks(page_list_va, blocks);
+        let entry = abi::PagePoolDescriptor::compute(page_list_va);
         let size = core::mem::size_of::<abi::PagePoolDescriptor>();
         let offset = usize::from(slot) * size;
         let object = self.object(self.page_pool)?;
@@ -300,8 +228,8 @@ impl InitData {
             object.dword(offset + core::mem::offset_of!(abi::PagePoolDescriptor, counters))?;
         let count =
             object.dword(offset + core::mem::offset_of!(abi::PagePoolDescriptor, page_count))?;
-        // SAFETY: the whole fresh row was bounds checked, this is a fresh QID or its release
-        // was consumed, and the device mutex excludes another host publisher. No other row is touched.
+        // SAFETY: the whole fresh row was bounds checked, the QID has never been published,
+        // and the device mutex excludes another host publisher. No other row is touched.
         unsafe {
             pointer.write_bytes(0, size);
         }
@@ -465,23 +393,8 @@ impl InitData {
         Ok(())
     }
 
-    /// The sole host publisher holds the device mutex through the following
-    /// inner and outer publication. Firmware consumers can only free capacity;
-    /// neither this check nor waiting for room reserves or limits other queues.
-    /// `priority` selects the engine's ring of that priority class.
-    pub(super) fn work_ready(
-        &self,
-        priority: u8,
-        engine: super::fw::queue::DataMaster,
-    ) -> Result<bool> {
-        let [consumer, consumer_b, producer] = self.work_cursors(priority, engine)?;
-        let next = (producer + 1) % super::fw::channels::WORK_RING_SLOTS;
-        Ok(next != consumer && next != consumer_b)
-    }
-
     fn work_publication<'a>(
         &'a self,
-        priority: u8,
         record: &'a super::fw::channels::WorkSlot,
     ) -> Result<WorkPublication<'a>> {
         use super::fw::{channels, queue::DataMaster};
@@ -491,8 +404,8 @@ impl InitData {
             2 => DataMaster::Compute,
             _ => return Err(EINVAL),
         };
-        let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
-        let [consumer, consumer_b, producer] = self.work_cursors(priority, engine)?;
+        let channel = channels::work_ring_index(engine);
+        let [consumer, consumer_b, producer] = self.work_cursors(engine)?;
         let next = (producer + 1) % channels::WORK_RING_SLOTS;
         if next == consumer || next == consumer_b {
             return Err(EINVAL);
@@ -515,13 +428,9 @@ impl InitData {
     }
 
     /// Two firmware consumers and the host producer, sampled in that order.
-    pub(super) fn work_cursors(
-        &self,
-        priority: u8,
-        engine: super::fw::queue::DataMaster,
-    ) -> Result<[u32; 3]> {
+    pub(super) fn work_cursors(&self, engine: super::fw::queue::DataMaster) -> Result<[u32; 3]> {
         use super::fw::channels;
-        let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
+        let channel = channels::work_ring_index(engine);
         let base = Self::state_offset(Role::Primary) + abi::work_state_offset(channel);
         let state = self.object(self.cluster)?;
         let mut values = [0; 3];
@@ -543,12 +452,8 @@ impl InitData {
 
     /// Inner queue records must be visible before this outer publication. The returned
     /// producer is the retained consumer witness for this slot.
-    pub(super) fn publish_work(
-        &self,
-        priority: u8,
-        record: &super::fw::channels::WorkSlot,
-    ) -> Result<u32> {
-        Ok(self.work_publication(priority, record)?.commit())
+    pub(super) fn publish_work(&self, record: &super::fw::channels::WorkSlot) -> Result<u32> {
+        Ok(self.work_publication(record)?.commit())
     }
 
     /// Validate both destinations before exposing fragment, then tiling. The accounting token
@@ -556,7 +461,6 @@ impl InitData {
     /// Deferred pairs retain both slot bodies without exposing either producer.
     pub(super) fn publish_work_pair(
         &self,
-        priority: u8,
         fragment: &super::fw::channels::WorkSlot,
         tiling: &super::fw::channels::WorkSlot,
         deferred: bool,
@@ -569,8 +473,8 @@ impl InitData {
         {
             return Err(EINVAL);
         }
-        let fragment = self.work_publication(priority, fragment)?;
-        let tiling = self.work_publication(priority, tiling)?;
+        let fragment = self.work_publication(fragment)?;
+        let tiling = self.work_publication(tiling)?;
         fragment.copy_record();
         commit_accounting()?;
         fence(Ordering::SeqCst);
@@ -589,7 +493,6 @@ impl InitData {
 
     fn retained_work_publication<'a>(
         &'a self,
-        priority: u8,
         record: &'a super::fw::channels::WorkSlot,
         next: u32,
     ) -> Result<WorkPublication<'a>> {
@@ -599,7 +502,7 @@ impl InitData {
             1 => DataMaster::Fragment,
             _ => return Err(EINVAL),
         };
-        let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
+        let channel = channels::work_ring_index(engine);
         let producer = self.object(self.cluster)?.word(
             Self::state_offset(Role::Primary)
                 + abi::work_state_offset(channel)
@@ -626,7 +529,6 @@ impl InitData {
     /// witnesses before either copy; both bodies precede the fragment and tiling publications.
     pub(super) fn publish_retained_work_pair(
         &self,
-        priority: u8,
         fragment: &super::fw::channels::WorkSlot,
         tiling: &super::fw::channels::WorkSlot,
         next: [u32; 2],
@@ -637,8 +539,8 @@ impl InitData {
         {
             return Err(EINVAL);
         }
-        let fragment = self.retained_work_publication(priority, fragment, next[0])?;
-        let tiling = self.retained_work_publication(priority, tiling, next[1])?;
+        let fragment = self.retained_work_publication(fragment, next[0])?;
+        let tiling = self.retained_work_publication(tiling, next[1])?;
         fragment.copy_record();
         tiling.copy_record();
         fence(Ordering::SeqCst);
@@ -653,15 +555,18 @@ impl InitData {
     /// scanner latches exact identities; firmware retains sole ownership of these slots.
     pub(super) fn scan_compute_completions(
         &self,
-        mut record: impl FnMut(ComputeCompletion<'_>) -> Result,
+        mut record: impl FnMut([u64; 8]) -> Result,
     ) -> Result {
         let object = self.object(self.completion_rings[0])?;
         fence(Ordering::Acquire);
         for slot in 0..(abi::COMPLETION_RING_SIZE / 0x40).min(0x800) {
-            record(ComputeCompletion {
-                object,
-                offset: slot * 0x40,
-            })?;
+            let mut words = [0; 8];
+            for (index, word) in words.iter_mut().enumerate() {
+                *word = object
+                    .dword(slot * 0x40 + index * 8)?
+                    .load(Ordering::Relaxed);
+            }
+            record(words)?;
         }
         Ok(())
     }
@@ -689,57 +594,58 @@ impl InitData {
     /// Constructs the graph after the firmware has published the high-root entries.
     pub(super) fn build(
         &mut self,
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         cfg: &Config,
         uat: &mmu::Uat,
         render: &mmu::Vm,
         metrics: &KernelObject,
     ) -> Result {
+        let vm = uat.kernel_vm();
+        let lower = uat.kernel_lower_vm();
         let range = uat.geometry().kernel_range();
-        let env = BuildEnv {
-            dev,
-            vm: uat.kernel_vm(),
-            lower: uat.kernel_lower_vm(),
-            render,
-            base: range.start,
-            dynamic: range.start + t8140::dynamic::KERNEL_OFFSET..range.end,
+        let base = range.start;
+        let dynamic = base + t8140::dynamic::KERNEL_OFFSET..range.end;
+        let fixed = |offset, size, prot, cpu| {
+            KernelObject::new(dev, vm, Placement::At(base + offset), size, prot, cpu)
         };
-        self.map_register_windows(&env)?;
-        let tables = self.build_descriptor_tables(&env)?;
-        self.build_render_free_lists(&env)?;
-        let first_block = self.build_render_pool(&env)?;
-        self.build_compute_pools(&env, first_block)?;
-        let bundle = self.build_bundle(&env, cfg, metrics)?;
-        self.initialize_firmware_objects(&env, cfg, &tables, &bundle)
-    }
+        let dynamic_object = |size, align, prot, cpu| {
+            KernelObject::new(
+                dev,
+                vm,
+                Placement::In(dynamic.clone(), align),
+                size,
+                prot,
+                cpu,
+            )
+        };
+        use mmu::{
+            PROT_FW_PRIV_RW as FP, PROT_FW_SHARED_RW as FS, PROT_GPU_FW_PRIV_RW as GFP,
+            PROT_GPU_FW_SHARED_RW as GFS, PROT_GPU_SHARED_RW as GS,
+        };
+        use CpuMap::{WriteBack as WB, WriteCombined as WC};
 
-    fn map_register_windows(&mut self, env: &BuildEnv<'_>) -> Result {
         for window in &t8140::REGISTER_WINDOWS {
             let (phys, va, size) = window.mapping().ok_or(EINVAL)?;
             self.aliases.push(
-                env.vm.map_io(va, phys.try_into()?, size.try_into()?, mmu::PROT_FW_MMIO_RW)?,
+                vm.map_io(
+                    dev.as_ref().as_ref(),
+                    va,
+                    phys.try_into()?,
+                    size.try_into()?,
+                    mmu::PROT_FW_MMIO_RW,
+                )?,
                 GFP_KERNEL,
             )?;
         }
-        Ok(())
-    }
-
-    /// The private cluster, zero page and the three descriptor tables with their low aliases.
-    fn build_descriptor_tables(&mut self, env: &BuildEnv<'_>) -> Result<DescriptorTables> {
-        use mmu::{
-            PROT_FW_PRIV_RW as FP, PROT_FW_SHARED_RW as FS, PROT_GPU_FW_SHARED_RW as GFS,
-            PROT_GPU_SHARED_RW as GS,
-        };
-        use CpuMap::{WriteBack as WB, WriteCombined as WC};
-        self.cluster = self.add(env.fixed(high::PRIVATE_CLUSTER, abi::private::SIZE, FS, WC)?)?;
-        self.compute_global = self.add(env.fixed(high::ZERO_PAGE, mmu::UAT_PGSZ, FP, WC)?)?;
-        let pb = self.add(env.fixed(high::PB_DESCRIPTORS, mmu::UAT_PGSZ, FS, WC)?)?;
+        self.cluster = self.add(fixed(high::PRIVATE_CLUSTER, abi::private::SIZE, FS, WC)?)?;
+        self.compute_global = self.add(fixed(high::ZERO_PAGE, mmu::UAT_PGSZ, FP, WC)?)?;
+        let pb = self.add(fixed(high::PB_DESCRIPTORS, mmu::UAT_PGSZ, FS, WC)?)?;
         self.object_mut(pb)?
             .initialize::<abi::PbDescriptorTable>(0, |table| {
                 table.init();
                 Ok(())
             })?;
-        let page_pool = self.add(env.fixed(high::PAGE_POOL_DESCRIPTORS, mmu::UAT_PGSZ, FS, WC)?)?;
+        let page_pool = self.add(fixed(high::PAGE_POOL_DESCRIPTORS, mmu::UAT_PGSZ, FS, WC)?)?;
         self.object_mut(page_pool)?
             .initialize::<abi::PagePoolDescriptorTable>(0, |table| {
                 table.init(low::RENDER_PAGE_LIST, low::COMPUTE_POOL_PAGE_LIST);
@@ -747,30 +653,17 @@ impl InitData {
             })?;
         self.pb = pb;
         self.page_pool = page_pool;
-        self.alias(pb, env.lower, low::PB_DESCRIPTORS, GS)?;
-        self.alias(page_pool, env.lower, low::PAGE_POOL_DESCRIPTORS, GS)?;
-        let index = self.add(env.fixed(high::INDEX, INDEX_SIZE, GFS, WB)?)?;
+        self.alias(pb, lower, low::PB_DESCRIPTORS, GS)?;
+        self.alias(page_pool, lower, low::PAGE_POOL_DESCRIPTORS, GS)?;
+        let index = self.add(fixed(high::INDEX, INDEX_SIZE, GFS, WB)?)?;
         self.object_mut(index)?
             .initialize::<abi::IndexTable>(0, |table| {
                 table.init();
                 Ok(())
             })?;
-        self.alias(index, env.lower, low::INDEX, GFS)?;
-        let fwctl = self.add(env.fixed(high::FWCTL, abi::FWCTL_SIZE, FS, WB)?)?;
-        Ok(DescriptorTables {
-            pb,
-            page_pool,
-            fwctl,
-        })
-    }
+        self.alias(index, lower, low::INDEX, GFS)?;
+        let fwctl = self.add(fixed(high::FWCTL, abi::FWCTL_SIZE, FS, WB)?)?;
 
-    /// Render and boot free-list controls, descriptor pages and the two queue contexts.
-    fn build_render_free_lists(&mut self, env: &BuildEnv<'_>) -> Result {
-        use mmu::{
-            PROT_FW_PRIV_RW as FP, PROT_FW_SHARED_RW as FS, PROT_GPU_FW_PRIV_RW as GFP,
-            PROT_GPU_FW_SHARED_RW as GFS,
-        };
-        use CpuMap::WriteCombined as WC;
         for (offset, state, class, prot, initial) in [
             (
                 high::RENDER_FREE_LIST,
@@ -787,7 +680,7 @@ impl InitData {
                 abi::FreeListState::BOOT,
             ),
         ] {
-            let control = self.add(env.fixed(offset, mmu::UAT_PGSZ, prot, WC)?)?;
+            let control = self.add(fixed(offset, mmu::UAT_PGSZ, prot, WC)?)?;
             self.object_mut(control)?.write(
                 0,
                 abi::FreeListControl::new(&abi::FreeListArgs {
@@ -796,7 +689,7 @@ impl InitData {
                     page_list_va: low::RENDER_PAGE_LIST,
                     run_list_va: low::RENDER_RUN_LIST,
                     blocks: low::RENDER_BLOCKS_INITIAL,
-                    state_va: env.base + state,
+                    state_va: base + state,
                 }),
             )?;
             let state_prot = if class == abi::FreeListClass::One {
@@ -804,26 +697,19 @@ impl InitData {
             } else {
                 GFS
             };
-            let state = self.add(env.fixed(state, mmu::UAT_PGSZ, state_prot, WC)?)?;
+            let state = self.add(fixed(state, mmu::UAT_PGSZ, state_prot, WC)?)?;
             self.object_mut(state)?.write(0, initial)?;
             if class == abi::FreeListClass::Two {
                 self.boot_control = control;
                 self.boot_state = state;
             }
         }
-        self.stamps[0] = self.add(env.fixed(high::DESCRIPTOR_PAGE_A, mmu::UAT_PGSZ, GFS, WC)?)?;
-        self.stamps[1] = self.add(env.fixed(high::DESCRIPTOR_PAGE_B, mmu::UAT_PGSZ, GFP, WC)?)?;
-        self.add(env.fixed(high::TA_CONTEXT, CONTEXT_SIZE, FS, WC)?)?;
-        self.add(env.fixed(high::FRAGMENT_CONTEXT, CONTEXT_SIZE, FS, WC)?)?;
-        Ok(())
-    }
+        self.stamps[0] = self.add(fixed(high::DESCRIPTOR_PAGE_A, mmu::UAT_PGSZ, GFS, WC)?)?;
+        self.stamps[1] = self.add(fixed(high::DESCRIPTOR_PAGE_B, mmu::UAT_PGSZ, GFP, WC)?)?;
+        self.add(fixed(high::TA_CONTEXT, CONTEXT_SIZE, FS, WC)?)?;
+        self.add(fixed(high::FRAGMENT_CONTEXT, CONTEXT_SIZE, FS, WC)?)?;
 
-    /// Render page list, run list and blocks aliased into the render-global root; returns
-    /// the index of the first block.
-    fn build_render_pool(&mut self, env: &BuildEnv<'_>) -> Result<usize> {
-        use mmu::PROT_GPU_SHARED_RW as GS;
-        use CpuMap::WriteBack as WB;
-        let pages = self.add(KernelObject::backing(env.dev, low::RENDER_PAGE_LIST_SIZE, WB)?)?;
+        let pages = self.add(KernelObject::backing(dev, low::RENDER_PAGE_LIST_SIZE, WB)?)?;
         self.object_mut(pages)?
             .initialize::<[u64; low::RENDER_PAGE_LIST_SIZE / 8]>(0, |list| {
                 abi::fill_page_list(
@@ -831,28 +717,21 @@ impl InitData {
                     (0..low::RENDER_BLOCKS_INITIAL as usize).map(low::render_block),
                 )
             })?;
-        let runs = self.add(KernelObject::backing(env.dev, low::RENDER_RUN_LIST_SIZE, WB)?)?;
+        let runs = self.add(KernelObject::backing(dev, low::RENDER_RUN_LIST_SIZE, WB)?)?;
         let first_block = self.objects.len();
         for _ in 0..low::RENDER_BLOCKS_ALLOCATED {
-            self.add(KernelObject::backing(env.dev, abi::FREE_LIST_BLOCK_SIZE, WB)?)?;
+            self.add(KernelObject::backing(dev, abi::FREE_LIST_BLOCK_SIZE, WB)?)?;
         }
         self.render_pages = pages;
         self.render_runs = runs;
         self.render_blocks = first_block..self.objects.len();
-        self.alias(pages, env.render, low::RENDER_PAGE_LIST, GS)?;
-        self.alias(runs, env.render, low::RENDER_RUN_LIST, GS)?;
+        self.alias(pages, render, low::RENDER_PAGE_LIST, GS)?;
+        self.alias(runs, render, low::RENDER_RUN_LIST, GS)?;
         for block in 0..low::RENDER_BLOCKS_MAPPED {
-            self.alias(first_block + block, env.render, low::render_block(block), GS)?;
+            self.alias(first_block + block, render, low::render_block(block), GS)?;
         }
-        Ok(first_block)
-    }
 
-    /// Compute free-list controls and states, zero blocks, run list and the compute page
-    /// list inside the render blocks.
-    fn build_compute_pools(&mut self, env: &BuildEnv<'_>, first_block: usize) -> Result {
-        use mmu::PROT_GPU_FW_SHARED_RW as GFS;
-        use CpuMap::{WriteBack as WB, WriteCombined as WC};
-        let compute = self.add(env.fixed(high::COMPUTE_FREE_LIST, mmu::UAT_PGSZ, GFS, WC)?)?;
+        let compute = self.add(fixed(high::COMPUTE_FREE_LIST, mmu::UAT_PGSZ, GFS, WC)?)?;
         self.object_mut(compute)?.write(
             0,
             abi::FreeListControl::new(&abi::FreeListArgs {
@@ -861,15 +740,18 @@ impl InitData {
                 page_list_va: low::COMPUTE_PAGE_LIST,
                 run_list_va: low::COMPUTE_RUN_LIST,
                 blocks: low::COMPUTE_BLOCKS,
-                state_va: env.base + high::COMPUTE_FREE_LIST_STATE,
+                state_va: base + high::COMPUTE_FREE_LIST_STATE,
             }),
         )?;
-        let compute_state = self.add(KernelObject::backing(env.dev, mmu::UAT_PGSZ, WB)?)?;
+        let compute_state = self.add(KernelObject::backing(dev, mmu::UAT_PGSZ, WB)?)?;
         self.object_mut(compute_state)?
             .write(0, abi::FreeListState::COMPUTE)?;
+        for _ in &low::COMPUTE_ZERO_BLOCKS {
+            self.add(KernelObject::backing(dev, abi::FREE_LIST_BLOCK_SIZE, WB)?)?;
+        }
         let compute_runs = self.add(KernelObject::new(
-            env.dev,
-            env.lower,
+            dev,
+            lower,
             Placement::At(low::COMPUTE_RUN_LIST),
             mmu::UAT_PGSZ,
             GFS,
@@ -879,7 +761,7 @@ impl InitData {
             .initialize::<[abi::FreeListRunSlot; mmu::UAT_PGSZ / 0x40]>(0, |list| {
                 abi::fill_run_list(list, low::COMPUTE_FREE_LIST_BLOCKS)
             })?;
-        let ready = self.add(env.fixed(
+        let ready = self.add(fixed(
             high::COMPUTE_READY_FREE_LIST,
             mmu::UAT_PGSZ,
             GFS,
@@ -893,11 +775,11 @@ impl InitData {
                 page_list_va: low::COMPUTE_POOL_PAGE_LIST,
                 run_list_va: low::COMPUTE_POOL_RUN_LIST,
                 blocks: low::COMPUTE_READY_BLOCKS,
-                state_va: env.base + high::COMPUTE_READY_FREE_LIST_STATE,
+                state_va: base + high::COMPUTE_READY_FREE_LIST_STATE,
             }),
         )?;
         for state in [high::COMPUTE_READY_FREE_LIST_STATE, high::COMPUTE_STATE] {
-            let obj = self.add(env.fixed(state, mmu::UAT_PGSZ, GFS, WC)?)?;
+            let obj = self.add(fixed(state, mmu::UAT_PGSZ, GFS, WC)?)?;
             self.object_mut(obj)?
                 .write(0, abi::FreeListState::COMPUTE)?;
         }
@@ -906,24 +788,9 @@ impl InitData {
                 abi::fill_page_list(list, low::COMPUTE_FREE_LIST_BLOCKS)
             })?;
         fence(Ordering::SeqCst);
-        Ok(())
-    }
 
-    /// The bundle with its zero page and completion rings, the QoS table, the metrics alias,
-    /// the roots and regions A and C.
-    fn build_bundle(
-        &mut self,
-        env: &BuildEnv<'_>,
-        cfg: &Config,
-        metrics: &KernelObject,
-    ) -> Result<BundleObjects> {
-        use mmu::{
-            PROT_FW_PRIV_RW as FP, PROT_FW_SHARED_RW as FS, PROT_GPU_FW_SHARED_RW as GFS,
-            PROT_GPU_SHARED_RW as GS,
-        };
-        use CpuMap::{WriteBack as WB, WriteCombined as WC};
-        self.bundle = self.add(env.fixed(high::BUNDLE, abi::bundle::SIZE, FP, WC)?)?;
-        let zero = self.add(env.fixed(
+        self.bundle = self.add(fixed(high::BUNDLE, abi::bundle::SIZE, FP, WC)?)?;
+        let zero = self.add(fixed(
             high::BUNDLE + abi::bundle::ZERO_PAGE as u64,
             mmu::UAT_PGSZ,
             GFS,
@@ -935,62 +802,45 @@ impl InitData {
         }; 2];
         for slot in 0..2 {
             let offset = high::BUNDLE + abi::bundle::COMPLETION_RINGS[slot] as u64;
-            let ring = self.add(env.fixed(offset, abi::COMPLETION_RING_SIZE, FP, WB)?)?;
+            let ring = self.add(fixed(offset, abi::COMPLETION_RING_SIZE, FP, WB)?)?;
             self.completion_rings[slot] = ring;
-            self.alias(ring, env.lower, low::COMPLETION_RINGS[slot], GS)?;
+            self.alias(ring, lower, low::COMPLETION_RINGS[slot], GS)?;
             completion_rings[slot] = abi::CompletionRing {
                 low_va: low::COMPLETION_RINGS[slot],
-                high_va: env.base + offset,
+                high_va: base + offset,
             };
         }
-        let qos = self.add(env.dynamic(abi::QOS_SIZE, mmu::UAT_PGSZ as u64, FS, WC)?)?;
+        let qos = self.add(dynamic_object(abi::QOS_SIZE, mmu::UAT_PGSZ as u64, FS, WC)?)?;
         self.qos = qos;
         fence(Ordering::SeqCst);
         let metrics_alias =
-            metrics.alias_in(env.vm, env.dynamic.clone(), cfg.pm_metrics.size as u64, GFS)?;
+            metrics.alias_in(vm, dynamic.clone(), cfg.pm_metrics.size as u64, GFS)?;
         self.metrics_fw_va = metrics_alias.iova();
         self.aliases.push(metrics_alias, GFP_KERNEL)?;
         fence(Ordering::SeqCst);
-        self.roots = self.add(env.dynamic(
+        self.roots = self.add(dynamic_object(
             abi::ROOTS_SIZE,
             abi::SECONDARY_ROOT_OFFSET as u64,
             mmu::PROT_FW_SHARED_RO,
             WB,
         )?)?;
-        let region_a = self.add(env.dynamic(
+        let region_a = self.add(dynamic_object(
             REGION_A_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RO,
             WB,
         )?)?;
-        self.region_c = self.add(env.dynamic(REGION_C_SIZE, mmu::UAT_PGSZ as u64, FS, WB)?)?;
-        Ok(BundleObjects {
-            zero,
-            completion_rings,
-            region_a,
-            qos,
-        })
-    }
+        self.region_c = self.add(dynamic_object(REGION_C_SIZE, mmu::UAT_PGSZ as u64, FS, WB)?)?;
 
-    /// Writes every firmware object the host builds from constants and addresses, then the
-    /// opening control-ring state for both roles.
-    fn initialize_firmware_objects(
-        &mut self,
-        env: &BuildEnv<'_>,
-        cfg: &Config,
-        tables: &DescriptorTables,
-        bundle: &BundleObjects,
-    ) -> Result {
-        let base = env.base;
-        let opps = Self::opps(env.dev)?;
+        let opps = Self::opps(dev)?;
         let hw_args = abi::HwDataArgs {
             chip_id: cfg.chip_id,
             windows: &t8140::REGISTER_WINDOWS,
             reserved_slots: &t8140::RESERVED_REGISTER_SLOTS,
             opps: &opps,
             perf: &t8140::PERF,
-            completion_rings: bundle.completion_rings,
-            qos_va: self.object(bundle.qos)?.gpu_va(),
+            completion_rings,
+            qos_va: self.object(qos)?.gpu_va(),
         };
         self.object_mut(self.bundle)?
             .initialize::<abi::HwData>(abi::bundle::HW_DATA, |hw| hw.init(&hw_args))?;
@@ -1003,7 +853,7 @@ impl InitData {
             .write(abi::private::PRIMARY_STATUS_A, abi::StatusBlock::new())?;
         self.object_mut(self.cluster)?
             .write(abi::private::SECONDARY_STATUS_A, abi::StatusBlock::new())?;
-        let fwctl_va = self.object(tables.fwctl)?.gpu_va();
+        let fwctl_va = self.object(fwctl)?.gpu_va();
         self.object_mut(self.cluster)?
             .initialize::<abi::PrimaryStatusB>(abi::private::STATUS_B, |status| {
                 status.init(fwctl_va);
@@ -1036,9 +886,9 @@ impl InitData {
                 Ok(())
             })?;
         let views = abi::PrimaryViews {
-            zero_page_va: self.object(bundle.zero)?.gpu_va(),
-            pb_descriptors_va: self.object(tables.pb)?.gpu_va(),
-            page_pool_descriptors_va: self.object(tables.page_pool)?.gpu_va(),
+            zero_page_va: self.object(zero)?.gpu_va(),
+            pb_descriptors_va: self.object(pb)?.gpu_va(),
+            page_pool_descriptors_va: self.object(page_pool)?.gpu_va(),
         };
         for role in [Role::Primary, Role::Secondary] {
             let slot = role as usize;
@@ -1071,7 +921,7 @@ impl InitData {
                 abi::OpeningRecord::new(abi_role),
             )?;
             let root = abi::RootArgs {
-                region_a_va: self.object(bundle.region_a)?.gpu_va(),
+                region_a_va: self.object(region_a)?.gpu_va(),
                 region_c_va: self.object(self.region_c)?.gpu_va(),
                 main_config_va: main_va,
                 status_a_va: status_va,
@@ -1174,8 +1024,8 @@ impl InitData {
             .load(Ordering::Relaxed))
     }
 
-    fn opps(dev: &AsahiDevice) -> Result<KVec<abi::Opp>> {
-        let node = dev.as_ref().of_node().ok_or(EIO)?;
+    fn opps(dev: &AsahiDrmDevice) -> Result<KVec<abi::Opp>> {
+        let node = dev.as_ref().as_ref().of_node().ok_or(EIO)?;
         let table = node
             .parse_phandle(c_str!("operating-points-v2"), 0)
             .ok_or(EIO)?;
@@ -1370,14 +1220,14 @@ impl super::recovery::Memory for InitData {
             .dword(abi::private::STATUS_B + abi::PrimaryStatusB::RECOVERY_SLOT_MASK)?
             .load(Ordering::Relaxed);
         let mut sources = super::recovery::Sources::sample(mask as u32, |slot| {
-            let key = super::recovery::slot_key(slot)?;
+            let key = super::recovery::slot_key(slot).unwrap_or(0);
             let monitor = self.recovery_view_words::<6>(abi::recovery::PROGRESS_VIEW,
                 abi::recovery::PROGRESS_START + slot * abi::recovery::PROGRESS_STRIDE)
-                .ok().map(|words| words[0])?;
-            Some((key, monitor))
+                .map(|words| words[0]).unwrap_or(0);
+            (key, monitor)
         });
         sources.reason = self.recovery_view_words::<1>(abi::recovery::REPORT_VIEW, abi::recovery::REASON)
-            .ok().map(|words| words[0]);
+            .map(|words| words[0]).unwrap_or(0);
         Ok(sources)
     }
 
@@ -1429,17 +1279,30 @@ impl super::recovery::Memory for InitData {
         Ok(())
     }
 
-    fn entries(&self) -> Result<super::recovery::Entries> {
+    fn entries(
+        &self,
+        out: &mut [super::recovery::Entry; super::recovery::MAX_ENTRIES],
+    ) -> Result<usize> {
         let cluster = self.object(self.cluster)?;
         let base = abi::private::STATUS_B + abi::PrimaryStatusB::RECOVERY_INFO;
         fence(Ordering::Acquire);
-        let mut entries = super::recovery::Entries::default();
+        let mut used = 0;
         for index in 0..256 {
+            if used == out.len() {
+                break;
+            }
             let offset = base + index * core::mem::size_of::<abi::RecoveryInfoEntry>();
             let flags = cluster.word(offset)?.load(Ordering::Relaxed);
-            entries.include(flags);
+            if flags & 1 == 0 {
+                continue;
+            }
+            let stamp = cluster.word(offset + 4)?.load(Ordering::Relaxed);
+            if let Some(entry) = super::recovery::Entry::decode(flags, stamp) {
+                out[used] = entry;
+                used += 1;
+            }
         }
-        Ok(entries)
+        Ok(used)
     }
 
     fn wait_tick(&self) {

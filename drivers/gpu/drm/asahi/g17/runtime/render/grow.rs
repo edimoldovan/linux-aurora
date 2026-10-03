@@ -72,19 +72,6 @@ impl crate::g17::Firmware {
     pub(in crate::g17) fn render_grow_pending(&self) -> bool {
         !self.queues.render.grow.requests.is_empty()
     }
-    /// Borrowed owners and control publication each have their own retry wake.
-    /// A stale request is runnable so the worker can discard it immediately.
-    pub(in crate::g17) fn render_grow_ready(&self) -> bool {
-        let render = &self.queues.render;
-        !render.grow.requests.is_empty()
-            && !self.recovery.pending()
-            && !self.render_control_backpressured()
-            && render.grow.active.is_none()
-            && render.grow.requests.iter().any(|request| {
-                request.halt_count != self.recovery.generation()
-                    || !render.grow_owner_busy(*request)
-            })
-    }
     pub(in crate::g17) fn render_control_backpressured(&self) -> bool {
         self.queues.render.grow.reply.is_some() || self.queues.render.pools.pending()
     }
@@ -194,7 +181,6 @@ impl crate::g17::Shared {
     pub(in crate::g17) fn grow_render(&self) -> Result {
         loop {
             let lease = self.preparations.enter(false)?;
-            let dev = self.drm()?;
             let (request, slot, mut pair) = {
                 let mut state = self.state.lock();
                 let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
@@ -247,7 +233,7 @@ impl crate::g17::Shared {
                         Err(EFAULT)
                     } else {
                         manager.prepare_growth(
-                            &dev,
+                            &self.dev,
                             &vm,
                             crate::g17::buffer::firmware_growth_target(before),
                             None,

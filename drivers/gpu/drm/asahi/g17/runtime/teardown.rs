@@ -30,11 +30,7 @@ impl Reclaim {
     pub(in crate::g17) fn finish(self) {
         match self {
             Self::Binding(binding) => drop(binding),
-            Self::Context(context) => {
-                context.release_execution();
-                drop(context.take_render_pool());
-                drop(context);
-            }
+            Self::Context(context) => drop(context),
         }
     }
 }
@@ -158,6 +154,9 @@ impl Host for Service<'_> {
                 context.id(),
                 error
             ),
+            Failure::Stalled => {
+                dev_warn!(dev, "Scheduler {} release is still pending\n", context.id())
+            }
         }
     }
 }
@@ -187,13 +186,14 @@ impl Firmware {
             primary: &mut self.primary,
             reclaim,
         };
-        teardown.publish_ready(&mut service, recovery, super::now_ns())?;
+        teardown.publish_ready(&mut service, recovery)?;
         let consumer = self.init.control_consumer()?.load(Ordering::Relaxed);
         let producer = self.init.control_producer()?.load(Ordering::Relaxed);
         while teardown
             .take_consumed(consumer, producer, &mut service)?
             .is_some()
         {}
+        teardown.report_stalled(super::now_ns(), &mut service);
         Ok(())
     }
 }

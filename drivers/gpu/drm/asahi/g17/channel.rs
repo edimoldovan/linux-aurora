@@ -9,7 +9,9 @@
 //! empty slot and orders the record, power tally and producer together.
 
 use core::sync::atomic::{fence, Ordering};
-use kernel::{device::Device, prelude::*};
+use kernel::prelude::*;
+
+use crate::driver::AsahiDrmDevice;
 
 use super::fw::{channels::*, initdata::status};
 use super::initdata::InitData;
@@ -55,15 +57,15 @@ impl Rings {
         }
     }
 
-    pub(crate) fn drain_trace(&mut self, dev: &Device, init: &InitData, role: Role) {
+    pub(crate) fn drain_trace(&mut self, dev: &AsahiDrmDevice, init: &InitData, role: Role) {
         self.drain_report(dev, init, role, ReportRing::Trace);
     }
 
-    pub(crate) fn drain_statistics(&mut self, dev: &Device, init: &InitData, role: Role) {
+    pub(crate) fn drain_statistics(&mut self, dev: &AsahiDrmDevice, init: &InitData, role: Role) {
         self.drain_report(dev, init, role, ReportRing::Statistics);
     }
 
-    fn drain_report(&mut self, dev: &Device, init: &InitData, role: Role, ring: ReportRing) {
+    fn drain_report(&mut self, dev: &AsahiDrmDevice, init: &InitData, role: Role, ring: ReportRing) {
         let quarantined = &mut self.quarantined[role as usize][ring as usize];
         if *quarantined {
             return;
@@ -174,7 +176,7 @@ impl Events {
         }
     }
 
-    pub(crate) fn next(&mut self, dev: &Device, init: &InitData) -> Result<Option<Event>> {
+    pub(crate) fn next(&mut self, dev: &AsahiDrmDevice, init: &InitData) -> Result<Option<Event>> {
         let role = self.role;
         let state = status::EVENT_STATE as usize;
         let consumer_word = init.status_word(role, state)?;
@@ -182,6 +184,7 @@ impl Events {
         while self.remaining != 0 {
             init.validate_event_ring(role)?;
             self.remaining -= 1;
+            fence(Ordering::Acquire);
             let consumer = consumer_word.load(Ordering::Relaxed);
             let producer = producer_word.load(Ordering::Relaxed);
             if consumer >= EVENT_SLOTS || producer >= EVENT_SLOTS {
@@ -191,8 +194,6 @@ impl Events {
                 self.remaining = 0;
                 break;
             }
-            // Observe the producer before reading the record it publishes.
-            fence(Ordering::Acquire);
             let offset = status::EVENT_RING as usize + consumer as usize * EVENT_RECORD_SIZE;
             let record = EventRecord::from_words(init.status_read_words(role, offset)?);
             let event = record.decode();

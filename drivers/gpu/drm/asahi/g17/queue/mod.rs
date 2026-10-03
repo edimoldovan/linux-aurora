@@ -8,20 +8,20 @@ pub(crate) mod render;
 
 use super::{
     command::{Parser, UscWindow, Validated},
-    completion::{Completion, Destinations, PreparedPublication},
+    completion::Completion,
     context::Context,
     fence::{Outputs, Submission},
     job::{self, Backend, Engine, Fences, Order, Packet, Scheduler},
     validation::Proof,
 };
 use crate::{
-    driver::{AsahiDevRef, AsahiDevice},
+    driver::{AsahiDevRef, AsahiDrmDevice},
     file, mmu,
 };
 use core::ops::Range;
 use kernel::{
     c_str,
-    dma_fence::{Fence, FenceContexts, RawDmaFence},
+    dma_fence::FenceContexts,
     prelude::*,
     sync::{Arc, LockClassKey},
     xarray,
@@ -53,7 +53,6 @@ impl Identities {
 /// Validated frontend state prepared before allocating a logical execution context.
 pub(crate) struct Frontend {
     fences: FenceContexts,
-    allocation_failure: Fence,
     range: Range<u64>,
     window: UscWindow,
 }
@@ -65,10 +64,8 @@ impl Frontend {
         }
         let window = UscWindow::new(usc_base, range.clone())?;
         let fences = FenceContexts::new(1, c_str!("asahi_g17_queue"), FENCE_KEY)?;
-        let allocation_failure = super::fence::allocation_failure(&fences)?;
         Ok(Self {
             fences,
-            allocation_failure,
             range,
             window,
         })
@@ -82,13 +79,11 @@ pub(crate) struct Queue<B: Backend> {
     render: Option<Scheduler<B>>,
     compute: Option<Scheduler<B>>,
     fences: FenceContexts,
-    allocation_failure: Fence,
     range: Range<u64>,
     window: UscWindow,
     proof: Proof,
     sequence: [u64; 2],
     frontiers: [KVec<(u64, Fences)>; 2],
-    failures: [Option<(u64, Fence)>; 2],
     // Closing the userspace queue releases admission even if firmware still
     // retains one of its execution contexts or installed physical graphs.
     _slot: admission::QueueSlot,
@@ -96,7 +91,7 @@ pub(crate) struct Queue<B: Backend> {
 
 impl<B: Backend> Queue<B> {
     pub(crate) fn new(
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         context: Arc<Context>,
         backend: Arc<B>,
         frontend: Frontend,
@@ -104,7 +99,6 @@ impl<B: Backend> Queue<B> {
     ) -> Result<Self> {
         let Frontend {
             fences,
-            allocation_failure,
             range,
             window,
         } = frontend;
@@ -116,20 +110,18 @@ impl<B: Backend> Queue<B> {
             render,
             compute: None,
             fences,
-            allocation_failure,
             range,
             window,
             proof: Proof::new(),
             sequence: [0; 2],
             frontiers: core::array::from_fn(|_| KVec::new()),
-            failures: [None, None],
             _slot: slot,
         })
     }
 
-    fn ensure_compute(&mut self, scs_pages: u16) -> Result {
+    fn ensure_compute(&mut self) -> Result {
         // Admission is checked even when this queue already owns a scheduler.
-        self.backend.ensure_compute(scs_pages)?;
+        self.backend.ensure_compute()?;
         if self.compute.is_none() {
             self.compute = Some(Scheduler::new(
                 &self.dev,
@@ -140,22 +132,6 @@ impl<B: Backend> Queue<B> {
         Ok(())
     }
 
-    fn prune_frontier(&mut self, index: usize) {
-        let failure = &mut self.failures[index];
-        self.frontiers[index].retain(|(sequence, fences)| {
-            let status = job::fence_status(&fences.completed);
-            if status == 0 {
-                return true;
-            }
-            // One earliest failed ordinal covers every later prefix without
-            // retaining its packet, mappings, or every failed fence.
-            if status < 0 && failure.as_ref().is_none_or(|(first, _)| *sequence < *first) {
-                *failure = Some((*sequence, fences.completed.clone()));
-            }
-            false
-        });
-    }
-
     fn enqueue(
         &mut self,
         id: u64,
@@ -164,107 +140,58 @@ impl<B: Backend> Queue<B> {
         guard: mmu::VmJobGuard,
         aggregate: &Arc<Submission>,
         inputs: &[file::SyncItem],
-        destinations: Destinations,
+        objects: Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
         let engine = match &command {
             Validated::Render { .. } => Engine::Render,
             Validated::Compute { .. } => Engine::Compute,
         };
         let index = engine.index();
-        if let Validated::Render { ray_query, .. } = &command {
-            let blocks = self.backend.render_scs_blocks(ray_query.map(|stage| stage.scratch.pages()))?;
-            if blocks > self.context.render_blocks() { return Err(EINVAL); }
-        }
-        self.prune_frontier(index);
+        self.frontiers[index].retain(|(_, fences)| job::fence_status(&fences.completed) == 0);
         self.frontiers[index].reserve(1, GFP_KERNEL)?;
         if engine == Engine::Compute {
-            let Validated::Compute { scratch, .. } = &command else { return Err(EINVAL); };
-            self.ensure_compute(scratch.pages())?;
+            self.ensure_compute()?;
         }
-        // Only earlier render ordinals covered by the explicit logical prefix
-        // can delay host publication. These links never become GPU dependencies.
-        let host_predecessors = self.frontiers[index]
-            .iter()
-            .take_while(|(sequence, _)| {
-                engine == Engine::Render
-                    && Order::contains(order.wait_through[index], *sequence)
-            })
-            .filter_map(|(_, fences)| fences.publication.as_ref());
-        let completion = Completion::new(
-            &self.dev,
-            &self.fences,
-            &self.context,
-            aggregate.member(),
-            guard,
-            destinations,
-            engine == Engine::Compute,
-            host_predecessors.clone().next().is_some(),
-            if engine == Engine::Render { self.backend.feed() } else { None },
-        )?;
-        let publication = completion.publication()
-            .map(|target| PreparedPublication::new(target, host_predecessors))
-            .transpose()?;
+        let completion = match &command {
+            Validated::Render { timestamps, .. } => Completion::new(
+                &self.dev,
+                &self.fences,
+                &self.context,
+                aggregate.member(),
+                guard,
+                objects,
+                timestamps,
+                false,
+            )?,
+            Validated::Compute { timestamps, .. } => Completion::new(
+                &self.dev,
+                &self.fences,
+                &self.context,
+                aggregate.member(),
+                guard,
+                objects,
+                core::slice::from_ref(timestamps),
+                true,
+            )?,
+        };
         if engine == Engine::Compute {
-            self.prune_frontier(Engine::Render.index());
+            self.frontiers[Engine::Render.index()]
+                .retain(|(_, fences)| job::fence_status(&fences.completed) == 0);
         }
         let other = 1 - index;
         let prefix = order.wait_through[other];
-        let frontier = if prefix.is_some() {
-            let frontier = self.frontiers[other].as_slice();
-            // Accepted sequences increase from one, and retain preserves their
-            // order, so all members of a logical prefix form one slice.
-            let end = frontier.partition_point(|(sequence, _)| Order::contains(prefix, *sequence));
-            &frontier[..end]
-        } else {
-            &[]
-        };
-        let count = frontier.len();
-        let timestamp_prefix = order.wait_through[index];
-        let timestamps = if engine == Engine::Compute && timestamp_prefix.is_some() {
-            let frontier = self.frontiers[index].as_slice();
-            let end = frontier
-                .partition_point(|(sequence, _)| Order::contains(timestamp_prefix, *sequence));
-            &frontier[..end]
-        } else {
-            &[]
-        };
-        let timestamp_count = timestamps
+        let count = self.frontiers[other]
             .iter()
-            .filter(|(_, fences)| fences.ready.raw() == fences.completed.raw())
+            .filter(|(sequence, _)| Order::contains(prefix, *sequence))
             .count();
-        let failures: [Option<&Fence>; 2] = core::array::from_fn(|index| {
-            self.failures[index].as_ref().and_then(|(sequence, fence)| {
-                Order::contains(order.wait_through[index], *sequence).then_some(fence)
-            })
-        });
-        let failure_count = failures.iter().flatten().count();
-        let mut dependencies =
-            KVec::with_capacity(inputs.len() + count + timestamp_count + failure_count, GFP_KERNEL)?;
-        let mut checked_inputs =
-            KVec::with_capacity(inputs.len() + timestamp_count + failure_count, GFP_KERNEL)?;
+        let mut dependencies = KVec::with_capacity(inputs.len() + count, GFP_KERNEL)?;
+        let mut checked_inputs = KVec::with_capacity(inputs.len(), GFP_KERNEL)?;
         let mut firmware = KVec::with_capacity(count, GFP_KERNEL)?;
-        for fence in failures.into_iter().flatten() {
-            checked_inputs.push(fence.clone(), GFP_KERNEL)?;
-            dependencies.push(fence.clone(), GFP_KERNEL)?;
-        }
-        // Same-engine parents order GPU execution, not the host's timestamp
-        // writes. Only timestamp publishers need these completion waits and
-        // status checks; ordinary compute keeps its existing queue ordering.
-        for (_, fences) in timestamps {
-            if fences.ready.raw() == fences.completed.raw() {
-                checked_inputs.push(fences.completed.clone(), GFP_KERNEL)?;
+        for (sequence, fences) in &self.frontiers[other] {
+            if Order::contains(prefix, *sequence) {
                 dependencies.push(fences.ready.clone(), GFP_KERNEL)?;
+                firmware.push(fences.completed.clone(), GFP_KERNEL)?;
             }
-        }
-        for (_, fences) in frontier {
-            // Successful completion includes host timestamp publication. Its
-            // ready fence adds no ordering and would prevent shallow inline
-            // publication. Failed and pending producers still need checking.
-            if job::fence_status(&fences.completed) > 0 {
-                continue;
-            }
-            dependencies.push(fences.ready.clone(), GFP_KERNEL)?;
-            firmware.push(fences.completed.clone(), GFP_KERNEL)?;
         }
         // Each command owns every input fence; independent engines may publish in
         // either order and must each consume an input's error status before running.
@@ -293,7 +220,7 @@ impl<B: Backend> Queue<B> {
         let fences = scheduler
             .as_mut()
             .ok_or(ENODEV)?
-            .enqueue(packet, dependencies, early, publication)?;
+            .enqueue(packet, dependencies, early)?;
         self.sequence[index] = order.sequence;
         self.frontiers[index]
             .push_within_capacity((order.sequence, fences))
@@ -306,13 +233,9 @@ impl<B: Backend> Queue<B> {
     fn prepare_submission(
         &mut self,
         bytes: &[u8],
-        objects: Pin<&xarray::XArray<KBox<file::Object>>>,
-    ) -> Result<(KVec<(Validated, Order, Destinations)>, KVec<mmu::VmJobGuard>)> {
+    ) -> Result<(KVec<(Validated, Order)>, KVec<mmu::VmJobGuard>)> {
         let parse_guard = self.context.vm().retain_first_job()?;
         let mut parser = Parser::new(bytes);
-        // All historical ordinals use the same entry counters; publication
-        // starts only after the entire ioctl has been validated and pinned.
-        let base = self.sequence;
         let mut preceding = [0; 2];
         let mut pending = KVec::with_capacity(1, GFP_KERNEL)?;
         while let Some(command) = parser.next()? {
@@ -326,21 +249,9 @@ impl<B: Backend> Queue<B> {
                 Validated::Render { .. } => Engine::Render,
                 Validated::Compute { .. } => Engine::Compute,
             };
-            let order = Order::new(
-                base,
-                preceding,
-                command.barriers,
-                command.payload.prior(),
-                engine,
-            )?;
+            let order = Order::new(self.sequence, preceding, command.barriers, engine)?;
             preceding[engine.index()] += 1;
-            let destinations = match &payload {
-                Validated::Render { timestamps, .. } => Destinations::resolve(objects, timestamps)?,
-                Validated::Compute { timestamps, .. } => {
-                    Destinations::resolve(objects, core::slice::from_ref(timestamps))?
-                }
-            };
-            pending.push((payload, order, destinations), GFP_KERNEL)?;
+            pending.push((payload, order), GFP_KERNEL)?;
         }
         parser.finish()?;
         // Every accepted command pins the VM before any command is enqueued.
@@ -358,36 +269,25 @@ impl<B: Backend> Queue<B> {
 }
 
 impl<B: Backend> crate::queue::Queue for Queue<B> {
-    fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
-        let pages = [super::fw::compute::ScratchRequest::new(layouts[0])?.pages(),
-                     super::fw::compute::ScratchRequest::new(layouts[1])?.pages()];
-        let blocks = self.backend.render_scs_blocks(pages)?;
-        self.context.reserve_render_blocks(blocks)
-    }
-
     fn submit(
         &mut self,
+        _reg_data: &crate::driver::AsahiRegData<'_>,
         id: u64,
         syncs: KVec<file::SyncItem>,
         input_count: usize,
         bytes: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
-        let mut outputs = Outputs::new(
-            &self.fences,
-            syncs,
-            input_count,
-            &self.allocation_failure,
-        )?;
+        let mut outputs = Outputs::new(&self.fences, syncs, input_count)?;
         let result = (|| {
             if self.context.status().get() != 0 {
                 return Err(EIO);
             }
-            let (pending, guards) = self.prepare_submission(bytes, objects)?;
-            let mut guards = guards.into_iter();
-            let aggregate = outputs.publish(self.context.clone())?;
-            for (command, order, destinations) in pending {
-                let guard = guards.next().ok_or(EIO)?;
+            let (pending, mut guards) = self.prepare_submission(bytes)?;
+            let aggregate = Submission::new(&self.fences, self.context.clone())?;
+            outputs.publish(aggregate.clone());
+            for (command, order) in pending {
+                let guard = guards.remove(0).map_err(|_| EIO)?;
                 self.enqueue(
                     id,
                     command,
@@ -395,7 +295,7 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                     guard,
                     &aggregate,
                     outputs.inputs(),
-                    destinations,
+                    objects,
                 )?;
             }
             Ok(())

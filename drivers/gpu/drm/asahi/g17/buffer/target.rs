@@ -10,7 +10,7 @@ use crate::g17::{
     object::{CpuMap, KernelObject},
 };
 use crate::{
-    driver::AsahiDevice,
+    driver::AsahiDrmDevice,
     hw::t8140::{queues, resources as cfg},
     mmu,
 };
@@ -112,7 +112,7 @@ struct Object {
     backing: KernelObject,
 }
 impl Object {
-    fn new(dev: &AsahiDevice, vm: &mmu::Vm, size: usize) -> Result<Self> {
+    fn new(dev: &AsahiDrmDevice, vm: &mmu::Vm, size: usize) -> Result<Self> {
         let backing = KernelObject::backing(dev, size, CpuMap::WriteCombined)?;
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
         let mapping = compact_alias(&backing, vm, 0..size, cfg::TVB_PAGE, prot, mmu::UAT_PGSZ)?;
@@ -145,7 +145,7 @@ pub(crate) struct Target {
 impl Target {
     /// Keep this allocation frame separate from the rest of the render graph.
     #[inline(never)]
-    pub(crate) fn new(dev: &AsahiDevice, vm: &mmu::Vm, layout: &Layout) -> Result<KBox<Self>> {
+    pub(crate) fn new(dev: &AsahiDrmDevice, vm: &mmu::Vm, layout: &Layout) -> Result<KBox<Self>> {
         let tpc = layout.tpc_capacity()?;
         let stride = layout.record_stride()?;
         if tpc > cfg::TPC_MAX || stride > cfg::TARGET_RECORD_MAX {
@@ -208,7 +208,7 @@ impl Target {
     /// stays enlarged even if allocating the following record object fails.
     pub(crate) fn ensure_capacity(
         &mut self,
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
         layout: &Layout,
         owners: &[Option<u64>; DEPTH],
@@ -244,7 +244,7 @@ impl Target {
     fn replace(
         retired: &mut KVec<Retired>,
         old: &mut Object,
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
         size: usize,
         owners: &[Option<u64>; DEPTH],

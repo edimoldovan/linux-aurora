@@ -21,7 +21,7 @@ use kernel::{
     prelude::*, //
 };
 
-use crate::driver::AsahiDevice;
+use crate::driver::AsahiDrmDevice;
 use crate::{
     gem,
     mmu, //
@@ -68,7 +68,7 @@ unsafe impl Sync for KernelObject {}
 impl KernelObject {
     /// Allocates a zeroed object of `size` bytes and maps it into `vm`.
     pub(crate) fn new(
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
         placement: Placement,
         size: usize,
@@ -85,15 +85,15 @@ impl KernelObject {
     }
 
     /// Allocates CPU-accessible backing whose GPU mappings will be installed later.
-    pub(crate) fn backing(dev: &AsahiDevice, size: usize, cpu: CpuMap) -> Result<Self> {
+    pub(crate) fn backing(dev: &AsahiDrmDevice, size: usize, cpu: CpuMap) -> Result<Self> {
         let mut obj = match cpu {
             CpuMap::WriteBack => gem::new_kernel_object(dev, size)?,
             CpuMap::WriteCombined => gem::new_kernel_object_wc(dev, size)?,
         };
-        let mut vmap = obj.vmap()?;
-        vmap.memset(0);
-        let ptr = NonNull::new(vmap.as_mut_ptr()).ok_or(ENOMEM)?;
-        core::mem::drop(vmap);
+        let vmap = obj.vmap()?;
+        let ptr = NonNull::new(vmap.addr.cast::<u8>()).ok_or(ENOMEM)?;
+        // SAFETY: The mapping covers the whole object.
+        unsafe { ptr.as_ptr().write_bytes(0, kernel::drm::gem::BaseObject::size(vmap.owner())) };
 
         // INVARIANT: `vmap()` created the owned kernel mapping of `obj` that `ptr` points into,
         // and `obj` keeps it until it is dropped.
@@ -192,7 +192,7 @@ impl KernelObject {
     }
 
     /// Returns a reference-counted kernel mapping of the object.
-    pub(crate) fn kernel_map(&self) -> Result<shmem::VMap<gem::AsahiObject, u8>> {
+    pub(crate) fn kernel_map(&self) -> Result<shmem::VMapOwned<gem::AsahiObject>> {
         self.obj.gem.owned_vmap()
     }
 
@@ -298,7 +298,7 @@ impl KernelObject {
 /// Allocation domains shared by the G17 resource builders. Dynamic objects
 /// retain a guard page; aliases keep the existing backing and its exact VA.
 pub(crate) struct Allocator<'a> {
-    pub(crate) dev: &'a AsahiDevice,
+    pub(crate) dev: &'a AsahiDrmDevice,
     pub(crate) uat: &'a mmu::Uat,
 }
 

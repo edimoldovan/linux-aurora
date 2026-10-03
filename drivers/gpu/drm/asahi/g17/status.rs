@@ -1,107 +1,72 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! VM admission errors and client failure reporting. No firmware state is accessed here.
+//! Sticky VM errors and their optional userspace mirror. No firmware state is accessed here.
 
 use crate::gem;
-use core::sync::atomic::{AtomicI32, Ordering};
-use kernel::{new_mutex, prelude::*, sync::Mutex};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
+use kernel::prelude::*;
 
 const MIRROR_MAX_SIZE: usize = 64 * 1024;
 
 /// A VM and its accepted jobs share this status, including after queue destruction.
-/// Client failure is separate from hardware admission: recovery may preserve the
-/// VM while failed accepted work must still be reported before signalling fences.
-#[pin_data]
+/// The first error is permanent. Callers record it before signalling the job's fence.
 pub(crate) struct VmStatus {
     error: AtomicI32,
-    reported_error: AtomicI32,
-    /// The client's mapped status word, retained with its object only while the
-    /// client's VM handle exists; released by `release_mirror` at VM close.
-    #[pin]
-    mirror: Mutex<Option<Mirror>>,
+    mirror: AtomicPtr<i32>,
+    mirror_claimed: AtomicBool,
+    mirror_owner: UnsafeCell<Option<gem::ObjectRef>>,
 }
 
-/// One aligned word inside the retained, vmapped mirror object.
-struct Mirror {
-    word: *mut i32,
-    _owner: gem::ObjectRef,
-}
-// SAFETY: The word points into the mapping the retained owner keeps alive; it is
-// only accessed atomically through this pointer while the mutex is held.
-unsafe impl Send for Mirror {}
+// SAFETY: Only the winner of mirror_claimed writes mirror_owner. The owner is never
+// read or replaced while the status lives, and its mapping is retained until drop.
+// Other shared accesses use atomics, including accesses through the mirror pointer.
+unsafe impl Sync for VmStatus {}
+// SAFETY: The retained GEM reference and mapping can move between threads. Moving
+// the status does not move that mapping, and its remaining fields are atomic.
+unsafe impl Send for VmStatus {}
 
 impl VmStatus {
-    pub(crate) fn new() -> impl PinInit<Self> {
-        pin_init!(Self {
+    pub(crate) fn new() -> Self {
+        Self {
             error: AtomicI32::new(0),
-            reported_error: AtomicI32::new(0),
-            mirror <- new_mutex!(None, "Asahi VM status mirror"),
-        })
+            mirror: AtomicPtr::new(core::ptr::null_mut()),
+            mirror_claimed: AtomicBool::new(false),
+            mirror_owner: UnsafeCell::new(None),
+        }
     }
 
     pub(crate) fn get(&self) -> i32 {
         self.error.load(Ordering::Acquire)
     }
 
-    /// Record permanent admission failure and report it to the client.
-    #[track_caller]
+    /// Store the first error in both the status and any registered mirror.
     pub(crate) fn record(&self, error: Error) {
-        self.report_failure(error);
-        let _ = self.error.compare_exchange(
-            0,
-            error.to_errno(),
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
-    }
-
-    pub(crate) fn reported_error(&self) -> i32 {
-        self.reported_error.load(Ordering::Acquire)
-    }
-
-    /// Report failed accepted work without preventing recovery of the VM.
-    /// Every reporter publishes the first error before returning: a losing
-    /// reporter may signal its fence before the winning reporter resumes.
-    ///
-    /// The first failure reported to a VM is logged once, with the reporting site: the client treats
-    /// any reported failure as a lost device, and nothing else in the kernel log names it.
-    #[track_caller]
-    pub(crate) fn report_failure(&self, error: Error) {
-        let error = match self.reported_error.compare_exchange(
+        let error = match self.error.compare_exchange(
             0,
             error.to_errno(),
             Ordering::SeqCst,
             Ordering::SeqCst,
         ) {
-            Ok(_) => {
-                let at = core::panic::Location::caller();
-                pr_warn!(
-                    "GPU work of a client failed ({:?}, reported at {}:{}); the client sees a lost device\n",
-                    error,
-                    at.file().rsplit("asahi/").next().unwrap_or(at.file()),
-                    at.line()
-                );
-                error.to_errno()
-            }
+            Ok(_) => error.to_errno(),
             Err(first) => first,
         };
-        let mirror = self.mirror.lock();
-        if let Some(mirror) = mirror.as_ref() {
-            // SAFETY: attach_mirror stored only an aligned word within a mapping the
-            // retained owner keeps alive while this entry exists under the mutex.
-            unsafe { AtomicI32::from_ptr(mirror.word) }.store(error, Ordering::SeqCst);
+        let word = self.mirror.load(Ordering::SeqCst);
+        if !word.is_null() {
+            // SAFETY: attach_mirror publishes only an aligned word within a mapping
+            // owned by this status. Every kernel access to this word is atomic.
+            unsafe { AtomicI32::from_ptr(word) }.store(error, Ordering::SeqCst);
         }
     }
 
     /// Rejected submissions and contention leave the VM usable.
-    #[track_caller]
     pub(crate) fn record_if_device_loss(&self, error: Error) {
         if error == EIO || error == ETIMEDOUT || error == ENODEV {
             self.record(error);
         }
     }
 
-    /// Retain one mapped GEM word until the client's VM handle is dropped.
+    /// Retain one mapped GEM word until the last reference to this status is dropped.
     pub(crate) fn attach_mirror(&self, mut owner: gem::ObjectRef, offset: usize) -> Result {
         if owner.size() > MIRROR_MAX_SIZE
             || offset % core::mem::align_of::<i32>() != 0
@@ -111,29 +76,27 @@ impl VmStatus {
         {
             return Err(EINVAL);
         }
-        let base = owner.vmap()?.as_mut_ptr();
+        let base = owner.vmap()?.addr.cast::<u8>();
         // SAFETY: The checked range is inside the retained, page-aligned mapping.
         let word = unsafe { base.add(offset) }.cast::<i32>();
-        let mut mirror = self.mirror.lock();
-        if mirror.is_some() {
+        if self.mirror_claimed.swap(true, Ordering::AcqRel) {
             return Err(EBUSY);
         }
-        // No reporter runs while the mutex is held, so the word holds the first
-        // reported error (or zero) when it becomes visible.
-        let error = self.reported_error.load(Ordering::SeqCst);
+        // SAFETY: This is the only thread that may write mirror_owner. It is not
+        // read again until the status is dropped, after all shared references end.
+        unsafe { *self.mirror_owner.get() = Some(owner) };
         // SAFETY: The retained owner keeps this checked, aligned word mapped.
-        unsafe { AtomicI32::from_ptr(word) }.store(error, Ordering::SeqCst);
-        *mirror = Some(Mirror {
-            word,
-            _owner: owner,
-        });
-        Ok(())
-    }
+        unsafe { AtomicI32::from_ptr(word) }.store(0, Ordering::SeqCst);
 
-    /// The client's VM handle is gone and nobody reads the mirror any more. The
-    /// mapping and object reference drop outside the mutex (GEM release may sleep).
-    pub(crate) fn release_mirror(&self) {
-        let taken = self.mirror.lock().take();
-        drop(taken);
+        // The pointer publication and error update form a store/load handshake:
+        // either this load sees record's error or record sees our pointer. Stores
+        // after publishing the pointer write only the same first error, never zero.
+        self.mirror.store(word, Ordering::SeqCst);
+        let error = self.error.load(Ordering::SeqCst);
+        if error != 0 {
+            // SAFETY: The mapping remains owned by this status as above.
+            unsafe { AtomicI32::from_ptr(word) }.store(error, Ordering::SeqCst);
+        }
+        Ok(())
     }
 }

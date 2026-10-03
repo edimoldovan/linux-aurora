@@ -26,7 +26,7 @@ impl Backend {
         result
     }
     pub(in crate::g17) fn cancel_render(&self, packet: &Arc<Packet>) -> Result {
-        let fence = packet.completion.scheduler_fence();
+        let fence = packet.completion.fence();
         // SAFETY: The retained fence remains alive across this bounded,
         // uninterruptible queue-teardown wait, without holding a device lock.
         let completed = unsafe {
@@ -70,7 +70,7 @@ impl crate::g17::Firmware {
                 .and_then(Option::as_ref)
                 .and_then(|entry| entry.pair.as_ref())
                 .ok_or(EIO)?;
-            if pair.replay_contains(packet) || !pair.contains_packet(packet) {
+            if !pair.contains_packet(packet) {
                 return Ok(());
             }
             let generation = self.recovery.generation();

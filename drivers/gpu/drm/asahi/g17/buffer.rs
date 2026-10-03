@@ -34,17 +34,21 @@ pub(crate) struct BufferIds {
     next_token: u64,
 }
 impl BufferIds {
-    pub(crate) fn new() -> impl Init<Self, Error> {
-        kernel::try_init!(Self {
-            entries <- pin_init::init_array_from_fn(|_| BufferId {
+    pub(crate) fn new() -> Self {
+        let mut returned = [0; BUFFER_IDS];
+        for (index, entry) in returned.iter_mut().enumerate() {
+            *entry = (BUFFER_IDS - index - 1) as u8;
+        }
+        Self {
+            entries: [BufferId {
                 references: 0,
                 owner: false,
                 token: 0,
-            }),
-            returned <- pin_init::init_array_from_fn(|index| (BUFFER_IDS - index - 1) as u8),
+            }; BUFFER_IDS],
+            returned,
             returned_count: BUFFER_IDS,
             next_token: 0,
-        })
+        }
     }
     fn remove_returned(&mut self, id: u8) {
         if let Some(at) = self.returned[..self.returned_count]
@@ -302,7 +306,7 @@ pub(crate) fn automatic_growth_target(used_pages: usize, current: usize) -> Opti
 }
 
 use super::object::{CpuMap, KernelObject};
-use crate::{driver::AsahiDevice, mmu};
+use crate::{driver::AsahiDrmDevice, mmu};
 use core::ops::Range;
 
 pub(crate) fn compact_alias(
@@ -331,15 +335,8 @@ pub(crate) struct TvbGrowth {
     extension: KernelObject,
 }
 
-/// Aliases and backing of growth extensions a shrink removed from an idle
-/// heap. Field order unmaps the aliases before freeing their backing.
-pub(crate) struct TvbRelease {
-    _mappings: KVec<mmu::KernelMapping>,
-    _extensions: KVec<KernelObject>,
-}
-
-/// Packed 128-KiB data blocks mapped at guarded 160-KiB virtual strides.
-/// Firmware owns their contents; CPU zeroing occurs only on fresh backing.
+/// Sparse 128-KiB data blocks at 160-KiB backing strides. Firmware owns their
+/// contents; CPU zeroing occurs only on fresh backing, never on pool reuse.
 pub(crate) struct Tvb {
     addresses: KVec<u64>,
     // Retain sparse-block backing until the pool and its aliases retire.
@@ -347,17 +344,21 @@ pub(crate) struct Tvb {
     extensions: KVec<KernelObject>,
 }
 impl Tvb {
-    /// Blocks are packed in the backing; only their VA placement keeps the
-    /// stride and its trailing guard.
     fn bytes(blocks: usize) -> Result<usize> {
-        blocks.checked_mul(cfg::TVB_BLOCK_SIZE).ok_or(EOVERFLOW)
+        blocks
+            .checked_sub(1)
+            .and_then(|v| v.checked_mul(cfg::TVB_BLOCK_STRIDE as usize))
+            .and_then(|v| v.checked_add(cfg::TVB_BLOCK_SIZE))
+            .ok_or(EOVERFLOW)
     }
     fn map_block(
         object: &KernelObject,
         vm: &mmu::Vm,
         relative: usize,
     ) -> Result<mmu::KernelMapping> {
-        let start = relative.checked_mul(cfg::TVB_BLOCK_SIZE).ok_or(EOVERFLOW)?;
+        let start = relative
+            .checked_mul(cfg::TVB_BLOCK_STRIDE as usize)
+            .ok_or(EOVERFLOW)?;
         let source = start..start.checked_add(cfg::TVB_BLOCK_SIZE).ok_or(EOVERFLOW)?;
         let mapping = compact_alias(
             object,
@@ -371,7 +372,7 @@ impl Tvb {
         Ok(mapping)
     }
     pub(crate) fn new(
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
         blocks: usize,
     ) -> Result<(Self, KVec<mmu::KernelMapping>)> {
@@ -401,22 +402,10 @@ impl Tvb {
     pub(crate) fn addresses(&self) -> &[u64] {
         &self.addresses
     }
-    /// Blocks of each growth extension; extensions are packed like the primary.
-    fn extension_blocks(extension: &KernelObject) -> usize {
-        extension.size() / cfg::TVB_BLOCK_SIZE
-    }
-    /// Blocks of the primary backing, which a heap never gives back.
-    fn primary_blocks(&self) -> usize {
-        self.extensions
-            .iter()
-            .fold(self.blocks(), |blocks, extension| {
-                blocks.saturating_sub(Self::extension_blocks(extension))
-            })
-    }
 
     pub(crate) fn prepare_growth(
         &mut self,
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
         target: usize,
     ) -> Result<Option<TvbGrowth>> {
@@ -469,14 +458,14 @@ pub(crate) struct MetricsLease {
     _backing: Arc<KernelObject>,
     allocator: Arc<MetricsIds>,
     slot: usize,
-    addresses: fw::MetricsAddresses,
+    addresses: [u64; 2],
 }
 impl MetricsLease {
     /// Clears only the selected retired metrics entry before reusing it.
     pub(crate) fn new(
         ids: &Arc<MetricsIds>,
         object: &Arc<KernelObject>,
-        bases: fw::MetricsAddresses,
+        bases: [u64; 2],
     ) -> Result<Self> {
         let mut selected = None;
         for (bank, used) in ids.used.iter().enumerate() {
@@ -510,13 +499,13 @@ impl MetricsLease {
             _backing: object.clone(),
             allocator: ids.clone(),
             slot,
-            addresses: fw::MetricsAddresses::default(),
+            addresses: [0; 2],
         };
         let offset = slot * fw::METRICS_STRIDE;
-        lease.addresses = fw::MetricsAddresses {
-            firmware: bases.firmware.checked_add(offset as u64).ok_or(EOVERFLOW)?,
-            client: bases.client.checked_add(offset as u64).ok_or(EOVERFLOW)?,
-        };
+        lease.addresses = [
+            bases[0].checked_add(offset as u64).ok_or(EOVERFLOW)?,
+            bases[1].checked_add(offset as u64).ok_or(EOVERFLOW)?,
+        ];
         let words = object.pointer(offset, fw::METRICS_STRIDE)?.cast::<u32>();
         object.word(offset)?;
         for index in 0..fw::SCENES {
@@ -555,44 +544,6 @@ pub(crate) struct Manager {
     scratch: u64,
     buffer_id: u8,
     generation: u64,
-    shrink: Shrink,
-}
-
-/// Native tiler-heap shrink policy, matching the heap behaviour seen
-/// under macOS. Once per
-/// period the page high-water folds into an average,
-/// `max((sample + 4 * average) / 5, sample)`. Each period whose average
-/// stays below a quarter of the capacity earns one 512 KiB block of shrink,
-/// and a heap idle for ten seconds returns to its minimum. Only an idle heap
-/// is rebuilt here, by whole growth extensions.
-///
-/// Unlike macOS, the minimum keeps what the recent work needs: never below
-/// the size at which the automatic growth check would grow the heap again
-/// for the largest high-water sample of the last ten active periods. A
-/// shrink then never makes the next pass at the recent load grow back.
-const SHRINK_PERIOD_NS: u64 = 1_000_000_000;
-const SHRINK_IDLE_NS: u64 = 10_000_000_000;
-/// Blocks in one native 512 KiB parameter-buffer block.
-const SHRINK_STEP_BLOCKS: usize = 0x8_0000 / cfg::TVB_BLOCK_SIZE;
-/// Active periods in the recent-load window.
-const SHRINK_WINDOW: usize = (SHRINK_IDLE_NS / SHRINK_PERIOD_NS) as usize;
-
-#[derive(Default)]
-struct Shrink {
-    last_busy: u64,
-    period_start: u64,
-    /// High-water samples since the last period and the last growth check.
-    period_max: u32,
-    growth_max: u32,
-    average: u32,
-    credit: usize,
-    /// Blocks the most recent pass layout required.
-    required: usize,
-    /// High-water samples of the last active periods (with a sample or a
-    /// pass) and their largest value. Idle periods leave both unchanged.
-    window: [u32; SHRINK_WINDOW],
-    window_next: usize,
-    busy_peak: u32,
 }
 
 pub(crate) struct Submitted<'a> {
@@ -656,7 +607,6 @@ impl Manager {
             scratch: args.scratch,
             buffer_id: args.buffer_id,
             generation: args.generation,
-            shrink: Shrink::default(),
         })
     }
     pub(crate) fn buffer_id(&self) -> u8 {
@@ -681,7 +631,7 @@ impl Manager {
         Ok(self.graph.gpu_va() + fw::SCENE_TABLE as u64 + (index * size_of::<fw::Scene>()) as u64)
     }
     pub(crate) fn scene_registers(&self, index: usize) -> Result<(u64, u64)> {
-        fw::scene_registers(index, self.scratch, self.metrics.addresses.client)
+        fw::scene_registers(index, self.scratch, self.metrics.addresses[1])
     }
     pub(crate) fn prepare_scene(&mut self, ordinal: u64) -> Result<usize> {
         let scene = self.scenes.select(ordinal)?;
@@ -716,9 +666,7 @@ impl Manager {
             next: word.load(Ordering::Relaxed).wrapping_add(1),
         })
     }
-    /// Reads the firmware page high-water and requests its reset. Both the
-    /// growth check and the shrink period see every sample.
-    fn sample_max_pages(&mut self) -> Result<u32> {
+    pub(crate) fn automatic_target(&self) -> Result<Option<usize>> {
         let max_pages = self
             .graph
             .word(fw::CONTROL + core::mem::offset_of!(fw::Control, max_pages))?;
@@ -729,82 +677,7 @@ impl Manager {
         let pages = max_pages.load(Ordering::Relaxed);
         fence(Ordering::Release);
         reset.store(1, Ordering::Relaxed);
-        self.shrink.period_max = self.shrink.period_max.max(pages);
-        self.shrink.growth_max = self.shrink.growth_max.max(pages);
-        Ok(pages)
-    }
-    pub(crate) fn automatic_target(&mut self) -> Result<Option<usize>> {
-        self.sample_max_pages()?;
-        let pages = core::mem::take(&mut self.shrink.growth_max);
         Ok(automatic_growth_target(pages as usize, self.blocks()))
-    }
-    /// Records the blocks a pass layout requires, the floor of any shrink.
-    /// A pass is being prepared at `now`; the heap counts as busy.
-    pub(crate) fn note_required(&mut self, blocks: usize, now: u64) {
-        self.shrink.required = blocks;
-        self.shrink.last_busy = now;
-    }
-    /// The smallest heap a shrink may leave: the primary backing, the blocks
-    /// of the last pass layout, and the size below which the automatic growth
-    /// check would grow again for the recent peak.
-    fn shrink_floor(&self) -> usize {
-        let recent = (self.shrink.busy_peak as usize)
-            .saturating_mul(2)
-            .div_ceil(cfg::TVB_PAGES_PER_BLOCK);
-        self.tvb.primary_blocks().max(self.shrink.required).max(recent)
-    }
-    /// Whether the heap holds growth beyond its primary backing.
-    pub(crate) fn grown(&self) -> bool {
-        !self.tvb.extensions.is_empty()
-    }
-    /// Whether the heap holds growth that a shrink could give back.
-    pub(crate) fn shrinkable(&self) -> bool {
-        self.tvb.extensions.last().is_some_and(|extension| {
-            self.blocks() - Tvb::extension_blocks(extension) >= self.shrink_floor()
-        })
-    }
-    /// Advances the shrink policy at `now` and returns the block count an idle
-    /// heap should shrink to. `busy` is true while the pair has work in flight
-    /// or is borrowed; a busy heap only updates its average and recent peak.
-    /// Call it for every grown heap, so the recent peak can also fall.
-    pub(crate) fn shrink_target(&mut self, now: u64, busy: bool) -> Result<Option<usize>> {
-        if busy || self.shrink.last_busy == 0 {
-            self.shrink.last_busy = now;
-        }
-        if self.shrink.period_start == 0 {
-            self.shrink.period_start = now;
-        }
-        if now.saturating_sub(self.shrink.period_start) >= SHRINK_PERIOD_NS {
-            self.sample_max_pages()?;
-            let sample = core::mem::take(&mut self.shrink.period_max);
-            let average = (u64::from(sample) + 4 * u64::from(self.shrink.average)) / 5;
-            self.shrink.average = (average as u32).max(sample);
-            if sample != 0 || self.shrink.last_busy >= self.shrink.period_start {
-                let next = self.shrink.window_next;
-                self.shrink.window[next] = sample;
-                self.shrink.window_next = (next + 1) % SHRINK_WINDOW;
-                self.shrink.busy_peak = self.shrink.window.iter().copied().max().unwrap_or(0);
-            }
-            self.shrink.period_start = now;
-            let capacity = self.blocks() * cfg::TVB_PAGES_PER_BLOCK;
-            if (self.shrink.average as usize).saturating_mul(4) < capacity {
-                self.shrink.credit = self.shrink.credit.saturating_add(SHRINK_STEP_BLOCKS);
-            } else {
-                self.shrink.credit = 0;
-            }
-        }
-        if !self.shrinkable() {
-            self.shrink.credit = 0;
-            return Ok(None);
-        }
-        if busy {
-            return Ok(None);
-        }
-        if now.saturating_sub(self.shrink.last_busy) >= SHRINK_IDLE_NS {
-            return Ok(Some(self.shrink_floor()));
-        }
-        let last = self.tvb.extensions.last().map_or(0, Tvb::extension_blocks);
-        Ok((last != 0 && self.shrink.credit >= last).then(|| self.blocks() - last))
     }
     fn cursors(&self) -> Result<Cursors> {
         Ok(Cursors {
@@ -851,7 +724,7 @@ impl Manager {
     /// the firmware-owned page list and PB state untouched.
     pub(crate) fn prepare_growth(
         &mut self,
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
         target: usize,
         descriptor: Option<[u32; 4]>,
@@ -1004,111 +877,6 @@ impl Manager {
         write(fw::CONTROL + 4, plan.target());
         fence(Ordering::SeqCst);
         Ok(descriptor)
-    }
-}
-
-impl Manager {
-    /// Rebuilds an idle heap with whole trailing growth extensions removed,
-    /// keeping at least `target` blocks. The kept blocks are laid out as
-    /// `Graph::init` lays out a fresh heap, starting at the firmware read
-    /// cursor. This runs only while every block is back in the inventory, as
-    /// an idle-host growth requires the complete snapshot unchanged.
-    ///
-    /// `truncate(blocks, kept, out)` moves the removed blocks' client aliases
-    /// out of the VM cache. Returns the reloaded PB row and the released
-    /// aliases and backing, which the caller frees after the device mutex.
-    /// None leaves the heap, the firmware records and the VM unchanged.
-    pub(crate) fn shrink(
-        &mut self,
-        target: usize,
-        descriptor: [u32; 4],
-        truncate: impl FnOnce(usize, usize, &mut KVec<mmu::KernelMapping>) -> Result,
-    ) -> Result<Option<([u32; 4], TvbRelease)>> {
-        let blocks = self.blocks();
-        let mut kept = blocks;
-        let mut dropped = 0;
-        for extension in self.tvb.extensions.iter().rev() {
-            let size = Tvb::extension_blocks(extension);
-            if kept - size < target.max(self.tvb.primary_blocks()) {
-                break;
-            }
-            kept -= size;
-            dropped += 1;
-        }
-        if dropped == 0 {
-            return Ok(None);
-        }
-        let before = self.cursors()?;
-        let retained = (before.total as usize + cfg::TVB_BLOCK_SLOTS - before.read as usize)
-            % cfg::TVB_BLOCK_SLOTS;
-        if !before.valid() || before.total != before.committed || retained != blocks {
-            return Ok(None);
-        }
-        // Allocation failure only postpones the shrink to a later pass.
-        let (Ok(mappings), Ok(extensions)) = (
-            KVec::with_capacity(blocks - kept, GFP_NOWAIT),
-            KVec::with_capacity(dropped, GFP_NOWAIT),
-        ) else {
-            return Ok(None);
-        };
-        let mut release = TvbRelease {
-            _mappings: mappings,
-            _extensions: extensions,
-        };
-        for &address in &self.tvb.addresses[..kept] {
-            fw::compact_page(address)?
-                .checked_add(cfg::TVB_PAGES_PER_BLOCK as u32 - 1)
-                .ok_or(EOVERFLOW)?;
-        }
-        let base = self.graph.pointer(0, fw::SIZE)?.cast::<u32>();
-        self.graph.word(0)?;
-        // The callback moves aliases only after checking the cached owner,
-        // its block count and the spare capacity.
-        truncate(blocks, kept, &mut release._mappings)?;
-
-        // From here every index, address and CPU view has been checked.
-        let write = |offset: usize, value: u32| {
-            // SAFETY: The full graph and base alignment were checked above.
-            // Every offset is an aligned field or a checked array index of
-            // Graph. No mutable reference aliases firmware-owned fields.
-            unsafe { AtomicU32::from_ptr(base.add(offset / 4)).store(value, Ordering::Relaxed) };
-        };
-        for (index, &address) in self.tvb.addresses[..kept].iter().enumerate() {
-            // The same pure conversion succeeded for every kept block above.
-            let Ok(first) = fw::compact_page(address) else {
-                continue;
-            };
-            let slot = (before.read as usize + index) % cfg::TVB_BLOCK_SLOTS;
-            let at = fw::BLOCK_TABLE + slot * size_of::<fw::Block>();
-            write(at, first);
-            write(at + 4, 0);
-            for page in 0..cfg::TVB_PAGES_PER_BLOCK {
-                let entry = index * cfg::TVB_PAGES_PER_BLOCK + page;
-                write(fw::PAGE_LIST + entry * 4, first + page as u32);
-            }
-        }
-        let total = ((before.read as usize + kept) % cfg::TVB_BLOCK_SLOTS) as u32;
-        let pages = (kept * cfg::TVB_PAGES_PER_BLOCK) as u32;
-        write(core::mem::offset_of!(fw::State, pages), pages);
-        write(core::mem::offset_of!(fw::State, producer), total);
-        write(core::mem::offset_of!(fw::State, consumer), before.read);
-        write(core::mem::offset_of!(fw::State, last_page), pages - 1);
-        write(fw::CONTROL, total);
-        fence(Ordering::SeqCst);
-        write(fw::CONTROL + 4, total);
-        fence(Ordering::SeqCst);
-
-        self.tvb.addresses.truncate(kept);
-        for _ in 0..dropped {
-            if let Some(extension) = self.tvb.extensions.pop() {
-                append_reserved(&mut release._extensions, extension);
-            }
-        }
-        self.shrink.credit = self.shrink.credit.saturating_sub(blocks - kept);
-        Ok(Some((
-            fw::reload_descriptor(descriptor, self.page_list_client, pages),
-            release,
-        )))
     }
 }
 

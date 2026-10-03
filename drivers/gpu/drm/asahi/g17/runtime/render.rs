@@ -11,7 +11,6 @@ mod observe;
 mod pools;
 mod prepare;
 mod recovery;
-mod replay;
 mod settle;
 mod submit;
 pub(super) mod teardown;
@@ -240,17 +239,6 @@ impl Registry {
         Ok(())
     }
 
-    /// Only an optional sibling's unpublished QID-capacity refusal is soft.
-    /// ensure_render_ids cancels a first ID if the second cannot be reserved;
-    /// validation, identity overflow, and cancellation errors still propagate.
-    fn prepare_render_ids(&mut self, slot: u8, owner: u64, optional: bool) -> Result<bool> {
-        match self.ensure_render_ids(slot, owner) {
-            Ok(()) => Ok(true),
-            Err(error) if optional && error == ENOSPC => Ok(false),
-            Err(error) => Err(error),
-        }
-    }
-
     fn reserve_render(&mut self, slot: u8, owner: u64) -> Result<Reservation> {
         self.ensure_render_ids(slot, owner)?;
         let entry = self.render.entry(slot)?;
@@ -330,7 +318,7 @@ impl Registry {
             }
             if let Some(pair) = entry.pair.as_mut() {
                 pair.quarantine(error, &mut |event| deferred.push(event))?;
-            } else if entry.preparing.is_some() || entry.growing {
+            } else if entry.preparing.is_some() {
                 entry.pending_error = Some((status.clone(), error));
             }
         }
@@ -344,7 +332,7 @@ struct Host<'a> {
 }
 impl Host<'_> {
     fn release_registration(&mut self) {
-        if !self.registration_powered && !self.firmware.registration_power_release_pending {
+        if !core::mem::take(&mut self.registration_powered) {
             return;
         }
         if let Err(error) = self.firmware.release_registration_power() {
@@ -353,8 +341,6 @@ impl Host<'_> {
                 "Could not restore render idle policy: {:?}\n",
                 error
             );
-        } else {
-            self.registration_powered = false;
         }
     }
 }
@@ -378,14 +364,12 @@ impl crate::g17::queue::render::Host for Host<'_> {
         &mut self,
         owner: crate::g17::qos::Owner,
         scheduler: u64,
-        policy: crate::g17::fw::queue::Policy,
     ) -> Result<crate::g17::qos::Publication> {
         use crate::g17::qos;
         self.firmware.queues.accounting.publish(
             &qos::View::new(self.firmware.init.qos()?)?,
             owner,
             scheduler,
-            policy,
             qos::clock,
         )
     }
@@ -396,15 +380,12 @@ impl crate::g17::queue::render::Host for Host<'_> {
             .accounting
             .cancel(&qos::View::new(self.firmware.init.qos()?)?, publication)
     }
-    /// Idle descent is held for the whole first install. A point-in-time power
-    /// check let the firmware gate the cores between the host's configuration
-    /// writes while several clients installed their first pairs at once.
     fn install_pair(&mut self, registration: &crate::g17::fw::kick::RenderRegistration) -> Result {
-        if !self.registration_powered {
-            self.firmware.acquire_registration_power()?;
-            self.registration_powered = true;
-        }
         for _ in 0..3 {
+            if !self.firmware.bridge.regs.g17_configuration_powered() {
+                self.firmware.acquire_registration_power()?;
+                self.registration_powered = true;
+            }
             if self
                 .firmware
                 .bridge
@@ -421,7 +402,6 @@ impl crate::g17::queue::render::Host for Host<'_> {
     }
     fn publish_outer_pair(
         &mut self,
-        priority: u8,
         fragment: &crate::g17::fw::channels::WorkSlot,
         tiling: &crate::g17::fw::channels::WorkSlot,
         commit: impl FnOnce() -> Result,
@@ -429,7 +409,7 @@ impl crate::g17::queue::render::Host for Host<'_> {
     ) -> Result<[u32; 2]> {
         self.firmware
             .init
-            .publish_work_pair(priority, fragment, tiling, true, commit, late_tiling)
+            .publish_work_pair(fragment, tiling, true, commit, late_tiling)
     }
     fn activate_render_pool(&mut self, id: u16, generation: u64) -> Result {
         self.release_registration();
@@ -441,7 +421,6 @@ impl crate::g17::queue::render::Host for Host<'_> {
     }
     fn publish_retained_pair(
         &mut self,
-        priority: u8,
         fragment: &crate::g17::fw::channels::WorkSlot,
         tiling: &crate::g17::fw::channels::WorkSlot,
         next: [u32; 2],
@@ -449,19 +428,18 @@ impl crate::g17::queue::render::Host for Host<'_> {
         let result = self
             .firmware
             .init
-            .publish_retained_work_pair(priority, fragment, tiling, next);
+            .publish_retained_work_pair(fragment, tiling, next);
         if result.is_err() {
             self.firmware.primary.state.shared.lose_device_quietly();
         }
         result
     }
-    /// Pipe 0 (tiling) in bits 1:0, priority class in bits 3:2.
-    fn notify_render(&mut self, priority: u8) -> Result {
+    fn notify_render(&mut self) -> Result {
         self.release_registration();
         let result = self
             .firmware
             .primary
-            .notify((0x83 << crate::g17::MSG_TYPE_SHIFT) | u64::from(priority) << 2);
+            .notify((0x83 << crate::g17::MSG_TYPE_SHIFT) | 0x08);
         if result.is_err() {
             self.firmware.primary.state.shared.lose_device_quietly();
         }
@@ -648,111 +626,6 @@ impl Registry {
             || !self.render.retired.is_empty()
             || !self.teardown.is_empty()
     }
-    /// Applies the native tiler-heap shrink policy (`buffer::Manager::
-    /// shrink_target`) to every grown heap at `now` and rebuilds the heaps of
-    /// idle pairs that are due, removing whole growth extensions. The removed
-    /// aliases and backing go to the worker's deferred batch, which frees them
-    /// after the device mutex. A shrink is best effort: any failure leaves the
-    /// heap as it was. Returns whether a heap still holds growth it could give
-    /// back, so the worker keeps a periodic wake.
-    pub(in crate::g17) fn shrink_render_heaps(
-        &mut self,
-        init: &crate::g17::initdata::InitData,
-        now: u64,
-        deferred: &mut super::DeferredBatch,
-    ) -> bool {
-        let mut pending = false;
-        for (slot, entry) in self.render.entries.iter_mut().enumerate() {
-            let Some(entry) = entry.as_mut() else {
-                continue;
-            };
-            let borrowed = entry.constructing || entry.growing || entry.preparing.is_some();
-            let Some(pair) = entry.pair.as_mut() else {
-                continue;
-            };
-            if !pair.manager().grown() {
-                continue;
-            }
-            let busy = borrowed || !pair.idle_for_context(pair.context()).unwrap_or(false);
-            if let Ok(Some(target)) = pair.manager().shrink_target(now, busy) {
-                if deferred.tvb_room() {
-                    if let Ok(slot) = u8::try_from(slot) {
-                        // Ignoring the result keeps the heap unchanged on failure.
-                        let _ = Self::shrink_pair(init, slot, pair, target, deferred);
-                    }
-                }
-            }
-            pending |= pair.manager().shrinkable();
-        }
-        pending
-    }
-
-    fn shrink_pair(
-        init: &crate::g17::initdata::InitData,
-        slot: u8,
-        pair: &mut Pair,
-        target: usize,
-        deferred: &mut super::DeferredBatch,
-    ) -> Result {
-        use core::sync::atomic::{fence, Ordering};
-        let offset = usize::from(pair.buffer_id()) * 16;
-        let table = init.pb_descriptor_table()?;
-        let words = [
-            table.word(offset)?,
-            table.word(offset + 4)?,
-            table.word(offset + 8)?,
-            table.word(offset + 12)?,
-        ];
-        fence(Ordering::Acquire);
-        let descriptor = words.each_ref().map(|word| word.load(Ordering::Relaxed));
-        let vm = pair.context().vm().clone();
-        let pool = pair.pool_id();
-        let shrunk = pair
-            .manager()
-            .shrink(target, descriptor, |blocks, kept, out| {
-                vm.truncate_render_pool_mappings(slot, pool, blocks, kept, out)
-            })?;
-        if let Some((reloaded, release)) = shrunk {
-            for (word, value) in words.into_iter().zip(reloaded) {
-                word.store(value, Ordering::Relaxed);
-            }
-            fence(Ordering::SeqCst);
-            deferred.defer_tvb(release);
-        }
-        Ok(())
-    }
-
-    /// Gives back the USC backing of render pools whose client VM pressure
-    /// reclaim evicted (an idle VM) and whose final free-list release was
-    /// consumed. The vacated backings go to the worker's deferred batch, which
-    /// frees them after the device mutex; a later job of that client re-arms
-    /// the pool first.
-    pub(in crate::g17) fn vacate_evicted_render_pools(
-        &mut self,
-        init: &crate::g17::initdata::InitData,
-        deferred: &mut super::DeferredBatch,
-    ) -> Result {
-        let render = &mut self.render;
-        render.pools.observe(init)?;
-        for entry in render.entries.iter().flatten() {
-            if !deferred.render_backing_room() {
-                break;
-            }
-            if entry.constructing || entry.growing || entry.preparing.is_some() {
-                continue;
-            }
-            let Some(pool) = entry.pool.as_ref() else {
-                continue;
-            };
-            if pool.vacant() || !render.pools.idle(pool.id()) || !pool.client_evicted() {
-                continue;
-            }
-            if let Some(backing) = pool.vacate() {
-                deferred.defer_render_backing(backing);
-            }
-        }
-        Ok(())
-    }
     pub(in crate::g17) fn render_in_flight(&self) -> bool {
         self.render.entries.iter().flatten().any(|entry| {
             entry.pair.as_ref().map_or(
@@ -774,10 +647,7 @@ impl Registry {
             let active = entry
                 .pair
                 .as_ref()
-                .map_or(
-                    (entry.preparing.is_some() || entry.growing) && entry.borrowed_active,
-                    |pair| pair.published_in_flight(),
-                );
+                .map_or(entry.borrowed_active, |pair| pair.published_in_flight());
             active
                 && entry.reservation.ids.into_iter().all(|id| {
                     let qid = usize::from(id.qid());
@@ -790,12 +660,6 @@ impl Registry {
         packet: &Arc<Packet>,
         error: Error,
     ) -> bool {
-        // Its tracker may already be gone while off-lock completion still
-        // owns the fence and admission lease. A loan for a subsequent packet
-        // cannot turn this exact accepted retirement into a missing-owner error.
-        if packet.completion.retirement_queued() {
-            return true;
-        }
         let Some(slot) = packet.completion.render_slot() else {
             return false;
         };

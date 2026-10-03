@@ -266,7 +266,7 @@ pub(crate) struct GpuManager {
 /// Operations the DRM driver performs on a GPU, independent of its firmware interface.
 pub(crate) trait Gpu: Send + Sync {
     /// Cast as an Any type.
-    fn _as_any(&self) -> &dyn Any;
+    fn as_any(&self) -> &dyn Any;
     /// Cast Arc<Self> as an Any type.
     fn arc_as_any(self: Arc<Self>) -> Arc<dyn Any + Sync + Send>;
     /// Return the G13/G14 firmware manager, if this GPU uses that firmware interface.
@@ -279,6 +279,15 @@ pub(crate) trait Gpu: Send + Sync {
     fn is_crashed(&self) -> bool;
     /// Fill in the hardware description reported to userspace.
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result;
+    /// Whether user VMs retain a sticky error and support a userspace mirror.
+    fn supports_vm_status(&self) -> bool {
+        false
+    }
+    /// Limits for independently executing queues, if supported by this GPU.
+    fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
+        None
+    }
+
     /// Frequency of the CPU timer that GPU timestamps are derived from.
     fn base_clock_hz(&self) -> u32;
     /// Return the GPU address space geometry.
@@ -686,6 +695,7 @@ impl GpuManager::ver {
                     oas: cfg.uat_oas,
                 },
                 map_kernel_to_user,
+                mmu::UatFirmware::Handoff,
             )?,
             GFP_KERNEL,
         )?)
@@ -1240,7 +1250,7 @@ impl GpuManager::ver {
 
 #[versions(AGX)]
 impl Gpu for GpuManager::ver {
-    fn _as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 

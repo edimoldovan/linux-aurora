@@ -13,9 +13,6 @@ use crate::g17::{
 };
 use kernel::{prelude::*, sync::Arc};
 
-/// Wake interval while a tiler heap may still shrink: the native check period.
-const SHRINK_WAKE_NS: u64 = 1_000_000_000;
-
 struct Service<'a> {
     firmware: &'a mut Firmware,
     deferred: &'a mut DeferredBatch,
@@ -67,7 +64,7 @@ impl event::Host for Service<'_> {
 
 impl event::Queues for Service<'_> {
     fn context_killed(&mut self, cookie: u64) {
-        self.firmware.queues.acknowledge_compute_exit(cookie);
+        self.firmware.queues.exit_acks.note(cookie);
     }
     fn flush_tvb_reply(&mut self) -> Result<bool> {
         self.firmware.flush_tvb_reply()
@@ -95,10 +92,7 @@ impl event::Queues for Service<'_> {
         self.render_masks[1] |= masks[1];
     }
     fn complete_compute(&mut self, masks: [u64; 2]) -> Result {
-        // A batch without a queue identity still observes completions whose
-        // notification was coalesced; identified batches retain QID filtering.
-        let selected = (masks != [0; 2]).then_some(masks);
-        self.firmware.scan_compute(selected, self.deferred)
+        self.firmware.scan_compute(Some(masks), self.deferred)
     }
 }
 
@@ -128,8 +122,8 @@ impl recovery::Memory for Service<'_> {
     fn clear_timestamps(&self) -> Result {
         self.firmware.init.clear_timestamps()
     }
-    fn entries(&self) -> Result<recovery::Entries> {
-        self.firmware.init.entries()
+    fn entries(&self, out: &mut [recovery::Entry; recovery::MAX_ENTRIES]) -> Result<usize> {
+        self.firmware.init.entries(out)
     }
     fn wait_tick(&self) {
         self.firmware.init.wait_tick();
@@ -317,7 +311,6 @@ impl crate::g17::Shared {
         };
         let result = self.runtime_event_turn(&mut deferred);
         deferred.finish();
-        self.queue_feed();
         if let Some(firmware) = (*self.state.lock()).as_deref_mut() {
             firmware.queues.worker_deferred = Some(deferred);
         }
@@ -368,7 +361,6 @@ impl crate::g17::Shared {
         // Replay only at this outer boundary, after recovery has settled.
         // Publication may service events but must never recurse into replay.
         firmware.replay_compute(deferred)?;
-        firmware.replay_render(deferred)?;
         drop(state);
         self.observe_renders(masks, deferred)?;
         let mut state = self.state.lock();
@@ -390,16 +382,6 @@ impl crate::g17::Shared {
         let idle = firmware.idle_check(now, in_flight)?;
         firmware.reclaim_drained_renders(deferred)?;
         firmware.service_compute_exit(deferred)?;
-        let pools = firmware.service_compute_pools(deferred, now)?;
-        let mut shrinking = false;
-        if !firmware.recovery.pending() {
-            firmware
-                .queues
-                .vacate_evicted_render_pools(&firmware.init, deferred)?;
-            shrinking = firmware
-                .queues
-                .shrink_render_heaps(&firmware.init, now, deferred);
-        }
         {
             let mut reclaim = self.reclaim.lock();
             firmware.service_teardown(&mut reclaim)?;
@@ -409,32 +391,11 @@ impl crate::g17::Shared {
         }
         let backpressured = firmware.render_control_backpressured();
         let polling = backpressured
-            || firmware.queues.replay_outer_wait.is_some()
-            || firmware.queues.render.replay_polling()
             || firmware.queues.teardown.polling(now)
-            || firmware.compute_exit_polling(now)
-            || firmware
-                .queues
-                .compute
-                .iter()
-                .flatten()
-                .filter_map(|entry| entry.queue.as_deref())
-                .any(|queue| queue.retirement_polling());
+            || firmware.compute_exit_polling(now);
         if polling {
             self.queue_poll();
         }
-        // A heap with growth to give back is re-evaluated at least once per
-        // shrink period, also while the device is otherwise idle.
-        let idle = if shrinking {
-            Some(idle.map_or(SHRINK_WAKE_NS, |delay| delay.min(SHRINK_WAKE_NS)))
-        } else {
-            idle
-        };
-        // A retained compute pool gives its backing back when it expires.
-        let idle = match (idle, pools) {
-            (Some(delay), Some(expiry)) => Some(delay.min(expiry)),
-            (delay, expiry) => delay.or(expiry),
-        };
         if let Some(delay) = idle {
             self.queue_idle(delay);
         }
@@ -450,9 +411,7 @@ impl crate::g17::Shared {
             // records that arrived while it was consuming the same ring.
             self.queue_events();
         }
-        let grow_ready = firmware.render_grow_ready();
-        drop(state);
-        if grow_ready {
+        if firmware.render_grow_pending() && !firmware.recovery.pending() {
             self.queue_grow();
         }
         Ok(())
