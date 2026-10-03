@@ -2091,6 +2091,9 @@ impl Vm {
         if let Some(bo) = vm_exec.unique_gpuvm.find_bo(gem) {
             mod_dev_dbg!(self.dev, "MMU: bo_unmap\n");
             vm_exec.unique_gpuvm.bo_unmap(&mut ctx, &bo)?;
+            // The close callback or deferred object list retains this GEM, so
+            // clearing its candidate cannot release the final reference here.
+            self.untrack_context_object(gem);
             self.untrack_shared_object(gem);
             mod_dev_dbg!(self.dev, "MMU: bo_unmap done\n");
             // We need to drop the exec_lock first, then the GpuVmBo since that will take the lock itself.
