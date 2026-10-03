@@ -25,6 +25,7 @@ mod completion;
 pub(crate) mod context;
 mod dependency;
 mod event;
+mod feed;
 mod fence;
 mod freelist;
 pub(crate) mod fw;
@@ -583,6 +584,7 @@ const POLL_WORK: u64 = 1;
 const IDLE_WORK: u64 = 2;
 const GROW_WORK: u64 = 3;
 const RECLAIM_WORK: u64 = 4;
+const FEED_WORK: u64 = 5;
 
 /// Device state shared with the coprocessor callbacks and the event worker.
 #[pin_data]
@@ -591,6 +593,9 @@ struct Shared {
     clusters: u32,
     descriptor_flags: [u32; 2],
     crashed: AtomicBool,
+    feed: Arc<feed::Feed>,
+    #[pin]
+    feed_work: Work<Shared, FEED_WORK>,
     preparations: Arc<preparation::Gate>,
     #[pin]
     work: Work<Shared, EVENT_WORK>,
@@ -819,12 +824,15 @@ impl Gpu {
         let max_frequency_khz = Self::max_frequency_khz(dev)?;
         let preparations = preparation::Gate::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
+        let feed = feed::Feed::new()?;
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 dev: dev.into(),
                 clusters: id.num_clusters,
                 descriptor_flags: [id.perf_control, id.perf_map[0]],
                 crashed: AtomicBool::new(false),
+                feed,
+                feed_work <- new_work!("g17::Shared::feed_work"),
                 preparations,
                 work <- new_work!("g17::Shared::work"),
                 poll <- new_delayed_work!("g17::Shared::poll"),
@@ -980,6 +988,7 @@ impl Gpu {
 
     /// Stops the firmware and releases everything it used.
     pub(crate) fn shutdown(&self) {
+        self.shared.feed.begin_shutdown();
         self.shared.preparations.remove();
         self.shared.stop_queues();
         self.shared.disable_timer(&self.shared.poll);
@@ -987,11 +996,17 @@ impl Gpu {
         self.shared.disable_work(&self.shared.grow);
         self.shared.disable_work(&self.shared.reclaim_work);
         self.shared.disable_work(&self.shared.work);
+        self.shared.disable_work(&self.shared.feed_work);
+        self.shared.feed.shutdown();
         self.shared.drain_reclaims();
     }
 }
 
 impl gpu::Gpu for Gpu {
+    fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
+        self.shared.feed.wait_hint()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

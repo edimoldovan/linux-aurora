@@ -1312,6 +1312,12 @@ impl File {
             objects,
         );
 
+        if ret.is_ok() {
+            if let Some((util_min, duration_ms)) = gpu.syncobj_wait_hint() {
+                file.set_syncobj_wait_hint(util_min, duration_ms);
+            }
+        }
+
         match ret {
             Err(ERESTARTSYS) => Err(ERESTARTSYS),
             Err(e) => {
