@@ -17,14 +17,24 @@ pub(crate) enum Chip {
 
 /// Refuse M3 before DMA setup, MMIO mapping, firmware access or DRM allocation.
 pub(crate) fn refuse_probe(pdev: &platform::Device<Core<'_>>, chip: Chip) -> Error {
-    // pending provenance decision: T8122 register lists and InitData words.
     // [ryan: adapted to 7.2.10 — minimal, pending DJ review: M3 needs an
     // independent event/runtime owner and current GPUVM backing lifetimes.]
     match chip {
-        Chip::T8122 => dev_err!(
-            pdev.as_ref(),
-            "M3/T8122 unavailable: pending provenance decision; backend is compile-only\n"
-        ),
+        // This gate reads only DT properties. A complete hardware config and
+        // exact image gate are still missing, so startup remains disabled.
+        Chip::T8122 => match t8122_admission::read_identity(pdev) {
+            Ok(identity) => dev_info!(
+                pdev.as_ref(),
+                "G15G: T8122 revision 2.0 identity admitted ({} active / {} slots); image and hardware config incomplete, startup refused\n",
+                identity.active_cores,
+                identity.core_slots
+            ),
+            Err(error) => dev_info!(
+                pdev.as_ref(),
+                "G15G: T8122 identity or ABI rejected ({:?}); startup refused\n",
+                error
+            ),
+        },
         _ => dev_err!(
             pdev.as_ref(),
             "M3 unavailable: event/runtime and GPUVM adaptation pending DJ review\n"
@@ -90,3 +100,5 @@ mod agx_render_state;
 mod m3_tiler_command;
 
 mod m3_fragment_command;
+
+mod t8122_admission;
