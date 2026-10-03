@@ -9,12 +9,12 @@
 mod identity;
 use super::{
     freelist::{RenderIds, RenderPool},
-    fw::{context as fw, queue::Policy},
+    fw::context as fw,
     object::{Allocator, CpuMap, Family, KernelObject, Pool, PooledObject},
     status::VmStatus,
 };
 use crate::mmu::{self, ExecutionContext, Vm, UAT_PGSZ};
-use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, Ordering};
 use identity::{RenderSlots, WorkStates, FREE, NODE_STRIDE, STATE_COUNT};
 use kernel::{
     new_mutex,
@@ -101,13 +101,6 @@ impl WorkStorage {
     }
 }
 
-/// Firmware-visible pages of a context, retained by an installed queue whose
-/// last owner has exited (see [`Context::retain_firmware_pages`]).
-pub(crate) struct FirmwarePages {
-    _scheduler: Arc<KernelObject>,
-    _work: Arc<Mutex<WorkStorage>>,
-}
-
 pub(crate) struct Context {
     execution: Arc<ExecutionContext>,
     status: Arc<VmStatus>,
@@ -120,10 +113,6 @@ pub(crate) struct Context {
     work: Arc<Mutex<WorkStorage>>,
     work_base: u64,
     render: Arc<Mutex<Option<Arc<RenderPool>>>>,
-    render_blocks: AtomicUsize,
-    /// Fixed for the context's life. Physical queues bound to it carry this
-    /// profile in every record, ring, doorbell and registration.
-    policy: Policy,
 }
 impl Context {
     pub(crate) fn new(
@@ -132,7 +121,6 @@ impl Context {
         qos: &Arc<QosIds>,
         execution: Arc<ExecutionContext>,
         owner_pid: u32,
-        policy: Policy,
     ) -> Result<Self> {
         let status = execution.vm().status().ok_or(EINVAL)?.clone();
         let qos = qos.acquire()?;
@@ -193,8 +181,6 @@ impl Context {
             work,
             work_base,
             render,
-            render_blocks: AtomicUsize::new(super::fw::freelist::RENDER_BLOCKS),
-            policy,
         })
     }
     pub(crate) fn vm(&self) -> &Vm {
@@ -216,9 +202,6 @@ impl Context {
     pub(crate) fn owner_pid(&self) -> u32 {
         self.owner_pid
     }
-    pub(crate) fn policy(&self) -> Policy {
-        self.policy
-    }
     pub(crate) fn qos_id(&self) -> u8 {
         self.qos.id
     }
@@ -230,22 +213,8 @@ impl Context {
     pub(crate) fn scheduler_owner(&self) -> Arc<KernelObject> {
         self.scheduler.clone()
     }
-    /// Scheduler release and command retirement have both been witnessed.
-    /// Keep installed storage alive while returning the finite TTBAT identity.
-    pub(crate) fn release_execution(&self) {
-        self.execution.release();
-    }
     pub(crate) fn scheduler_generation(&self) -> u32 {
         self.scheduler_generation
-    }
-    /// The pages an installed queue record of this context still names: the
-    /// scheduler page and the work storage holding the job-list head. A retained
-    /// physical queue keeps these after dropping the context itself.
-    pub(crate) fn retain_firmware_pages(&self) -> FirmwarePages {
-        FirmwarePages {
-            _scheduler: self.scheduler.clone(),
-            _work: self.work.clone(),
-        }
     }
     pub(crate) fn work_head_va(&self) -> u64 {
         self.work_base + (UAT_PGSZ + 0x400) as u64
@@ -279,14 +248,6 @@ impl Context {
         }
         Ok(result)
     }
-    pub(crate) fn reserve_render_blocks(&self, blocks: usize) -> Result {
-        if self.is_published() || self.render.lock().is_some() { return Err(EBUSY); }
-        self.render_blocks.store(blocks, Ordering::Release);
-        Ok(())
-    }
-    pub(crate) fn render_blocks(&self) -> usize {
-        self.render_blocks.load(Ordering::Acquire)
-    }
     pub(crate) fn render_pool(
         &self,
         alloc: &Allocator<'_>,
@@ -298,22 +259,14 @@ impl Context {
         }
         let mut render = self.render.lock();
         if let Some(pool) = &*render {
-            // A pool vacated under memory pressure is re-armed before reuse.
-            pool.ensure_backing(alloc, render_global, self.vm())?;
             return Ok(pool.clone());
         }
         let pool = Arc::new(
-            RenderPool::new(alloc, ids, render_global, self.vm(), self.render_blocks())?,
+            RenderPool::new(alloc, ids, render_global, self.vm())?,
             GFP_KERNEL,
         )?;
         *render = Some(pool.clone());
         Ok(pool)
-    }
-    /// Drops the pool once its free-list release is consumed and the closed
-    /// scheduler is detached. Installed compute bindings may retain the
-    /// context itself until replacement; they never use the render pool.
-    pub(crate) fn take_render_pool(&self) -> Option<Arc<RenderPool>> {
-        self.render.lock().take()
     }
     pub(crate) fn render_pools_released(&self, released: impl Fn(u32, u64) -> bool) -> bool {
         self.render

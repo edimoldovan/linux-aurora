@@ -3,10 +3,8 @@
 //! Decode a submission and validate its user resources before publishing any work.
 
 use super::fw::{
-    compute::{IntersectionTables, ScratchRequest},
     kick::WriteRange,
     render::{RenderPass, UscProgram, ZlsSurface},
-    render_rt::RayQueryStage,
 };
 use crate::util::{AnyBitPattern, Reader};
 use core::ops::Range;
@@ -15,13 +13,6 @@ use kernel::{prelude::*, uapi};
 const MAX_ATTACHMENTS: usize = crate::microseq::MAX_ATTACHMENTS;
 const USC_WINDOW_SIZE: u64 = 1 << 32;
 const MAX_SAMPLERS: u32 = 1024;
-const RENDER_BASE_SIZE: usize = core::mem::offset_of!(uapi::drm_asahi_cmd_render, prior_cdm) + size_of::<u64>();
-const COMPUTE_BASE_SIZE: usize = core::mem::offset_of!(uapi::drm_asahi_cmd_compute, prior_cdm) + size_of::<u64>();
-/// The timestamp-copy arrays of the common command layout, which G17P does not implement.
-const RENDER_TIMESTAMP_COPIES: Range<usize> = core::mem::offset_of!(uapi::drm_asahi_cmd_render, ts_frag_end_copies)
-    ..core::mem::offset_of!(uapi::drm_asahi_cmd_render, prior_vdm);
-const COMPUTE_TIMESTAMP_COPIES: Range<usize> = core::mem::offset_of!(uapi::drm_asahi_cmd_compute, ts_end_copies)
-    ..core::mem::offset_of!(uapi::drm_asahi_cmd_compute, scs_layout);
 const SAMPLER_SIZE: u64 = 8;
 const PAGE_SIZE: u64 = 0x4000;
 const ZLS_METADATA_STRIDE: u64 = 0x80;
@@ -31,10 +22,7 @@ const MAX_TILE_BUFFER: u64 = 32768;
 const PROCESS_EMPTY: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES;
 const RSRC_SPEC_HI: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_RSRC_SPEC_HI;
 const DBIAS_INT: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT;
-const FEW_PRIMITIVES: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FEW_PRIMITIVES;
-const FRAGMENT_BARRIERS: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
-const RENDER_FLAGS: u32 =
-    PROCESS_EMPTY | RSRC_SPEC_HI | DBIAS_INT | FEW_PRIMITIVES | FRAGMENT_BARRIERS;
+const RENDER_FLAGS: u32 = PROCESS_EMPTY | RSRC_SPEC_HI | DBIAS_INT;
 
 /// Attachment settings persist until replaced, including by an empty list.
 #[derive(Clone, Copy)]
@@ -85,8 +73,8 @@ impl Attachments {
 // Commands stay inline in the submission plan, avoiding an allocation per render pass.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Payload {
-    Render(uapi::drm_asahi_cmd_render, [Attachments; 2], [RayQueryStage; 2]),
-    Compute(uapi::drm_asahi_cmd_compute, Attachments, IntersectionTables),
+    Render(uapi::drm_asahi_cmd_render, [Attachments; 2]),
+    Compute(uapi::drm_asahi_cmd_compute, Attachments),
 }
 
 pub(crate) struct Command {
@@ -135,20 +123,10 @@ impl<'a> Parser<'a> {
                         == uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER
                     {
                         self.counts[0] += 1;
-                        no_timestamp_copies(bytes, RENDER_TIMESTAMP_COPIES)?;
-                        Payload::Render(
-                            payload(&bytes[..bytes.len().min(RENDER_BASE_SIZE)])?,
-                            [self.attachments[0], self.attachments[1]],
-                            RayQueryStage::parse_pair(bytes.get(RENDER_BASE_SIZE..).unwrap_or(&[]))?,
-                        )
+                        Payload::Render(payload(bytes)?, [self.attachments[0], self.attachments[1]])
                     } else {
                         self.counts[1] += 1;
-                        no_timestamp_copies(bytes, COMPUTE_TIMESTAMP_COPIES)?;
-                        Payload::Compute(
-                            payload(&bytes[..bytes.len().min(COMPUTE_BASE_SIZE)])?,
-                            self.attachments[2],
-                            IntersectionTables::parse(bytes.get(COMPUTE_BASE_SIZE..).unwrap_or(&[]))?,
-                        )
+                        Payload::Compute(payload(bytes)?, self.attachments[2])
                     };
                     return Ok(Some(Command { barriers, payload }));
                 }
@@ -174,16 +152,6 @@ impl<'a> Parser<'a> {
         }
         Ok(())
     }
-}
-
-/// Reject a command that asks for timestamp copies.
-fn no_timestamp_copies(bytes: &[u8], copies: Range<usize>) -> Result {
-    let end = copies.end.min(bytes.len());
-    let start = copies.start.min(end);
-    if bytes[start..end].iter().any(|&b| b != 0) {
-        return Err(EINVAL);
-    }
-    Ok(())
 }
 
 fn payload<T: AnyBitPattern>(bytes: &[u8]) -> Result<T> {
@@ -307,13 +275,10 @@ fn surface(
 pub(crate) enum Validated {
     Render {
         pass: RenderPass,
-        ray_query: [RayQueryStage; 2],
         attachments: [Attachments; 2],
         timestamps: [uapi::drm_asahi_timestamps; 2],
     },
     Compute {
-        intersection: IntersectionTables,
-        scratch: ScratchRequest,
         usc_base: u64,
         cdm_va: u64,
         cdm_end_va: u64,
@@ -324,20 +289,13 @@ pub(crate) enum Validated {
 }
 
 impl Payload {
-    pub(crate) fn prior(&self) -> [u64; 2] {
-        match self {
-            Self::Render(cmd, _, _) => [cmd.prior_vdm, cmd.prior_cdm],
-            Self::Compute(cmd, _, _) => [cmd.prior_vdm, cmd.prior_cdm],
-        }
-    }
-
     pub(crate) fn validate(
         &self,
         window: &UscWindow,
         space: &impl AddressSpace,
     ) -> Result<Validated> {
         match self {
-            Self::Render(cmd, attachments, ray_query) => {
+            Self::Render(cmd, attachments) => {
                 if cmd.flags & !RENDER_FLAGS != 0
                     || !(1..=MAX_DIMENSION).contains(&cmd.width_px)
                     || !(1..=MAX_DIMENSION).contains(&cmd.height_px)
@@ -407,8 +365,6 @@ impl Payload {
                     scissor_va: cmd.isp_scissor_base,
                     depth_bias_va: cmd.isp_dbias_base,
                     depth_bias_is_int: cmd.flags & DBIAS_INT != 0,
-                    few_primitives: cmd.flags & FEW_PRIMITIVES != 0,
-                    fragment_barriers: cmd.flags & FRAGMENT_BARRIERS != 0,
                     occlusion_query_va: cmd.isp_oclqry_base,
                     sampler_heap_va: cmd.sampler_heap,
                     sampler_count: cmd.sampler_count.into(),
@@ -432,28 +388,16 @@ impl Payload {
                             | (u64::from(cmd.bg_partial_rsrc_spec_hi) << 32),
                     },
                     eot_offset: cmd.eot.usc,
-                    eot_rsrc_spec: u64::from(cmd.eot.rsrc_spec)
-                        | (u64::from(cmd.bg_eot_rsrc_spec_hi) << 32),
                     partial_eot_offset: cmd.partial_eot.usc,
-                    partial_eot_rsrc_spec: u64::from(cmd.partial_eot.rsrc_spec)
-                        | (u64::from(cmd.bg_eot_partial_rsrc_spec_hi) << 32),
                     rsrc_spec_hi: cmd.flags & RSRC_SPEC_HI != 0,
                 };
-                for stage in ray_query {
-                    if stage.intersection.enabled() {
-                        require_range(space, stage.intersection.pool, stage.intersection.pool_bytes, Access::Read)?;
-                        let code = stage.intersection.default_program & 0x0000_ffff_ffff_ffff;
-                        if code != 0 { require_range(space, code, 64, Access::Read)?; }
-                    }
-                }
                 Ok(Validated::Render {
                     pass,
-                    ray_query: *ray_query,
                     attachments: *attachments,
                     timestamps: [cmd.ts_vtx, cmd.ts_frag],
                 })
             }
-            Self::Compute(cmd, attachments, intersection) => {
+            Self::Compute(cmd, attachments) => {
                 if cmd.flags != 0
                     || cmd.cdm_ctrl_stream_base & 3 != 0
                     || cmd.cdm_ctrl_stream_end & 3 != 0
@@ -470,14 +414,7 @@ impl Payload {
                 )?;
                 sampler(space, cmd.sampler_heap, cmd.sampler_count)?;
                 attachments.validate(space)?;
-                if intersection.enabled() {
-                    require_range(space, intersection.pool, intersection.pool_bytes, Access::Read)?;
-                    let code = intersection.default_program & 0x0000_ffff_ffff_ffff;
-                    if code != 0 { require_range(space, code, 64, Access::Read)?; }
-                }
                 Ok(Validated::Compute {
-                    intersection: *intersection,
-                    scratch: ScratchRequest::new(cmd.scs_layout)?,
                     usc_base: window.base,
                     cdm_va: cmd.cdm_ctrl_stream_base,
                     cdm_end_va: cmd.cdm_ctrl_stream_end - 4,

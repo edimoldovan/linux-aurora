@@ -34,33 +34,6 @@ pub(crate) use dependencies::Dependencies;
 use kernel::{prelude::*, sync::Arc};
 use retirement::{Ticket, Tracker};
 
-/// Firmware dependencies of one render, kept by origin until the kick entries
-/// are built: the covered earlier renders (their fragment completions) and the
-/// covered compute completion. Which kick waits for the render prefix is the
-/// command's choice (`RenderPass::fragment_barriers`); compute always orders
-/// the tiling kick, since compute output may feed vertex work.
-#[derive(Copy, Clone)]
-pub(crate) struct RenderDependencies {
-    pub(crate) render: [KickDependency; 2],
-    pub(crate) render_count: usize,
-    pub(crate) tiling: [KickDependency; 2],
-    pub(crate) tiling_count: usize,
-    pub(crate) compute: Option<KickDependency>,
-}
-
-impl RenderDependencies {
-    pub(crate) const EMPTY: Self = Self {
-        render: [KickDependency::ZERO; 2],
-        render_count: 0,
-        tiling: [KickDependency::ZERO; 2],
-        tiling_count: 0,
-        compute: None,
-    };
-    pub(crate) fn render(&self) -> &[KickDependency] {
-        &self.render[..self.render_count]
-    }
-}
-
 #[derive(Copy, Clone)]
 pub(crate) struct RenderAddresses {
     /// Tiling then fragment; each pair contains the primary and auxiliary stamp.
@@ -78,18 +51,12 @@ pub(crate) struct PublicationLease {
 pub(crate) trait Host {
     fn epoch(&self) -> Result<(u64, u32)>;
     fn stamps(&self, qids: [u8; 2]) -> Result<[u32; 2]>;
-    fn qos_publish(
-        &mut self,
-        owner: qos::Owner,
-        scheduler: u64,
-        policy: crate::g17::fw::queue::Policy,
-    ) -> Result<qos::Publication>;
+    fn qos_publish(&mut self, owner: qos::Owner, scheduler: u64) -> Result<qos::Publication>;
     fn qos_cancel(&mut self, publication: qos::Publication) -> Result;
     fn install_pair(&mut self, registration: &RenderRegistration) -> Result;
     fn publish_qid(&mut self, id: kick::Id) -> Result;
     fn publish_outer_pair(
         &mut self,
-        priority: u8,
         fragment: &crate::g17::fw::channels::WorkSlot,
         tiling: &crate::g17::fw::channels::WorkSlot,
         commit: impl FnOnce() -> Result,
@@ -98,12 +65,11 @@ pub(crate) trait Host {
     fn activate_render_pool(&mut self, id: u16, generation: u64) -> Result;
     fn publish_retained_pair(
         &mut self,
-        priority: u8,
         fragment: &WorkSlot,
         tiling: &WorkSlot,
         next: [u32; 2],
     ) -> Result;
-    fn notify_render(&mut self, priority: u8) -> Result;
+    fn notify_render(&mut self) -> Result;
     fn note_submission(&mut self) -> Result;
     fn complete_render(
         &mut self,
@@ -130,13 +96,7 @@ struct Active {
     context_update: bool,
     failed: bool,
     drained_result: Option<Result<[u64; 4]>>,
-    /// First observation of this group retired and unlinked without execution.
-    abandoned_since: Option<u64>,
 }
-
-/// A firmware-retired, unexecuted group must hold on two observations this far
-/// apart before it is republished; a single sample may straddle an update.
-const ABANDON_GRACE_NS: u64 = 2_000_000;
 
 /// Installed kick backing remains owned even when this pair has no logical
 /// owner. Commands retain their exact descriptor and allocation generations.
@@ -158,18 +118,13 @@ pub(crate) struct Pair {
     configs: [Option<crate::g17::fw::queue::QueueConfig>; 2],
     cursors: [u32; 2],
     recovery_generation: u64,
-    /// Priority class of the pair's installed registration, if any. A pair
-    /// rebound to an owner of another class is registered again.
-    registered: Option<u8>,
-    /// Bit `p` set once a work slot of priority class `p` named the pair.
-    outer_started: u8,
+    registered: bool,
+    outer_started: bool,
     quarantined: bool,
     terminal: Option<(Arc<VmStatus>, Error)>,
     previous: Option<RetiredBinding>,
     displaced: Option<RetiredBinding>,
     context_update: bool,
-    /// A retired, never-executed group awaiting republication on this pair.
-    replay: Option<Arc<Packet>>,
 }
 impl Pair {
     #[inline(never)]
@@ -207,7 +162,7 @@ impl Pair {
         let Validated::Render { pass, .. } = &first.command else {
             return Err(EINVAL);
         };
-        let word = first.completion.work_state()?.word();
+        let word = first.completion.work_state().word();
         if word == u32::MAX {
             return Err(EINVAL);
         }
@@ -245,13 +200,12 @@ impl Pair {
             configs: [None; 2],
             cursors: [0; 2],
             recovery_generation: 0,
-            registered: None,
-            outer_started: 0,
+            registered: false,
+            outer_started: false,
             quarantined: false,
             terminal: None,
             previous: None,
             displaced: None,
-            replay: None,
             context_update: true,
         }))
     }
@@ -280,21 +234,7 @@ impl Pair {
         &mut self.memory.manager
     }
     pub(crate) fn in_flight(&self) -> bool {
-        self.active.len() != 0 || self.replay.is_some()
-    }
-    /// A replay or an abandonment grace period needs the worker to poll.
-    pub(crate) fn replay_polling(&self) -> bool {
-        self.replay.is_some() || self.active.iter().any(|a| a.abandoned_since.is_some())
-    }
-    pub(crate) fn replay_front(&self) -> Option<Arc<Packet>> {
-        self.replay.clone()
-    }
-    pub(crate) fn finish_replay(&mut self, packet: &Arc<Packet>) -> Result {
-        if !self.replay.as_ref().is_some_and(|front| Arc::ptr_eq(front, packet)) {
-            return Err(EIO);
-        }
-        self.replay = None;
-        Ok(())
+        self.active.len() != 0
     }
     pub(crate) fn published_in_flight(&self) -> bool {
         !self.quarantined && self.active.iter().any(|active| active.outer_published)
@@ -321,7 +261,7 @@ impl Pair {
             return Err(EBUSY);
         }
         let Validated::Render {
-            pass, attachments, ray_query, ..
+            pass, attachments, ..
         } = &packet.command
         else {
             return Err(EINVAL);
@@ -331,7 +271,7 @@ impl Pair {
         }
         let ordinal = self.ordinal;
         ordinal.checked_add(1).ok_or(EOVERFLOW)?;
-        let work = packet.completion.work_state()?;
+        let work = packet.completion.work_state();
         let node = work.node_va()?;
         let word = work.word();
         let layout = target::Layout::new(pass, self.clusters)?;
@@ -385,7 +325,6 @@ impl Pair {
         let qids = self.qids();
         let args = abi::RenderArgs {
             pass,
-            ray_query: *ray_query,
             resources: &resources,
             ordinal,
             ta: abi::RenderStage {
@@ -429,58 +368,6 @@ impl Pair {
     }
 }
 
-/// Kick barriers of one render. The fragment kick always waits for its own tiling kick;
-/// with the fragment-barriers flag the resolved prefix orders the fragment kick too and the
-/// tiling kick preserves the TA prefix across physical pairs. Otherwise the render prefix
-/// orders the tiling kick. A compute dependency always orders the tiling kick.
-struct RenderBarriers {
-    tiling: [KickDependency; 3],
-    tiling_count: usize,
-    fragment: [KickDependency; 3],
-    fragment_count: usize,
-}
-
-fn render_barriers(
-    fragment_stage: bool,
-    dependencies: &RenderDependencies,
-    own_tiling: KickDependency,
-) -> RenderBarriers {
-    let mut tiling_barriers = [KickDependency::ZERO; 3];
-    let mut tiling_count = 0;
-    let mut fragment_barriers = [own_tiling; 3];
-    let mut fragment_count = 1;
-    for dependency in dependencies.render() {
-        if fragment_stage {
-            fragment_barriers[fragment_count] = *dependency;
-            fragment_count += 1;
-        } else {
-            tiling_barriers[tiling_count] = *dependency;
-            tiling_count += 1;
-        }
-    }
-    if fragment_stage {
-        // The implicit parent covers only this physical ring. Preserve the logical
-        // TA prefix when a predecessor was published on another pair, without
-        // making this TA kick wait for that predecessor's fragment completion.
-        for dependency in &dependencies.tiling[..dependencies.tiling_count] {
-            if dependency.qid() != own_tiling.qid() {
-                tiling_barriers[tiling_count] = *dependency;
-                tiling_count += 1;
-            }
-        }
-    }
-    if let Some(compute) = dependencies.compute {
-        tiling_barriers[tiling_count] = compute;
-        tiling_count += 1;
-    }
-    RenderBarriers {
-        tiling: tiling_barriers,
-        tiling_count,
-        fragment: fragment_barriers,
-        fragment_count,
-    }
-}
-
 impl Pair {
     /// All descriptor bytes and retained allocations are ready before entry.
     /// The first inner producer establishes firmware ownership, including on
@@ -488,7 +375,7 @@ impl Pair {
     pub(crate) fn publish(
         &mut self,
         packet: Arc<Packet>,
-        dependencies: &RenderDependencies,
+        dependencies: &[KickDependency],
         lease: PublicationLease,
         host: &mut impl Host,
         defer: &mut impl FnMut(Deferred) -> Result,
@@ -502,13 +389,35 @@ impl Pair {
             },
         };
         use core::sync::atomic::{fence, Ordering};
-        let (epoch, mcache, policy) = self.publication_preflight(&packet, host)?;
+        if self.pending_aliases.is_some() || self.kick_aliases.is_some() {
+            return Err(EBUSY);
+        }
+        let (epoch, recovery_state) = host.epoch()?;
+        if recovery_state != 0
+            || self.quarantined
+            || !self.active.room()
+            || packet.completion.render_slot() != Some(self.slot)
+        {
+            return Err(EBUSY);
+        }
+        let prepared = self.prepared.as_ref().ok_or(EINVAL)?;
+        if !Arc::ptr_eq(&prepared.packet, &packet)
+            || prepared.ordinal != self.ordinal
+            || !self.memory.owns(self.ordinal)
+            || !packet.context.is_current()
+        {
+            return Err(EIO);
+        }
+        if packet.completion.status().get() != 0 {
+            return Err(EIO);
+        }
         let ordinal = self.ordinal;
         let next_ordinal = ordinal.checked_add(1).ok_or(EOVERFLOW)?;
+        let mcache = prepared.mcache;
         let qids = self.qids();
         let kicks = self.kicks.each_ref().map(kick::Queue::timestamp);
         let parents = self.kicks.each_ref().map(kick::Queue::parent);
-        let work = packet.completion.work_state()?;
+        let work = packet.completion.work_state();
         let work_slot = work.render_slot(self.slot)?;
         self.memory.bind_work_slot(ordinal, qids, work_slot)?;
         let payload = work.channel_payload(self.slot, ordinal)?;
@@ -518,7 +427,6 @@ impl Pair {
         self.memory
             .completion_links(ordinal, kicks, payload, !covered[1])?;
         let context = &packet.context;
-        let ring = 1u8 << policy.priority();
         let qos = context.qos_id();
         let qos_owners = [
             qos::Owner {
@@ -561,7 +469,6 @@ impl Pair {
                     slot: self.free_list.id().into(),
                 },
                 scheduler_va: context.scheduler_va(),
-                policy,
                 qos_slot: qos,
                 qos_update: self.context_update,
                 owner_pid: context.owner_pid(),
@@ -586,12 +493,7 @@ impl Pair {
             self.memory.graph.queues.gpu_va()
                 + u64::from(qid) * size_of::<queue::QueueRecord>() as u64
         });
-        let Validated::Render { pass, ray_query, .. } = &packet.command else {
-            return Err(EINVAL);
-        };
-        let own_tiling = KickDependency::new(qids[0], kicks[0]).ok_or(EINVAL)?;
-        let barriers = render_barriers(pass.fragment_barriers, dependencies, own_tiling);
-        let tiling_barriers = &barriers.tiling[..barriers.tiling_count];
+        let fragment_barriers = [KickDependency::new(qids[0], kicks[0]).ok_or(EINVAL)?];
         let args = |stage: usize, barriers, arrays, mcache| KickArgs {
             qid: qids[stage],
             timestamp: kicks[stage],
@@ -610,31 +512,24 @@ impl Pair {
             mcache,
             event_mask: abi::RENDER_KICK_EVENT_MASK,
             register_arrays: arrays,
-            scs_enabled: ray_query[stage].scratch.enabled(),
-            priority: policy.priority(),
         };
         let ta_args = args(
             0,
-            tiling_barriers,
-            abi::TaDescriptor::register_bindings(
-                self.memory.graph.descriptor_client(0, ordinal),
-                ray_query[0].scratch.enabled(),
-            )?,
+            dependencies,
+            abi::TaDescriptor::register_bindings(self.memory.graph.descriptor_client(0, ordinal))?,
             None,
         );
         let fragment_args = args(
             1,
-            &barriers.fragment[..barriers.fragment_count],
+            &fragment_barriers,
             abi::FragmentDescriptor::register_bindings(
                 self.memory.graph.descriptor_client(1, ordinal),
-                ray_query[1].scratch.enabled(),
             )?,
             mcache,
         );
         let registration = RenderRegistration::new(
             (qids[1], self.kicks[1].low_va()),
             (qids[0], self.kicks[0].low_va()),
-            policy.priority(),
         )?;
         let [tiling_kick, fragment_kick] = &mut self.kicks;
         let tiling_kick = tiling_kick.prepare_entry(&ta_args)?;
@@ -676,14 +571,14 @@ impl Pair {
             queues[1],
             qids[1],
             windows[1].target().try_into()?,
-            self.outer_started & ring == 0,
+            !self.outer_started,
         )?;
         let tiling_slot = WorkSlot::new(
             DataMaster::Tiling,
             queues[0],
             qids[0],
             windows[0].target().try_into()?,
-            self.outer_started & ring == 0,
+            !self.outer_started,
         )?;
         let event_slot = memory
             .graph
@@ -710,7 +605,6 @@ impl Pair {
                 context_update: self.context_update,
                 failed: false,
                 drained_result: None,
-                abandoned_since: None,
             })
             .map_err(|_| EBUSY)?;
         self.prepared = None;
@@ -721,20 +615,16 @@ impl Pair {
         tiling_kick.commit();
         let mut qos_publications = [None; 2];
         let result = (|| {
-            qos_publications[1] =
-                Some(host.qos_publish(qos_owners[1], context.scheduler_va(), policy)?);
-            qos_publications[0] =
-                Some(host.qos_publish(qos_owners[0], context.scheduler_va(), policy)?);
-            // A class change happens only at a rebind, after the pair drained.
-            if self.registered != Some(policy.priority()) {
+            qos_publications[1] = Some(host.qos_publish(qos_owners[1], context.scheduler_va())?);
+            qos_publications[0] = Some(host.qos_publish(qos_owners[0], context.scheduler_va())?);
+            if !self.registered {
                 host.install_pair(&registration)?;
-                self.registered = Some(policy.priority());
+                self.registered = true;
             }
             for kick in &self.kicks {
                 host.publish_qid(kick.id())?;
             }
             host.publish_outer_pair(
-                policy.priority(),
                 &fragment_slot,
                 &tiling_slot,
                 || {
@@ -764,7 +654,11 @@ impl Pair {
                 }
                 self.active.back_mut().ok_or(EIO)?.qos_completed = true;
                 self.quarantined = true;
-                self.record_publication_failure(&packet, error, defer)?;
+                if !packet.completion.spared() && self.terminal.is_none() {
+                    self.terminal = Some((packet.completion.status().clone(), error));
+                }
+                defer(Deferred::FailedOwned(packet.completion.clone(), error))?;
+                self.active.back_mut().ok_or(EIO)?.failed = true;
                 return Err(error);
             }
         };
@@ -777,94 +671,16 @@ impl Pair {
         }
         self.recovery_generation = epoch;
         self.installed = [true; 2];
-        self.outer_started |= ring;
+        self.outer_started = true;
         if let Some(previous) = self.previous.as_mut().filter(|p| p.publication.is_none()) {
             previous.publication = Some(ordinal);
         }
         packet.context.mark_published();
-        self.announce_publication(
-            host,
-            (&fragment_slot, &tiling_slot, outer_next),
-            lease.free_list_generation,
-            policy.priority(),
-            &packet,
-            defer,
-        )
-    }
-
-    /// Everything that must hold before a publication changes any state: no alias work
-    /// pending, a healthy device epoch, room in the active ring, this slot's packet, the
-    /// prepared descriptors for this ordinal, a clean completion status and a registration
-    /// class the pair can still take. Returns the epoch, the prepared memory-cache setting
-    /// and the owner's policy.
-    fn publication_preflight(
-        &self,
-        packet: &Arc<Packet>,
-        host: &mut impl Host,
-    ) -> Result<(u64, Option<McacheTable>, crate::g17::fw::queue::Policy)> {
-        if self.pending_aliases.is_some() || self.kick_aliases.is_some() {
-            return Err(EBUSY);
-        }
-        let (epoch, recovery_state) = host.epoch()?;
-        if recovery_state != 0
-            || self.quarantined
-            || !self.active.room()
-            || packet.completion.render_slot() != Some(self.slot)
-        {
-            return Err(EBUSY);
-        }
-        let prepared = self.prepared.as_ref().ok_or(EINVAL)?;
-        if !Arc::ptr_eq(&prepared.packet, packet)
-            || prepared.ordinal != self.ordinal
-            || !self.memory.owns(self.ordinal)
-            || !packet.context.is_current()
-        {
-            return Err(EIO);
-        }
-        if packet.completion.status().get() != 0 {
-            return Err(EIO);
-        }
-        let policy = packet.context.policy();
-        // A registration of another class can only follow a rebind, which
-        // requires the pair to have drained.
-        if self.registered.is_some_and(|class| class != policy.priority()) && self.in_flight() {
-            return Err(EIO);
-        }
-        Ok((epoch, prepared.mcache, policy))
-    }
-
-    /// Records a failed publication on the retained active entry: the terminal status
-    /// (once), the deferred failure and the entry's failed flag.
-    fn record_publication_failure(
-        &mut self,
-        packet: &Arc<Packet>,
-        error: Error,
-        defer: &mut impl FnMut(Deferred) -> Result,
-    ) -> Result {
-        if !packet.completion.spared() && self.terminal.is_none() {
-            self.terminal = Some((packet.completion.status().clone(), error));
-        }
-        defer(Deferred::FailedOwned(packet.completion.clone(), error))?;
-        self.active.back_mut().ok_or(EIO)?.failed = true;
-        Ok(())
-    }
-
-    /// Activates the pool lease and announces the retained pair to the firmware; a failure
-    /// here quarantines the pair with the packet still retained for recovery.
-    fn announce_publication(
-        &mut self,
-        host: &mut impl Host,
-        (fragment_slot, tiling_slot, outer_next): (&WorkSlot, &WorkSlot, [u32; 2]),
-        free_list_generation: u64,
-        priority: u8,
-        packet: &Arc<Packet>,
-        defer: &mut impl FnMut(Deferred) -> Result,
-    ) -> Result {
         let publish = (|| {
-            host.activate_render_pool(self.free_list.id(), free_list_generation)?;
-            host.publish_retained_pair(priority, fragment_slot, tiling_slot, outer_next)?;
+            host.activate_render_pool(self.free_list.id(), lease.free_list_generation)?;
+            host.publish_retained_pair(&fragment_slot, &tiling_slot, outer_next)?;
             self.active.back_mut().ok_or(EIO)?.outer_published = true;
-            host.notify_render(priority)?;
+            host.notify_render()?;
             host.note_submission()
         })();
         if let Err(error) = publish {
@@ -875,7 +691,11 @@ impl Pair {
                 .packet
                 .completion
                 .quarantine_render();
-            self.record_publication_failure(packet, error, defer)?;
+            if !packet.completion.spared() && self.terminal.is_none() {
+                self.terminal = Some((packet.completion.status().clone(), error));
+            }
+            defer(Deferred::FailedOwned(packet.completion.clone(), error))?;
+            self.active.back_mut().ok_or(EIO)?.failed = true;
             return Err(error);
         }
         Ok(())
@@ -933,9 +753,6 @@ impl Pair {
                 .as_ref()
                 .is_some_and(|prepared| Arc::ptr_eq(&prepared.packet, packet))
     }
-    pub(crate) fn replay_contains(&self, packet: &Arc<Packet>) -> bool {
-        self.replay.as_ref().is_some_and(|replay| Arc::ptr_eq(replay, packet))
-    }
     pub(crate) fn take_deferred_timeout(&self) -> Option<(Arc<Packet>, Error)> {
         self.active.iter().find_map(|active| {
             active
@@ -956,7 +773,6 @@ impl Pair {
             return Err(EINVAL);
         };
         let required = target::Layout::new(pass, self.clusters)?.tvb_blocks;
-        self.memory.manager.note_required(required, crate::g17::now_ns());
         if self.in_flight() {
             return Ok(None);
         }
@@ -973,7 +789,7 @@ impl Pair {
     }
 
     pub(crate) fn needs_drain(&self) -> bool {
-        self.quarantined
+        self.quarantined && self.in_flight()
     }
 
     pub(crate) fn oldest_spared(&self) -> Option<bool> {
@@ -1111,8 +927,7 @@ impl Pair {
             };
             let timestamps = match result {
                 Ok(retirement::Poll::Complete(timestamps)) => timestamps,
-                Ok(retirement::Poll::Pending) => return self.replay_abandoned(host, defer),
-                Ok(retirement::Poll::Retry) => return Ok(false),
+                Ok(retirement::Poll::Retry | retirement::Poll::Pending) => return Ok(false),
                 Err(error) => {
                     self.quarantine(error, defer)?;
                     return Ok(false);
@@ -1140,105 +955,6 @@ impl Pair {
             self.active.pop().ok_or(EIO)?;
             return Ok(true);
         }
-    }
-
-    /// The front group was retired and unlinked by firmware without executing
-    /// (job list empty, stamps cover it, no recovery, fragment end never
-    /// written). Nothing of this group reached its attachments, so the same
-    /// command is published again instead of failing the owner's VM. The
-    /// proof is the strict timeout witness, taken twice ABANDON_GRACE_NS apart,
-    /// and only for a lone group whose completion still accepts a replay.
-    fn replay_abandoned(
-        &mut self,
-        host: &mut impl Host,
-        defer: &mut impl FnMut(Deferred) -> Result,
-    ) -> Result<bool> {
-        use retirement::Memory;
-        if self.quarantined || self.active.len() != 1 || self.replay.is_some() {
-            return Ok(false);
-        }
-        let front = self.active.front().ok_or(EIO)?;
-        if !front.outer_published || front.failed {
-            return Ok(false);
-        }
-        let mut observer = Observer {
-            memory: &self.memory,
-            qids: self.qids(),
-            host,
-        };
-        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-        let snapshot = observer.snapshot(front.ticket.ordinal)?;
-        let stamps = observer.stamps()?;
-        let (_, state) = observer.host.epoch()?;
-        let abandoned =
-            retirement::abandoned(&front.ticket, snapshot, stamps, state, false)?;
-        let now = crate::g17::now_ns();
-        let front = self.active.front_mut().ok_or(EIO)?;
-        if !abandoned {
-            front.abandoned_since = None;
-            return Ok(false);
-        }
-        let Some(since) = front.abandoned_since else {
-            front.abandoned_since = Some(now);
-            return Ok(false);
-        };
-        if now.saturating_sub(since) < ABANDON_GRACE_NS {
-            return Ok(false);
-        }
-        if crate::debug::debug_enabled(crate::debug::DebugFlags::VerboseFaults) {
-            pr_info!(
-                "render slot {} retired without execution (pass {:?}); replaying\n",
-                self.slot,
-                snapshot.pass
-            );
-        }
-        let qos = self.qos_owners();
-        let buffer = self.buffer_id();
-        let pool = self.free_list.id();
-        let front = self.active.front_mut().ok_or(EIO)?;
-        if !front.flist_completed {
-            host.complete_render(
-                (!front.qos_completed).then_some(qos),
-                pool,
-                front.generation,
-                buffer,
-            )?;
-            front.flist_completed = true;
-            front.qos_completed = true;
-        }
-        let ordinal = front.ticket.ordinal;
-        let packet = front.packet.clone();
-        if !packet.completion.begin_replay() {
-            if !packet.completion.spared() {
-                packet.completion.status().record(EIO);
-                if self.terminal.is_none() {
-                    self.terminal = Some((packet.completion.status().clone(), EIO));
-                }
-            }
-            defer(Deferred::Retired(packet.completion.clone(), Err(EIO)))?;
-            self.memory.retire(ordinal)?;
-            self.active.pop().ok_or(EIO)?;
-            return Ok(true);
-        }
-        self.memory.retire(ordinal)?;
-        self.active.pop().ok_or(EIO)?;
-        packet.reset_publication_for_replay();
-        self.replay = Some(packet);
-        Ok(true)
-    }
-
-    /// The pending replay cannot proceed (closed owner, cancellation or a
-    /// publication refusal). ECANCELED leaves the VM usable; any other error
-    /// is the ordinary device-loss outcome the replay tried to avoid.
-    pub(crate) fn fail_replay(
-        &mut self,
-        error: Error,
-        defer: &mut impl FnMut(Deferred) -> Result,
-    ) -> Result {
-        let Some(packet) = self.replay.take() else {
-            return Ok(());
-        };
-        defer(Deferred::Retired(packet.completion.clone(), Err(error)))
     }
 
     /// A closed preparation epoch invalidates only this unpublished descriptor.
@@ -1423,9 +1139,6 @@ impl Pair {
             let ordinal = active.ticket.ordinal;
             self.memory.retire(ordinal)?;
             self.active.pop().ok_or(EIO)?;
-        }
-        if let Some(packet) = self.replay.take() {
-            defer(Deferred::Drained(packet.completion.clone(), Err(EIO)))?;
         }
         if let Some(previous) = self.previous.as_mut() {
             previous.ready = true;
@@ -1669,7 +1382,7 @@ impl Pair {
                 buffer_id,
                 pm_generation,
                 self.ordinal,
-                first.completion.work_state()?.word(),
+                first.completion.work_state().word(),
             )?;
             (Some(memory), Some(persistent), Some(aliases))
         };

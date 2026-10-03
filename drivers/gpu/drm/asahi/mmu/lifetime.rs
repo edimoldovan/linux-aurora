@@ -54,9 +54,8 @@ struct State {
     quarantined: bool,
     draining: bool,
     closed: bool,
-    cleanup_failed: bool,
     close_ranges: Option<(Range<u64>, Range<u64>)>,
-    unmaps: KVec<super::bind::PreparedUserUnmap>,
+    unmaps: KVec<(u64, u64)>,
     objects: KVec<ARef<gem::Object>>,
 }
 
@@ -71,19 +70,11 @@ pub(super) struct VmLifetime {
 }
 
 impl VmLifetime {
-    pub(super) fn can_reclaim(&self) -> bool {
-        self.state.try_lock().is_some_and(|state| {
-            state.active == 0 && state.commits == 0
-                && !state.blocked && !state.quarantined && !state.draining
-                && !state.closed && !state.cleanup_failed
-        })
-    }
-
     pub(super) fn new() -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(Self {
                 state <- new_mutex!(State { active:0, commits:0, blocked:false,
-                    quarantined:false, draining:false, closed:false, cleanup_failed:false, close_ranges:None,
+                    quarantined:false, draining:false, closed:false, close_ranges:None,
                     unmaps:KVec::new(), objects:KVec::new() }, "VM job lifetime"),
                 changed <- new_condvar!("VM mapping admission"),
                 driver <- new_mutex!(None, "VM driver mappings"),
@@ -97,7 +88,6 @@ impl VmLifetime {
 /// retirement: potentially visible work must retain its guard through quarantine or stop.
 pub(crate) struct VmJobGuard {
     vm: Vm,
-    _residency: Option<residency::Lease>,
 }
 
 impl VmJobGuard {
@@ -238,40 +228,6 @@ impl Vm {
         Ok(())
     }
 
-    /// Moves the aliases of the last `blocks - kept` heap blocks of the exact
-    /// cached owner into `out`, which the caller drops after its locks. The
-    /// growth path appends one alias per added block, so these are the
-    /// blocks a shrink removed. Nothing moves unless all of them fit in `out`.
-    pub(crate) fn truncate_render_pool_mappings(
-        &self,
-        slot: u8,
-        id: u64,
-        blocks: usize,
-        kept: usize,
-        out: &mut KVec<KernelMapping>,
-    ) -> Result {
-        let count = blocks.checked_sub(kept).ok_or(EINVAL)?;
-        if id == 0 || count == 0 || out.capacity() - out.len() < count {
-            return Err(EINVAL);
-        }
-        let lifetime = self.lifetime.as_ref().ok_or(EINVAL)?;
-        let mut driver = lifetime.driver.lock();
-        let pool = Option::as_mut(&mut *driver)
-            .and_then(|driver| driver.render.get_mut(usize::from(slot)))
-            .and_then(Option::as_mut)
-            .filter(|pool| pool.id == id)
-            .ok_or(EINVAL)?;
-        if pool.blocks != blocks || pool.mappings.len() < count {
-            return Err(EBUSY);
-        }
-        for _ in 0..count {
-            let mapping = pool.mappings.pop().ok_or(EIO)?;
-            out.push_within_capacity(mapping).map_err(|_| EIO)?;
-        }
-        pool.blocks = kept;
-        Ok(())
-    }
-
     /// A delayed teardown must not remove a successor generation. Remove
     /// under the cache lock, then unmap after dropping that lock.
     pub(crate) fn clear_render_pool_mappings_if_owner(&self, slot: u8, id: u64) {
@@ -333,12 +289,6 @@ impl Vm {
         drop(previous);
     }
 
-    /// Whether userspace has permanently closed this VM's map admission.
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
-    pub(crate) fn is_closed(&self) -> bool {
-        self.lifetime.as_ref().is_some_and(|lifetime| lifetime.state.lock().closed)
-    }
-
     /// Tests mappings and reservations which userspace must never replace.
     pub(crate) fn driver_range_overlaps(&self, range: Range<u64>) -> bool {
         let Some(lifetime) = self.lifetime.as_ref() else {
@@ -393,7 +343,6 @@ impl Vm {
 
     /// Acquires a job reference without imposing a VM-wide limit on healthy work.
     pub(crate) fn retain_job(&self) -> Result<VmJobGuard> {
-        let residency = self.enter_residency()?;
         let lifetime = self.lifetime.as_ref().ok_or(EINVAL)?;
         let mut state = lifetime.state.lock();
         loop {
@@ -405,7 +354,7 @@ impl Vm {
             }
             if !state.draining {
                 state.active = state.active.checked_add(1).ok_or(EOVERFLOW)?;
-                return Ok(VmJobGuard { vm: self.clone(), _residency: residency });
+                return Ok(VmJobGuard { vm: self.clone() });
             }
             lifetime.changed.wait(&mut state);
         }
@@ -465,7 +414,7 @@ impl Vm {
         Ok(())
     }
 
-    pub(super) fn defer_bind_batch(&self, batch: &mut PreparedUserBindBatch, start: usize) -> Result<bool> {
+    pub(super) fn defer_bind_batch(&self, batch: &PreparedUserBindBatch) -> Result<bool> {
         use super::bind::PreparedUserBindOp;
         let Some(lifetime) = self.lifetime.as_ref() else {
             return Ok(false);
@@ -479,7 +428,7 @@ impl Vm {
         }
         if batch
             .ops
-            .iter().skip(start)
+            .iter()
             .any(|op| matches!(op, PreparedUserBindOp::Map(_)))
         {
             return Err(EIO);
@@ -487,25 +436,14 @@ impl Vm {
         if !state.quarantined {
             return Err(EBUSY);
         }
-        // Reserve before accepting any range; a partial deferred batch must
-        // not leave canonical metadata ahead of the accepted cleanup.
-        state.unmaps.reserve(batch.ops.len() - start, GFP_KERNEL)?;
-        let retired = self.untrack_context_ranges(batch.ops.iter().skip(start).filter_map(|op| match op {
-            PreparedUserBindOp::Unmap(unmap) => Some(unmap.iova..unmap.iova + unmap.size),
-            PreparedUserBindOp::Map(_) => None,
-        }));
-        // Transfer the preallocated split nodes along with each accepted range.
-        // Already-committed prefix operations must not be replayed: their nodes
-        // may have been consumed and another binding may now occupy the range.
-        for op in batch.ops.drain(start..) {
+        for op in &batch.ops {
             if let PreparedUserBindOp::Unmap(unmap) = op {
-                if !state.unmaps.iter().any(|old| old.iova == unmap.iova && old.size == unmap.size) {
-                    state.unmaps.push(unmap, GFP_KERNEL)?;
+                let range = (unmap.iova, unmap.size);
+                if !state.unmaps.contains(&range) {
+                    state.unmaps.push(range, GFP_KERNEL)?;
                 }
             }
         }
-        drop(state);
-        drop(retired);
         Ok(true)
     }
 
@@ -514,7 +452,7 @@ impl Vm {
         let Some(lifetime) = self.lifetime.as_ref() else {
             return Ok(false);
         };
-        let state = lifetime.state.lock();
+        let mut state = lifetime.state.lock();
         if state.closed {
             return Err(ENOENT);
         }
@@ -524,17 +462,8 @@ impl Vm {
         if !state.quarantined {
             return Err(EBUSY);
         }
-        if state.unmaps.iter().any(|old| old.iova == iova && old.size == size) {
-            return Ok(true);
-        }
-        drop(state);
-        let unmap = self.prepare_user_unmap(iova, size)?;
-        let mut state = lifetime.state.lock();
-        if state.closed { return Err(ENOENT); }
-        if !state.blocked { return Ok(false); }
-        if !state.quarantined { return Err(EBUSY); }
-        if !state.unmaps.iter().any(|old| old.iova == iova && old.size == size) {
-            state.unmaps.push(unmap, GFP_KERNEL)?;
+        if !state.unmaps.contains(&(iova, size)) {
+            state.unmaps.push((iova, size), GFP_KERNEL)?;
         }
         Ok(true)
     }
@@ -553,10 +482,6 @@ impl Vm {
             state.objects.push(gem.into(), GFP_KERNEL)?;
         }
         if state.active != 0 || state.draining {
-            // Stop new jobs from selecting this accepted cleanup candidate.
-            // The queued object retains its GEM while the candidate is removed.
-            // Actual unmap repeats this under exec to order any intervening bind.
-            self.untrack_context_object(gem);
             return Ok(());
         }
         state.draining = true;
@@ -582,20 +507,40 @@ impl Vm {
         self.unmap_user_ranges_now(user, kernel)
     }
 
-    fn unmap_user_ranges_now(&self, user: Range<u64>, _kernel: Range<u64>) -> Result {
-        let _residency = self.enter_retirement_residency();
-        // User mappings alone have GPUVA nodes. Kernel and driver aliases use
-        // mm::Node and are untouched; GPUVM's embedded kernel cutout is skipped.
-        // Closed admission and zero accepted jobs make whole-node teardown safe.
-        let mut inner = self.gpuvm.lock_inner();
-        let result = inner.unmap_all(VmInner::unmap_gpuva);
-        if result.is_ok() {
-            self.untrack_shared_range(user.start, user.end - user.start);
+    fn unmap_user_ranges_now(&self, user: Range<u64>, kernel: Range<u64>) -> Result {
+        let driver = self
+            .lifetime
+            .as_ref()
+            .map(|lifetime| lifetime.driver.lock());
+        let mut cursor = user.start;
+        while cursor < user.end {
+            let mut next = user.end;
+            let mut covered = cursor;
+            for range in Iterator::chain(
+                core::iter::once(kernel.clone()),
+                driver
+                    .as_ref()
+                    .and_then(|guard| guard.as_ref())
+                    .into_iter()
+                    .flat_map(DriverMappings::ranges),
+            ) {
+                if range.contains(&cursor) {
+                    covered = covered.max(range.end);
+                } else if cursor < range.start {
+                    next = next.min(range.start);
+                }
+            }
+            if covered != cursor {
+                cursor = covered.min(user.end);
+                continue;
+            }
+            if next <= cursor {
+                return Err(EIO);
+            }
+            self.unmap_range_now(cursor, next - cursor)?;
+            cursor = next;
         }
-        drop(inner);
-        // Final GEM/SG-table destruction may acquire reservations itself.
-        self.bo_deferred_cleanup();
-        result
+        Ok(())
     }
 }
 
@@ -619,30 +564,25 @@ impl Vm {
     /// Admission stays closed to new jobs while the exec lock is acquired for cleanup.
     /// Recheck queued cleanup and reopen under the same lock used to append it.
     fn drain_mappings(&self, lifetime: &VmLifetime) {
-        let _residency = self.enter_retirement_residency();
         let mut state = lifetime.state.lock();
-        let mut failure = None;
         loop {
             let close = state.close_ranges.take();
             let unmaps = core::mem::replace(&mut state.unmaps, KVec::new());
             let objects = core::mem::replace(&mut state.objects, KVec::new());
             drop(state);
             if let Some((user, kernel)) = close {
-                if let Err(error) = self.unmap_user_ranges_now(user, kernel) {
-                    failure.get_or_insert(error);
+                if self.unmap_user_ranges_now(user, kernel).is_err() {
                     pr_err!("MMU: deferred VM close failed\n");
                 }
             } else {
-                for mut unmap in unmaps {
-                    if let Err(error) = self.unmap_prepared_cleanup(&mut unmap) {
-                        failure.get_or_insert(error);
+                for (address, size) in unmaps {
+                    if self.unmap_range_now(address, size).is_err() {
                         pr_err!("MMU: deferred user unmap failed\n");
                     }
                 }
             }
             for object in objects {
-                if let Err(error) = self.drop_mappings_now(&object) {
-                    failure.get_or_insert(error);
+                if self.drop_mappings_now(&object).is_err() {
                     pr_err!("MMU: deferred object unmap failed\n");
                 }
             }
@@ -653,16 +593,7 @@ impl Vm {
             }
             state.quarantined = false;
             state.draining = false;
-            if let Some(error) = failure {
-                // Cleanup is allocation-free for accepted ranges and has a
-                // whole-node low-memory fallback for objects. An unexpected
-                // invariant error must not reopen admission over stale leaves.
-                // GPUVA owners retain backing until final VM close; report the
-                // terminal failure instead of silently discarding its outcome.
-                state.blocked = true;
-                state.cleanup_failed = true;
-                if let Some(status) = &self.status { status.record(error); }
-            } else if !state.closed && !state.cleanup_failed {
+            if !state.closed {
                 state.blocked = false;
             }
             drop(state);

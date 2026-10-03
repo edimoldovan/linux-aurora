@@ -8,7 +8,6 @@ use super::{context::Context, freelist::control_consumed, fw::channels::Schedule
 use core::sync::atomic::{fence, Ordering};
 use kernel::{prelude::*, sync::Arc};
 
-/// Entries preallocated at device start; a burst of closes beyond it grows the table.
 const CAPACITY: usize = 128;
 const POLL_NS: u64 = 2_000_000_000;
 
@@ -23,15 +22,16 @@ struct Entry {
     context: Arc<Context>,
     phase: Phase,
     armed: u64,
-    announce_pending: bool,
+    warned: bool,
 }
 
-/// Publication and announcement errors retain the entry; no timeout frees
-/// memory the firmware may still own.
+/// Publication and announcement errors retain the entry. A stalled release is reported once;
+/// its timeout never authorizes freeing memory still owned by firmware.
 #[derive(Clone, Copy)]
 pub(crate) enum Failure {
     Publication(Error),
     Announcement(Error),
+    Stalled,
 }
 
 /// Borrowed device operations. Readiness covers every matching installed and displaced graph,
@@ -81,17 +81,15 @@ impl Pending {
             .position(|entry| Arc::ptr_eq(&entry.context, context))
     }
 
-    /// Closes outpacing firmware release consumption grow the table instead of
-    /// failing the close: a failed close stops the device for every client.
     fn insert(&mut self, context: &Arc<Context>, phase: Phase, now: u64) -> Result {
-        let entry = Entry {
-            context: context.clone(),
-            phase,
-            armed: now,
-            announce_pending: false,
-        };
-        self.entries.push(entry, GFP_KERNEL)?;
-        Ok(())
+        self.entries
+            .push_within_capacity(Entry {
+                context: context.clone(),
+                phase,
+                armed: now,
+                warned: false,
+            })
+            .map_err(|_| ENOSPC)
     }
 
     /// Call before replacing a graph's logical owner. Failure leaves that graph with its
@@ -132,20 +130,9 @@ impl Pending {
 
     /// Publish in insertion order. Mandatory control replies and a full control ring stop this
     /// pass; an error for one page leaves it retained while other ready releases may progress.
-    pub(crate) fn publish_ready(&mut self, host: &mut impl Host, recovery: bool, now: u64) -> Result {
+    pub(crate) fn publish_ready(&mut self, host: &mut impl Host, recovery: bool) -> Result {
         if !recovery {
             for entry in self.entries.iter_mut() {
-                // The ring record is already published. Retry only its doorbell;
-                // never duplicate a scheduler release after a transport error.
-                if matches!(entry.phase, Phase::Released(_)) {
-                    if entry.announce_pending && host.notify().is_ok() {
-                        entry.announce_pending = false;
-                        // One successful retry starts its consumption window.
-                        // Failed retries never slide the polling deadline.
-                        entry.armed = now;
-                    }
-                    continue;
-                }
                 if entry.phase != Phase::Draining
                     || !host.render_idle(&entry.context)?
                     || !host.flists_released(&entry.context)
@@ -173,14 +160,9 @@ impl Pending {
                     }
                 };
                 entry.phase = Phase::Released(next);
-                // A long command drain must not consume the acknowledgement
-                // polling window before this release exists on the control ring.
-                entry.armed = now;
-                entry.announce_pending = true;
                 fence(Ordering::SeqCst);
-                match host.notify() {
-                    Ok(()) => entry.announce_pending = false,
-                    Err(error) => host.report(&entry.context, Failure::Announcement(error)),
+                if let Err(error) = host.notify() {
+                    host.report(&entry.context, Failure::Announcement(error));
                 }
             }
         }
@@ -218,12 +200,23 @@ impl Pending {
         Ok(None)
     }
 
-    /// Poll for a bounded window at close and again at actual release publication.
-    /// Failed announcements remain retryable on later service even after polling
-    /// expires. Time passage never substitutes for a firmware-consumption witness.
+    /// Poll quickly only during the initial release window; late arrivals still settle when
+    /// serviced. Time passage never substitutes for a firmware-consumption witness.
     pub(crate) fn polling(&self, now: u64) -> bool {
         self.entries.iter().any(|entry| {
             entry.phase != Phase::Deferred && now.saturating_sub(entry.armed) < POLL_NS
         })
+    }
+
+    pub(crate) fn report_stalled(&mut self, now: u64, host: &mut impl Host) {
+        for entry in self.entries.iter_mut() {
+            if entry.phase != Phase::Deferred
+                && !entry.warned
+                && now.saturating_sub(entry.armed) >= POLL_NS
+            {
+                entry.warned = true;
+                host.report(&entry.context, Failure::Stalled);
+            }
+        }
     }
 }

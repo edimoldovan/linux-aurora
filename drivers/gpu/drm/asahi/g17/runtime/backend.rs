@@ -41,7 +41,7 @@ impl Backend {
             Err(error)
         } else {
             deferred.finish();
-            Ok(packet.completion.scheduler_fence())
+            Ok(packet.completion.fence())
         }
     }
 
@@ -66,16 +66,8 @@ impl Backend {
 }
 
 impl job::Backend for Backend {
-    fn feed(&self) -> Option<Arc<crate::g17::feed::Feed>> {
-        Some(self.shared.feed.clone())
-    }
-
-    fn render_scs_blocks(&self, pages: [u16; 2]) -> Result<usize> {
-        crate::g17::fw::render_rt::required_blocks(self.shared.active_cores, pages)
-    }
-
-    fn ensure_compute(&self, scs_pages: u16) -> Result {
-        Backend::ensure_compute(self, scs_pages)
+    fn ensure_compute(&self) -> Result {
+        Backend::ensure_compute(self)
     }
 
     fn fail_vm(&self, error: Error) {
@@ -119,7 +111,7 @@ impl job::Backend for Backend {
 
     fn publish(&self, packet: Arc<Packet>) -> Result<Fence> {
         if let Some(result) = packet.early_result() {
-            return result.map(|()| packet.completion.scheduler_fence());
+            return result.map(|()| packet.completion.fence());
         }
         let mut deferred = match DeferredBatch::publication() {
             Ok(batch) => batch,
@@ -173,9 +165,9 @@ impl job::Backend for Backend {
         }
     }
 
-    fn defer_timeout(&self, packet: &Arc<Packet>, renewals: u8) -> bool {
-        if packet.engine() == Engine::Compute {
-            return self.defer_compute_timeout(packet, renewals);
+    fn defer_timeout(&self, packet: &Arc<Packet>) -> bool {
+        if packet.engine() != Engine::Render {
+            return false;
         }
         let mut state = self.shared.state.lock();
         (*state)

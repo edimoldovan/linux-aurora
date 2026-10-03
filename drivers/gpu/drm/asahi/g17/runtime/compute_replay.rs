@@ -18,19 +18,6 @@ impl Firmware {
         if state != 0 {
             return Ok(());
         }
-        let commands = self
-            .queues
-            .compute
-            .iter()
-            .flatten()
-            .filter_map(|entry| entry.queue.as_deref())
-            .map(|queue| queue.replay_commands())
-            .sum::<usize>();
-        if commands == 0 {
-            self.queues.replay_outer_wait = None;
-            return Ok(());
-        }
-        deferred.reserve_replays(commands)?;
         let view = qos::View::new(self.init.qos()?)?;
         for entry in self.queues.compute.iter_mut().flatten() {
             if let Some(queue) = entry.queue.as_deref_mut() {
@@ -56,27 +43,8 @@ impl Firmware {
                     break;
                 };
                 let owner = queue.owner();
-                let outer_ready = self.init.work_ready(
-                    packet.context.policy().priority(),
-                    crate::g17::fw::queue::DataMaster::Compute,
-                )?;
-                if !outer_ready {
-                    let now = super::now_ns();
-                    let since = *self.queues.replay_outer_wait.get_or_insert(now);
-                    if now.saturating_sub(since) < super::WORK_RING_WAIT_NS {
-                        // Keep the FIFO and its replay credit untouched. The
-                        // event worker schedules the existing delayed poll.
-                        return Ok(());
-                    }
-                } else {
-                    self.queues.replay_outer_wait = None;
-                }
 
-                let result = if !outer_ready {
-                    // This replay has no live firmware ownership. Persistent
-                    // backpressure uses the existing failed-replay retirement.
-                    Err(EBUSY)
-                } else { (|| {
+                let result = (|| {
                     self.queues.compute[index]
                         .as_mut()
                         .and_then(|entry| entry.queue.as_deref_mut())
@@ -86,7 +54,7 @@ impl Firmware {
                     packet.check_dependencies()?;
                     let dependencies = self.queues.render_prefix(owner, &packet)?;
                     self.publish_compute(owner, packet.clone(), dependencies.as_slice(), deferred)
-                })() };
+                })();
                 let recovery_wait = matches!(result, Err(EAGAIN) | Err(EBUSY))
                     && (self.recovery.pending()
                         || recovery::Memory::recovery_state(&self.init)? != 0);
@@ -109,7 +77,6 @@ impl Firmware {
                 queue.finish_replay(&packet)?;
             }
         }
-        self.queues.replay_outer_wait = None;
         Ok(())
     }
 }

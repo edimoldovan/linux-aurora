@@ -15,10 +15,7 @@ use super::{
 };
 use crate::{hw::t8140, mem, mmu};
 
-pub(super) const QID_COUNT: usize = QID_MAX as usize + 1;
-
-/// QIDs kept free for render pairs when compute queues fill the table.
-const COMPUTE_RENDER_RESERVE: usize = 16;
+const QID_COUNT: usize = QID_MAX as usize + 1;
 
 /// Stable physical-channel identity. The owner must not be reused within a
 /// device lifetime, including after an unpublished allocation is cancelled.
@@ -47,17 +44,13 @@ struct Identity {
 /// One shared namespace for tiling, fragment and compute queues.
 pub(crate) struct QueueIds {
     entries: [Option<Identity>; QID_COUNT],
-    compute_publication: u64,
-    leased: usize,
 }
 
 impl QueueIds {
-    pub(crate) fn new() -> impl Init<Self, Error> {
-        kernel::try_init!(Self {
-            entries <- pin_init::init_array_from_fn(|_| None),
-            compute_publication: 0,
-            leased: 0,
-        })
+    pub(crate) const fn new() -> Self {
+        Self {
+            entries: [None; QID_COUNT],
+        }
     }
 
     /// Reuses only an exact owner/engine match. Preferred placement is for
@@ -83,11 +76,6 @@ impl QueueIds {
                 Err(EINVAL)
             };
         }
-        // Healthy existing channels keep their QID. Never recycle a published
-        // identity to recover capacity after a fault; leave eight render pairs.
-        if engine == DataMaster::Compute && QID_COUNT - self.leased <= COMPUTE_RENDER_RESERVE {
-            return Err(ENOSPC);
-        }
         let index = preferred
             .map(usize::from)
             .filter(|index| self.entries.get(*index).is_some_and(Option::is_none))
@@ -102,14 +90,7 @@ impl QueueIds {
             id,
             published: false,
         });
-        self.leased += 1;
         Ok(id)
-    }
-
-    /// Ordered under the device mutex; no atomic operation on the submission path.
-    pub(crate) fn next_compute_publication(&mut self) -> Result<u64> {
-        self.compute_publication = self.compute_publication.checked_add(1).ok_or(EOVERFLOW)?;
-        Ok(self.compute_publication)
     }
 
     /// Call after preflighting the complete installation, before any address
@@ -132,7 +113,6 @@ impl QueueIds {
         match slot {
             Some(entry) if entry.id == id && !entry.published => {
                 *slot = None;
-                self.leased -= 1;
                 Ok(())
             }
             _ => Err(EINVAL),
@@ -308,7 +288,7 @@ impl Queue {
         if self.id.engine != DataMaster::Compute {
             return Err(EINVAL);
         }
-        mem::sync();
+        fence(Ordering::SeqCst);
         for asid in 0..4 {
             mem::tlbi_range_or_asid(asid, self.low_va() as usize, KICK_RING_SIZE);
             mem::tlbi_range_or_asid(asid, self.firmware_va() as usize, KICK_RING_SIZE);

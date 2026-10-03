@@ -16,7 +16,7 @@ pub(super) struct Source {
 }
 
 pub(crate) struct Sources {
-    pub(crate) reason: Option<u32>,
+    pub(crate) reason: u32,
     mask: u32,
     records: [Source; SLOTS],
     count: usize,
@@ -31,10 +31,10 @@ pub(super) enum Attribution {
 
 impl Sources {
     /// Firmware is halted for every selected key and progress-record read.
-    /// Failed reads stay unknown; incomplete evidence cannot override firmware blame.
-    pub(crate) fn sample(mask: u32, mut read: impl FnMut(usize) -> Option<(u64, u32)>) -> Self {
+    /// Missing keys stay unknown; they cannot establish execution by an owner.
+    pub(crate) fn sample(mask: u32, mut read: impl FnMut(usize) -> (u64, u32)) -> Self {
         let mut sources = Self {
-            reason: None,
+            reason: 0,
             mask,
             records: [Source::default(); SLOTS],
             count: 0,
@@ -43,9 +43,7 @@ impl Sources {
             if mask & (1 << slot) == 0 {
                 continue;
             }
-            let Some((key, monitor)) = read(slot) else {
-                continue;
-            };
+            let (key, monitor) = read(slot);
             let qid = (key >> 40) & 0xff;
             sources.records[sources.count] = Source {
                 slot: slot as u8,
@@ -64,15 +62,12 @@ impl Sources {
         blamed: Option<u8>,
         mut started: impl FnMut(u8, u64) -> Option<bool>,
     ) -> Attribution {
-        if self.reason.is_none() || self.count as u32 != self.mask.count_ones() {
-            return Attribution::Firmware;
-        }
         for source in &mut self.records[..self.count] {
             if let Some(qid) = source.qid {
                 source.started = started(qid, source.stamp);
             }
         }
-        if self.reason == Some(PAGE_FAULT) || self.mask.count_ones() < 2 {
+        if self.reason == PAGE_FAULT || self.mask.count_ones() < 2 {
             return Attribution::Firmware;
         }
         let Some(blamed) = blamed else {

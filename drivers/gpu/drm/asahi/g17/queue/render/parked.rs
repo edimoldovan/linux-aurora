@@ -28,8 +28,8 @@ pub(crate) struct ParkedPair {
     descriptor_flags: [u32; 2],
     installed: [bool; 2],
     recovery_generation: u64,
-    registered: Option<u8>,
-    outer_started: u8,
+    registered: bool,
+    outer_started: bool,
     previous: Option<RetiredBinding>,
 }
 
@@ -120,7 +120,7 @@ impl ParkedPair {
         let Validated::Render { pass, .. } = &first.command else {
             return Err(EINVAL);
         };
-        let word = first.completion.work_state()?.word();
+        let word = first.completion.work_state().word();
         if word == u32::MAX {
             return Err(EINVAL);
         }
@@ -213,7 +213,6 @@ impl ParkedPair {
             terminal: None,
             previous: self.previous.take(),
             displaced: None,
-            replay: None,
             context_update: true,
         }))
     }

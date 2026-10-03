@@ -8,15 +8,11 @@
 //! reference and are released only after the owner's teardown is acknowledged.
 
 use super::fw::freelist::*;
-use super::fw::initdata::{FreeListArgs, FreeListClass, FreeListControl, FREE_LIST_BLOCK_PAGES, FREE_LIST_BLOCK_SIZE};
+use super::fw::initdata::{FreeListArgs, FreeListClass, FreeListControl, FREE_LIST_BLOCK_SIZE};
 use super::object::{Allocator, CpuMap, KernelObject};
 use crate::mmu;
 use core::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
-use kernel::{
-    new_mutex,
-    prelude::*,
-    sync::{Arc, Mutex},
-};
+use kernel::{prelude::*, sync::Arc};
 
 /// Render pools occupy 129..255; compute uses its QID plus one, in 1..128.
 /// First-free allocation keeps the shared firmware namespace deterministic.
@@ -69,7 +65,7 @@ impl Drop for RenderId {
     }
 }
 
-pub(crate) struct Pages {
+struct Pages {
     backing: KernelObject,
     blocks: usize,
     layout: RunLayout,
@@ -89,16 +85,6 @@ impl Pages {
             blocks,
             layout,
         })
-    }
-    /// Fresh compute backing at the admitted capacity, built off-lock.
-    pub(crate) fn compute_sized(alloc: &Allocator<'_>, blocks: usize) -> Result<Self> {
-        if blocks < COMPUTE_BLOCKS || blocks > PAGE_LIST_SIZE / (FREE_LIST_BLOCK_PAGES as usize * 8) {
-            return Err(EINVAL);
-        }
-        Self::new(alloc, blocks, RunLayout::Compute)
-    }
-    pub(crate) fn map_client(&self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
-        self.backing.map_alias(vm, self.page_list_va(), mmu::PROT_GPU_SHARED_RW)
     }
     fn page_list_va(&self) -> u64 {
         self.backing.gpu_va()
@@ -125,55 +111,12 @@ impl Pages {
 /// Pool-object identities are independent of recycled firmware IDs and VAs.
 static RENDER_POOL_SERIAL: AtomicU64 = AtomicU64::new(0);
 
-/// The USC backing of a render pool and its two aliases. Field order drops
-/// both aliases before the backing.
-pub(crate) struct RenderBacking {
+/// A render pool retained by a logical context and every graph referencing it.
+pub(crate) struct RenderPool {
+    // Remove all aliases before dropping the backing or returning the ID.
     _client: mmu::KernelMapping,
     _global: mmu::KernelMapping,
     pages: Pages,
-}
-
-impl RenderBacking {
-    /// Fresh populated backing, built without the device mutex.
-    pub(crate) fn new(
-        alloc: &Allocator<'_>,
-        render_global: &mmu::Vm,
-        client: &mmu::Vm,
-        blocks: usize,
-    ) -> Result<Self> {
-        if blocks < RENDER_BLOCKS || blocks > PAGE_LIST_SIZE / (FREE_LIST_BLOCK_PAGES as usize * 8) {
-            return Err(EINVAL);
-        }
-        let pages = Pages::new(alloc, blocks, RunLayout::Render)?;
-        let address = pages.page_list_va();
-        let global = pages
-            .backing
-            .map_alias(render_global, address, mmu::PROT_GPU_SHARED_RW)?;
-        let client = pages
-            .backing
-            .map_alias(client, address, mmu::PROT_GPU_SHARED_RW)?;
-        Ok(Self {
-            _client: client,
-            _global: global,
-            pages,
-        })
-    }
-}
-
-/// A render pool retained by a logical context and every graph referencing it.
-/// Its backing can be given back while the pool's free-list release has been
-/// consumed and the client VM is evicted; a fresh backing is installed before
-/// the pool is staged again.
-pub(crate) struct RenderPool {
-    blocks: usize,
-    backing: Arc<Mutex<Option<RenderBacking>>>,
-    /// Page-list VA of the installed backing; zero while vacant.
-    page_list: AtomicU64,
-    /// Counts installed backings, so a re-armed backing is a new free-list
-    /// owner even if its addresses repeat.
-    epoch: AtomicU64,
-    /// Residency of the client VM the backing is aliased into.
-    client_residency: Option<Arc<mmu::ResidencyGate>>,
     control: KernelObject,
     state: KernelObject,
     served: AtomicBool,
@@ -187,12 +130,16 @@ impl RenderPool {
         ids: &Arc<RenderIds>,
         render_global: &mmu::Vm,
         client: &mmu::Vm,
-        blocks: usize,
     ) -> Result<Self> {
         let id = RenderId::new(ids)?;
-        let backing = RenderBacking::new(alloc, render_global, client, blocks)?;
-        let address = backing.pages.page_list_va();
-        let run_list_va = backing.pages.run_list_va();
+        let pages = Pages::new(alloc, RENDER_BLOCKS, RunLayout::Render)?;
+        let address = pages.page_list_va();
+        let global = pages
+            .backing
+            .map_alias(render_global, address, mmu::PROT_GPU_SHARED_RW)?;
+        let client = pages
+            .backing
+            .map_alias(client, address, mmu::PROT_GPU_SHARED_RW)?;
         let state = alloc.kernel(
             CONTROL_SIZE,
             mmu::UAT_PGSZ as u64,
@@ -212,8 +159,8 @@ impl RenderPool {
                     buffer_slot: u32::from(id.slot),
                     class: FreeListClass::Two,
                     page_list_va: address,
-                    run_list_va,
-                    blocks: blocks as u32,
+                    run_list_va: pages.run_list_va(),
+                    blocks: RENDER_BLOCKS as u32,
                     state_va: state.gpu_va(),
                 },
                 0,
@@ -223,16 +170,10 @@ impl RenderPool {
         let serial = RENDER_POOL_SERIAL
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
             .map_err(|_| EOVERFLOW)? + 1;
-        let backing = Arc::pin_init(
-            new_mutex!(Some(backing), "G17 render pool backing"),
-            GFP_KERNEL,
-        )?;
         Ok(Self {
-            blocks,
-            backing,
-            page_list: AtomicU64::new(address),
-            epoch: AtomicU64::new(0),
-            client_residency: client.residency_gate(),
+            _client: client,
+            _global: global,
+            pages,
             control,
             state,
             served: AtomicBool::new(false),
@@ -241,59 +182,8 @@ impl RenderPool {
         })
     }
 
-    /// No backing is installed: the pool must be re-armed before staging.
-    pub(crate) fn vacant(&self) -> bool {
-        self.page_list.load(Ordering::Acquire) == 0
-    }
-    /// Pressure reclaim evicted the client VM, which is idle.
-    pub(crate) fn client_evicted(&self) -> bool {
-        self.client_residency.as_ref().is_some_and(|gate| gate.evicted())
-    }
-    /// Removes the backing. The caller holds the device mutex and observed this
-    /// pool's free-list release consumed, so no firmware reference remains; the
-    /// next staging requires a re-armed backing. The caller drops the result
-    /// after releasing the device mutex.
-    pub(crate) fn vacate(&self) -> Option<RenderBacking> {
-        let backing = self.backing.lock().take();
-        if backing.is_some() {
-            self.page_list.store(0, Ordering::Release);
-        }
-        backing
-    }
-    /// Installs fresh backing into a vacant pool, unless another caller did.
-    /// The next staging rewrites the control header and descriptor row for it
-    /// (its run-list address changes the free-list owner identity).
-    pub(crate) fn rearm(&self, fresh: RenderBacking) -> Result {
-        let mut backing = self.backing.lock();
-        if backing.is_some() {
-            return Ok(());
-        }
-        let address = fresh.pages.page_list_va();
-        *backing = Some(fresh);
-        self.epoch.fetch_add(1, Ordering::AcqRel);
-        self.served.store(true, Ordering::Release);
-        self.page_list.store(address, Ordering::Release);
-        Ok(())
-    }
-    /// Re-arms a vacant pool with fresh backing built here, without the device
-    /// mutex. `client` is the VM of the context that owns this pool.
-    pub(crate) fn ensure_backing(
-        &self,
-        alloc: &Allocator<'_>,
-        render_global: &mmu::Vm,
-        client: &mmu::Vm,
-    ) -> Result {
-        if !self.vacant() {
-            return Ok(());
-        }
-        self.rearm(RenderBacking::new(alloc, render_global, client, self.blocks)?)
-    }
-
     pub(crate) fn serial(&self) -> u64 {
         self.serial
-    }
-    pub(crate) fn epoch(&self) -> u64 {
-        self.epoch.load(Ordering::Acquire)
     }
     pub(crate) fn id(&self) -> u16 {
         self.id.slot
@@ -301,16 +191,15 @@ impl RenderPool {
     pub(crate) fn control_va(&self) -> u64 {
         self.control.gpu_va()
     }
-    /// Zero while vacant.
     pub(crate) fn page_list_va(&self) -> u64 {
-        self.page_list.load(Ordering::Acquire)
+        self.pages.page_list_va()
     }
     pub(crate) fn run_list_va(&self) -> u64 {
-        self.page_list_va() + PAGE_LIST_SIZE as u64
+        self.pages.run_list_va()
     }
     pub(crate) fn end_va(&self) -> u64 {
         self.run_list_va()
-            + (self.blocks * size_of::<super::fw::initdata::FreeListRunSlot>()) as u64
+            + (RENDER_BLOCKS * size_of::<super::fw::initdata::FreeListRunSlot>()) as u64
     }
 
     /// Fresh pools are already populated. Reuse requires the previous release
@@ -326,7 +215,7 @@ impl RenderPool {
                 class: FreeListClass::Two,
                 page_list_va: self.page_list_va(),
                 run_list_va: self.run_list_va(),
-                blocks: self.blocks as u32,
+                blocks: RENDER_BLOCKS as u32,
                 state_va: self.state.gpu_va(),
             },
             submitted,
@@ -341,12 +230,7 @@ impl RenderPool {
                 .write_unaligned(header)
         };
         let control = self.control.pointer(0, CONTROL_SIZE)?.cast::<u64>();
-        let backing = self.backing.lock();
-        let pages = &backing.as_ref().ok_or(EAGAIN)?.pages;
-        if pages.page_list_va() != self.page_list_va() {
-            return Err(EIO);
-        }
-        pages.repopulate()?;
+        self.pages.repopulate()?;
         for (index, value) in image.iter().enumerate() {
             // SAFETY: The entire retained page was checked before any store;
             // the allocation is page-aligned and release excludes the firmware.
@@ -440,26 +324,19 @@ impl Submitted<'_> {
 }
 
 /// A pool owned by one physical compute queue, with fixed QID-derived slot.
-/// Idle retained queues may give their USC backing back (`pages` is `None`)
-/// once the firmware consumed the pool's release; the control and state
-/// objects the queue record names stay until processor stop.
 pub(crate) struct ComputePool {
-    pages: Option<Pages>,
+    pages: Pages,
     control: KernelObject,
     state: KernelObject,
     id: u16,
 }
 impl ComputePool {
-    pub(crate) fn fits(&self, blocks: usize) -> bool {
-        self.pages.as_ref().is_some_and(|pages| pages.blocks >= blocks)
-    }
-
-    pub(crate) fn new(alloc: &Allocator<'_>, qid: u8, blocks: usize) -> Result<Self> {
+    pub(crate) fn new(alloc: &Allocator<'_>, qid: u8) -> Result<Self> {
         if qid > super::fw::kick::QID_MAX {
             return Err(EINVAL);
         }
         let id = u16::from(qid) + 1;
-        let pages = Pages::compute_sized(alloc, blocks)?;
+        let pages = Pages::new(alloc, COMPUTE_BLOCKS, RunLayout::Compute)?;
         let mut control = alloc.kernel(
             CONTROL_SIZE,
             mmu::UAT_PGSZ as u64,
@@ -479,13 +356,13 @@ impl ComputePool {
                 class: FreeListClass::One,
                 page_list_va: pages.page_list_va(),
                 run_list_va: pages.run_list_va(),
-                blocks: blocks as u32,
+                blocks: COMPUTE_BLOCKS as u32,
                 state_va: state.gpu_va(),
             }),
         )?;
         fence(Ordering::SeqCst);
         Ok(Self {
-            pages: Some(pages),
+            pages,
             control,
             state,
             id,
@@ -494,59 +371,15 @@ impl ComputePool {
     pub(crate) fn id(&self) -> u16 {
         self.id
     }
-    /// EAGAIN while the pool is vacant: the owner must re-arm it first.
-    pub(crate) fn page_list_va(&self) -> Result<u64> {
-        self.pages.as_ref().map(Pages::page_list_va).ok_or(EAGAIN)
+    pub(crate) fn page_list_va(&self) -> u64 {
+        self.pages.page_list_va()
     }
     pub(crate) fn control_va(&self) -> u64 {
         self.control.gpu_va()
     }
-    pub(crate) fn populated(&self) -> bool {
-        self.pages.is_some()
-    }
-    /// The release record for this pool's buffer slot under the free-list
-    /// generation the queue last published.
-    pub(crate) fn release_record(&self, generation: u64) -> super::fw::channels::FreeListRelease {
-        super::fw::channels::FreeListRelease::new(generation, u32::from(self.id))
-    }
-    /// The caller has observed the firmware consume this pool's release and
-    /// frees the returned backing after releasing the device mutex.
-    pub(crate) fn take_pages(&mut self) -> Option<Pages> {
-        self.pages.take()
-    }
-    /// Rewrites the shared control header for fresh backing. The caller then
-    /// rewrites the page-pool descriptor row before the queue is kicked again.
-    /// As render repopulation does, the firmware-completed counter is carried
-    /// over so it stays consistent with the host submitted counter in `state`.
-    pub(crate) fn rearm(&mut self, pages: Pages) -> Result {
-        if self.pages.is_some() {
-            return Err(EBUSY);
-        }
-        let completed = self.control.pointer(FreeListControl::COMPLETED, 8)?;
-        let mut bytes = [0; 8];
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            // SAFETY: The checked eight-byte range stays mapped; byte accesses
-            // match the unaligned packed counter the firmware writes.
-            *byte = unsafe { completed.add(index).read_volatile() };
-        }
-        let mut header = FreeListControl::compute(&FreeListArgs {
-            buffer_slot: u32::from(self.id),
-            class: FreeListClass::One,
-            page_list_va: pages.page_list_va(),
-            run_list_va: pages.run_list_va(),
-            blocks: pages.blocks as u32,
-            state_va: self.state.gpu_va(),
-        });
-        header.unk_54[..8].copy_from_slice(&bytes);
-        self.control.write(0, header)?;
-        fence(Ordering::SeqCst);
-        self.pages = Some(pages);
-        Ok(())
-    }
     pub(crate) fn map_client(&mut self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
-        let pages = self.pages.as_mut().ok_or(EAGAIN)?;
-        let address = pages.page_list_va();
-        pages
+        let address = self.pages.page_list_va();
+        self.pages
             .backing
             .map_alias(vm, address, mmu::PROT_GPU_SHARED_RW)
     }
@@ -578,8 +411,6 @@ impl ComputePool {
 pub(crate) struct Owner {
     /// Identifies the host pool object even when every firmware address recycles.
     pub(crate) serial: u64,
-    /// Identifies the pool's installed backing (render pools are re-armed).
-    pub(crate) epoch: u64,
     pub(crate) buffer_slot: u32,
     pub(crate) control_va: u64,
     pub(crate) ring_va: u64,

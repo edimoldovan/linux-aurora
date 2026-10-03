@@ -13,7 +13,7 @@ use super::{
     recovery::Class,
     status::VmStatus,
 };
-use crate::{driver::AsahiDrmDevice, file, hw::t8140::{dynamic, resources as cfg}, mmu};
+use crate::{driver::AsahiDevice, file, hw::t8140::resources as cfg, mmu};
 use core::sync::atomic::{fence as barrier, AtomicBool, AtomicI32, AtomicU8, Ordering};
 use kernel::{
     dma_fence::{Fence, FenceContexts, RawDmaFence, UserFence},
@@ -23,13 +23,9 @@ use kernel::{
     uapi, xarray,
 };
 
-mod publication;
-pub(crate) use publication::{Prepared as PreparedPublication, Publication};
-
 struct Destination {
-    // Keep the existing GPU alias alive along with its prepared CPU view.
-    _mapping: Arc<mmu::KernelMapping>,
-    cpu: mmu::TimestampMapping,
+    mapping: Arc<mmu::KernelMapping>,
+    offset: usize,
 }
 
 impl Destination {
@@ -50,97 +46,19 @@ impl Destination {
         if offset.checked_add(size_of::<u64>()).ok_or(EINVAL)? > mapping.size() {
             return Err(ERANGE);
         }
-        let cpu = mapping.timestamp_mapping(offset)?;
-        Ok(Some(Self { _mapping: mapping, cpu }))
+        Ok(Some(Self { mapping, offset }))
     }
 
-    fn write(&self, ticks: u64) {
+    fn write(&self, ticks: u64) -> Result {
         const NSEC_PER_SEC: u64 = 1_000_000_000;
         let ns = (ticks / cfg::COMMAND_TIMESTAMP_HZ)
             .wrapping_mul(NSEC_PER_SEC)
             .wrapping_add(
                 ticks % cfg::COMMAND_TIMESTAMP_HZ * NSEC_PER_SEC / cfg::COMMAND_TIMESTAMP_HZ,
             );
-        self.cpu.write(ns);
+        self.mapping.write_timestamp(self.offset, ns)?;
         barrier(Ordering::Release);
-    }
-}
-
-/// Timestamp mappings resolved and retained before any command is enqueued.
-pub(crate) struct Destinations(Option<crate::cleanup::Deferred<[Option<Destination>; 4]>>);
-
-impl Destinations {
-    pub(crate) fn resolve(
-        objects: Pin<&xarray::XArray<KBox<file::Object>>>,
-        timestamps: &[uapi::drm_asahi_timestamps],
-    ) -> Result<Self> {
-        if timestamps.is_empty() || timestamps.len() > 2 {
-            return Err(EINVAL);
-        }
-        let mut destinations = core::array::from_fn(|_| None);
-        for (index, timestamp) in timestamps.iter().enumerate() {
-            destinations[2 * index] = Destination::resolve(objects, timestamp.start)?;
-            destinations[2 * index + 1] = Destination::resolve(objects, timestamp.end)?;
-        }
-        // Empty submissions need no cleanup allocation. Timestamped commands
-        // prepare the unique work item before any output fence is published.
-        let retained = if destinations.iter().any(Option::is_some) {
-            Some(crate::cleanup::Deferred::new(destinations)?)
-        } else {
-            None
-        };
-        Ok(Self(retained))
-    }
-
-    fn iter(&self) -> core::slice::Iter<'_, Option<Destination>> {
-        let destinations: &[Option<Destination>] =
-            self.0.as_deref().map_or(&[], |destinations| destinations.as_slice());
-        destinations.iter()
-    }
-}
-
-/// Public outputs do not own physical command resources or a scheduler job.
-struct Output {
-    fence: UserFence<CompletionFence>,
-    member: Member,
-    destinations: Destinations,
-}
-
-impl Output {
-    fn publish(&self, result: Result<[u64; 4]>) {
-        match result {
-            Ok(ticks) => {
-                for (destination, ticks) in self.destinations.iter().zip(ticks) {
-                    if let Some(destination) = destination {
-                        destination.write(ticks);
-                    }
-                }
-            }
-            Err(error) => self.fence.set_error(error),
-        }
-        self.fence.signal();
-        self.member.complete(result.map(|_| ()));
-    }
-}
-
-enum HostOutput {
-    Immediate(Output),
-    Ordered(Arc<Publication>),
-}
-
-impl HostOutput {
-    fn output(&self) -> &Output {
-        match self {
-            Self::Immediate(output) => output,
-            Self::Ordered(publication) => publication.output(),
-        }
-    }
-
-    fn finish(&self, result: Result<[u64; 4]>) {
-        match self {
-            Self::Immediate(output) => output.publish(result),
-            Self::Ordered(publication) => publication.finish(result),
-        }
+        Ok(())
     }
 }
 
@@ -152,13 +70,11 @@ struct ComputeTimestamps {
 }
 
 impl ComputeTimestamps {
-    fn new(dev: &AsahiDrmDevice, vm: &mmu::Vm) -> Result<Self> {
+    fn new(dev: &AsahiDevice, vm: &mmu::Vm) -> Result<Self> {
         let object = KernelObject::backing(dev, mmu::UAT_PGSZ, CpuMap::WriteCombined)?;
         let mapping = object.alias_in(
             vm,
-            // Canonical shared queue aliases may be installed in this VM later.
-            // Private timestamp pages must never occupy their retained addresses.
-            dynamic::CLIENT_LOWER,
+            cfg::TIMESTAMPS,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
@@ -169,19 +85,15 @@ impl ComputeTimestamps {
 #[pin_data]
 pub(crate) struct Completion {
     status: Arc<VmStatus>,
-    output: HostOutput,
-    // Present only when this command's public result may wait for a render
-    // predecessor's host writes. DRM credits must follow the terminal result.
-    terminal: Option<UserFence<CompletionFence>>,
+    fence: UserFence<CompletionFence>,
+    member: Member,
+    destinations: [Option<Destination>; 4],
     compute: Option<ComputeTimestamps>,
-    feed: Option<Arc<super::feed::Feed>>,
     #[pin]
     vm_job: Mutex<Option<mmu::VmJobGuard>>,
     #[pin]
     render: Mutex<Option<super::queue::admission::RenderLease>>,
     signalled: AtomicBool,
-    retirement_queued: AtomicBool,
-    accepted: AtomicBool,
     timeout_error: AtomicI32,
     replays: AtomicU8,
     replay_timeout: AtomicBool,
@@ -191,30 +103,24 @@ pub(crate) struct Completion {
 
 impl Completion {
     pub(crate) fn new(
-        dev: &AsahiDrmDevice,
+        dev: &AsahiDevice,
         contexts: &FenceContexts,
         context: &Arc<Context>,
         member: Member,
         vm_job: mmu::VmJobGuard,
-        destinations: Destinations,
+        objects: Pin<&xarray::XArray<KBox<file::Object>>>,
+        timestamps: &[uapi::drm_asahi_timestamps],
         compute: bool,
-        host_predecessors: bool,
-        feed: Option<Arc<super::feed::Feed>>,
     ) -> Result<Arc<Self>> {
+        if timestamps.len() != if compute { 1 } else { 2 } {
+            return Err(EINVAL);
+        }
+        let mut destinations = core::array::from_fn(|_| None);
+        for (index, timestamp) in timestamps.iter().enumerate() {
+            destinations[2 * index] = Destination::resolve(objects, timestamp.start)?;
+            destinations[2 * index + 1] = Destination::resolve(objects, timestamp.end)?;
+        }
         let fence = fence::independent(contexts)?;
-        let ordered = !compute
-            && (host_predecessors || destinations.iter().any(Option::is_some));
-        let terminal = if host_predecessors {
-            Some(fence::independent(contexts)?)
-        } else {
-            None
-        };
-        let output = Output { fence, member, destinations };
-        let output = if ordered {
-            HostOutput::Ordered(Publication::new(output, context.status().clone())?)
-        } else {
-            HostOutput::Immediate(output)
-        };
         let compute = if compute {
             Some(ComputeTimestamps::new(dev, context.vm())?)
         } else {
@@ -223,15 +129,13 @@ impl Completion {
         Arc::pin_init(
             pin_init!(Self {
                 status: context.status().clone(),
-                output,
-                terminal,
+                fence,
+                member,
+                destinations,
                 compute,
-                feed,
                 vm_job <- new_mutex!(Some(vm_job), "G17 command VM pin"),
                 render <- new_mutex!(None, "G17 command render lease"),
                 signalled: AtomicBool::new(false),
-                retirement_queued: AtomicBool::new(false),
-                accepted: AtomicBool::new(false),
                 timeout_error: AtomicI32::new(0),
                 replays: AtomicU8::new(0),
                 replay_timeout: AtomicBool::new(false),
@@ -243,38 +147,16 @@ impl Completion {
     }
 
     pub(crate) fn fence(&self) -> Fence {
-        Fence::from_fence(&self.output.output().fence)
-    }
-    pub(crate) fn scheduler_fence(&self) -> Fence {
-        self.terminal.as_ref().map_or_else(|| self.fence(), |fence| Fence::from_fence(fence))
-    }
-    pub(crate) fn publication(&self) -> Option<Arc<Publication>> {
-        match &self.output {
-            HostOutput::Ordered(publication) => Some(publication.clone()),
-            HostOutput::Immediate(_) => None,
-        }
-    }
-    fn signal_terminal(&self, result: Result<[u64; 4]>) {
-        if let Some(fence) = &self.terminal {
-            if let Err(error) = result {
-                fence.set_error(error);
-            }
-            fence.signal();
-        }
-    }
-    /// All fallible scheduler setup has succeeded. Failures from this point
-    /// must be visible through VM_STATUS before the accepted job's fence.
-    pub(crate) fn mark_accepted(&self) {
-        self.accepted.store(true, Ordering::Release);
+        Fence::from_fence(&self.fence)
     }
     pub(crate) fn status(&self) -> &Arc<VmStatus> {
         &self.status
     }
-    pub(crate) fn work_state(&self) -> Result<Arc<WorkStateLease>> {
-        self.output.output().member.work_state()
+    pub(crate) fn work_state(&self) -> Arc<WorkStateLease> {
+        self.member.work_state()
     }
     pub(crate) fn has_timestamps(&self) -> bool {
-        self.output.output().destinations.iter().any(Option::is_some)
+        self.destinations.iter().any(Option::is_some)
     }
 
     pub(crate) fn compute_timestamp_va(&self) -> Result<u64> {
@@ -342,16 +224,6 @@ impl Completion {
         end.store(0, Ordering::Relaxed);
         barrier(Ordering::SeqCst);
         Ok(())
-    }
-
-    /// A retirement witness has been accepted by an off-lock completion batch.
-    /// This is separate from fence signalling and from a failure still owned by firmware.
-    pub(crate) fn note_retirement_queued(&self) {
-        self.retirement_queued.store(true, Ordering::Release);
-    }
-
-    pub(crate) fn retirement_queued(&self) -> bool {
-        self.retirement_queued.load(Ordering::Acquire)
     }
 
     /// The first timeout request retains its errno while the physical graph is
@@ -433,44 +305,43 @@ impl Completion {
 
     /// Exact retirement permits the physical lease and VM pin to be released
     /// before waking userspace. A failure fence alone never establishes this.
-    #[track_caller]
     pub(crate) fn complete(&self, result: Result<[u64; 4]>) {
         if self.signalled.swap(true, Ordering::AcqRel) {
             return;
         }
-        if let (Some(feed), Ok(ticks)) = (&self.feed, &result) {
-            feed.note_render_pass(ticks[2], ticks[3]);
-        }
+        let result = result.and_then(|ticks| {
+            for (destination, ticks) in self.destinations.iter().zip(ticks) {
+                if let Some(destination) = destination {
+                    destination.write(ticks)?;
+                }
+            }
+            Ok(())
+        });
         if let Err(error) = result {
-            if self.spared() {
-                self.status.report_failure(error);
-            } else if error != ECANCELED {
+            if error != ECANCELED && !self.spared() {
                 self.status.record(error);
             }
+            self.fence.set_error(error);
         }
         self.release_healthy();
-        self.signal_terminal(result);
-        self.output.finish(result);
+        self.fence.signal();
+        self.member.complete(result);
     }
 
     /// A rejected, never-published command cannot poison the VM for contention.
-    #[track_caller]
     pub(crate) fn fail_unpublished(&self, error: Error) {
         if self.signalled.swap(true, Ordering::AcqRel) {
             return;
         }
         self.status.record_if_device_loss(error);
-        if self.accepted.load(Ordering::Acquire) {
-            self.status.report_failure(error);
-        }
+        self.fence.set_error(error);
         self.release_healthy();
-        self.signal_terminal(Err(error));
-        self.output.finish(Err(error));
+        self.fence.signal();
+        self.member.complete(Err(error));
     }
 
     /// The physical queue must already be quarantined. Keep mappings pinned while
     /// waking waiters, even if queue destruction requested cancellation.
-    #[track_caller]
     pub(crate) fn fail_while_owned(&self, error: Error) {
         if self.signalled.swap(true, Ordering::AcqRel) {
             return;
@@ -478,13 +349,12 @@ impl Completion {
         if let Some(guard) = self.vm_job.lock().as_ref() {
             guard.quarantine();
         }
-        if self.spared() {
-            self.status.report_failure(error);
-        } else if error != ECANCELED {
+        if error != ECANCELED && !self.spared() {
             self.status.record(error);
         }
-        self.signal_terminal(Err(error));
-        self.output.finish(Err(error));
+        self.fence.set_error(error);
+        self.fence.signal();
+        self.member.complete(Err(error));
     }
 }
 

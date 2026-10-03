@@ -196,9 +196,8 @@ pub(crate) mod low {
     pub(crate) const RENDER_BLOCKS: u64 = 0x70_0022_0000;
     /// Distance between consecutive blocks.
     pub(crate) const BLOCK_STRIDE: u64 = 0x10_8000;
-    /// Render blocks allocated at boot: the mapped blocks and the block that
-    /// holds the compute page list.
-    pub(crate) const RENDER_BLOCKS_ALLOCATED: usize = COMPUTE_PAGE_LIST_BLOCK + 1;
+    /// Render blocks allocated at boot.
+    pub(crate) const RENDER_BLOCKS_ALLOCATED: usize = 28;
     /// Render blocks mapped at boot.
     pub(crate) const RENDER_BLOCKS_MAPPED: usize = 22;
     /// Render blocks in the free list at boot.
@@ -377,17 +376,6 @@ pub(crate) mod qos {
     pub(crate) const CLASS: u8 = 0x0f;
     pub(crate) const SHARE: u32 = 0x2000;
     pub(crate) const CLOCK_HZ: u64 = 24_000_000;
-}
-
-/// Firmware scheduling profiles of the DRM queue priorities. Native user
-/// queues use priority class 2 with policy 2.
-pub(crate) mod scheduling {
-    use crate::g17::fw::queue::Policy;
-
-    /// `DRM_ASAHI_PRIORITY_MEDIUM`.
-    pub(crate) const MEDIUM: Policy = Policy::new(2, 2, super::qos::CLASS, super::qos::SHARE);
-    /// `DRM_ASAHI_PRIORITY_LOW`.
-    pub(crate) const LOW: Policy = Policy::new(3, 2, super::qos::CLASS, super::qos::SHARE);
 }
 
 /// Physical workqueue capacity and logical-owner admission limits.
