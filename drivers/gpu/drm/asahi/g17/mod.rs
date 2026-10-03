@@ -968,7 +968,7 @@ impl Gpu {
         primary: &Coprocessor,
         secondary: &Coprocessor,
     ) -> Result {
-        for _ in 0..OPENING_RETIRE_POLLS {
+        for poll in 0..=OPENING_RETIRE_POLLS {
             if primary.state.crashed.load(Ordering::Acquire)
                 || secondary.state.crashed.load(Ordering::Acquire)
             {
@@ -977,7 +977,9 @@ impl Gpu {
             if init.opening_retired(Role::Primary)? && init.opening_retired(Role::Secondary)? {
                 return Ok(());
             }
-            fsleep(Delta::from_millis(OPENING_RETIRE_POLL_MS));
+            if poll < OPENING_RETIRE_POLLS {
+                fsleep(Delta::from_millis(OPENING_RETIRE_POLL_MS));
+            }
         }
         dev_err!(
             dev.as_ref(),
