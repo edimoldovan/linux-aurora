@@ -82,3 +82,11 @@ mod m3_active_power;
 mod m3_consistent_perf;
 
 mod m3_globals_debug;
+
+mod agx_render;
+
+mod agx_render_state;
+
+mod m3_tiler_command;
+
+mod m3_fragment_command;

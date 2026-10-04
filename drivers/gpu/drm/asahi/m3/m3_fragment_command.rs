@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 use super::{agx_render::Geometry, agx_render_state::{Program,DepthStencil},
-    m3_compute_layout::{GpuVa,RegisterSet}, m3_init_layout::{Error,Region},
+    m3_compute_layout::GpuVa, m3_init_layout::{Error,Region},
     m3_queue_layout::FirmwareVa, m3_render_sequence::fragment};
 pub(crate) const SIZE:usize=0xc73;
 pub(crate) const REGISTERS:usize=fragment::REGISTERS;
-/// The registers G15G does not take; the others keep the G15S order.
-pub(crate) const G15G_OMIT:[u32;4]=[0x160a8,0x160b8,0xa5a9,0xd429];
 pub(crate) const REGISTER_COUNT:usize=79;
 pub(crate) const REGISTER_STRIDE:usize=12;
 pub(crate) const PARAMETERS:usize=0x790;
 pub(crate) const META:usize=0xbac;
-pub(crate) const SEQUENCE_LENGTH:usize=0x1c;
 pub(crate) const STAMP_VALUE:usize=META+0x10;
-pub(crate) const FLUSH_STAMPS:usize=META+0x1c;
 fn word(out:&mut[u8],off:usize,value:u32) {out[off..off+4].copy_from_slice(&value.to_le_bytes());}
 fn pointer(out:&mut[u8],off:usize,value:u64) {out[off..off+8].copy_from_slice(&value.to_le_bytes());}
 /// The initial producer had different register/mirror values for tilebuffer
@@ -36,10 +32,6 @@ pub(crate) struct State {
     pub(crate) mirror_tile_mode:u32,
     pub(crate) depth:DepthStencil,
     pub(crate) stencil:DepthStencil,
-    // Paired ZLS metadata address/stride. Native 26A428 compressed depth
-    // witness: 153c1/153c9 and partial mirror +1e0; independent of image data.
-    pub(crate) depth_compression:DepthStencil,
-    pub(crate) stencil_compression:DepthStencil,
     pub(crate) zls_control:u64,
     pub(crate) depth_dimensions:u32,
     pub(crate) depth_clear:u32,
@@ -49,8 +41,6 @@ pub(crate) struct State {
 }
 pub(crate) struct Command {
     pub(crate) context:u32,
-    /// The register list of the GPU: G15S's, or G15G's without [`G15G_OMIT`].
-    pub(crate) register_set:RegisterSet,
     pub(crate) sequence:Region,
     pub(crate) notifier:FirmwareVa,
     pub(crate) manager:FirmwareVa,
@@ -104,10 +94,7 @@ impl Command {
             (0x15329,s.depth.base),(0x15331,s.depth.base),(0x15339,s.stencil.base),(0x15341,s.stencil.base),
             (0x15231,0),(0x15221,0),(0x15239,0),(0x15229,0),
             (0x15401,s.depth.stride),(0x15421,s.depth.stride),(0x15409,s.stencil.stride),(0x15429,s.stencil.stride),
-            (0x153c1,s.depth_compression.base),(0x15411,s.depth_compression.stride),
-            (0x153c9,s.depth_compression.base),(0x15431,s.depth_compression.stride),
-            (0x153d1,s.stencil_compression.base),(0x15419,s.stencil_compression.stride),
-            (0x153d9,s.stencil_compression.base),(0x15439,s.stencil_compression.stride),
+            (0x153c1,0),(0x15411,0),(0x153c9,0),(0x15431,0),(0x153d1,0),(0x15419,0),(0x153d9,0),(0x15439,0),
             (0x16429,self.tilemap.get()),(0x16060,layer_metadata),(0x16431,u64::from(4*g.region_stride)<<24),
             (0x10039,s.tile_mode),(0x16020,0),(0x16451,0),(0x15359,0),(0x100b8,0x8860),
             (0x16461,self.auxiliary.get()),(0x16090,self.auxiliary.get()),(0x120a1,0x1c),(0x101e9,0x1c),
@@ -121,7 +108,7 @@ impl Command {
         word(bytes,0xc,self.context);
         for (offset,value) in [(0x14,seq),(0x20,self.notifier.get()),(0x28,self.manager.get()),
             (0x30,self.scene.get()),(0x38,self.empty.get()),(0x40,self.tilemap.get()),(0x780,registers)] {pointer(bytes,offset,value);}
-        word(bytes,SEQUENCE_LENGTH,fragment::LENGTH as u32);
+        word(bytes,0x1c,fragment::LENGTH as u32);
         // The qualified patch path updates register MSAA but retains these
         // producer header values. Representation cleanup must not change that.
         pointer(bytes,0x48,0x88);word(bytes,0x50,1);
@@ -129,23 +116,18 @@ impl Command {
         bytes[0x56..0x58].copy_from_slice(&((g.x_blocks>>18) as u16).to_le_bytes());
         word(bytes,0x68,s.merge_upper[0]);word(bytes,0x6c,s.merge_upper[1]);
         pointer(bytes,0x78,u64::from(g.tiles));
-        let g15g=self.register_set==RegisterSet::G15G;
-        let mut count=0;
-        for (register,value) in values.into_iter().filter(|(r,_)| !g15g || !G15G_OMIT.contains(r)) {
-            let n=count;count+=1;
+        for (n,(register,value)) in values.into_iter().enumerate() {
             word(bytes,REGISTERS+n*REGISTER_STRIDE,register);pointer(bytes,REGISTERS+n*REGISTER_STRIDE+4,value);
         }
-        bytes[0x788..0x78a].copy_from_slice(&(count as u16).to_le_bytes());
-        bytes[0x78a..0x78c].copy_from_slice(&((count*REGISTER_STRIDE) as u16).to_le_bytes());
+        bytes[0x788..0x78a].copy_from_slice(&(REGISTER_COUNT as u16).to_le_bytes());
+        bytes[0x78a..0x78c].copy_from_slice(&((REGISTER_COUNT*REGISTER_STRIDE) as u16).to_le_bytes());
         // Start3DJobParameters3: mirror records use their actual packed widths.
         for (offset,value) in [(0,s.depth_bias),(0x10,s.scissor),(0x20,s.query),
             (0x168,s.partial_background.resources),(0x170,s.partial_background.address),
             (0x198,s.partial_background.resources),(0x1a0,s.partial_background.address),
             (0x1a8,s.zls_control),(0x1b8,s.depth.base),(0x1c0,s.depth.stride),
-            (0x1c8,s.depth_compression.stride),(0x1e0,s.depth_compression.base),
             (0x1d0,s.depth.base),(0x1d8,s.depth.base),
             (0x1e8,s.stencil.base),(0x1f0,s.stencil.stride),(0x200,s.stencil.base),(0x208,s.stencil.base),
-            (0x1f8,s.stencil_compression.stride),(0x210,s.stencil_compression.base),
             (0x26c,s.partial_eot.address),(0x28c,s.partial_eot.address),(0x2c0,u64::from(s.depth_dimensions))] {
             pointer(bytes,PARAMETERS+offset,value);
         }
@@ -159,7 +141,7 @@ impl Command {
         word(bytes,0xb98,1); // retained no_clear_pipeline_textures
         pointer(bytes,META,self.stamp.get());pointer(bytes,META+8,self.fw_stamp.get());
         word(bytes,STAMP_VALUE,self.stamp_value);word(bytes,META+0x14,1); // event slot
-        word(bytes,FLUSH_STAMPS,1); // flush completion stamps
+        word(bytes,META+0x1c,1); // flush completion stamps
         word(bytes,META+0x20,fragment::UUID);word(bytes,0xbe8,1); // unk_buf2.unk_10
         for (offset,value) in [(8,self.timestamps[0].get()),(16,self.timestamps[1].get()),
             (0x18,self.user_timestamps[0].get()),(0x20,self.user_timestamps[1].get()),

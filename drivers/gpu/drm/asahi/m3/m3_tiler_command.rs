@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-use super::{agx_render::Geometry, m3_compute_layout::{GpuVa,RegisterSet},
+use super::{agx_render::Geometry, m3_compute_layout::GpuVa,
     m3_init_layout::{Error,Region}, m3_queue_layout::FirmwareVa,
     m3_render_sequence::ta};
 pub(crate) const SIZE:usize=0x92b;
 pub(crate) const REGISTERS:usize=ta::REGISTERS;
-/// The registers G15G does not take; the others keep the G15S order.
-pub(crate) const G15G_OMIT:[u32;14]=[0x1c041,0x1c9d0,0x1c948,0x1c888,0x1c890,0x1c918,0x1c089,0x1c9e0,0x16c41,0x1ca40,0x1c9a8,0x1c920,0xa5a1,0xd419];
 pub(crate) const REGISTER_COUNT:usize=72;
 pub(crate) const REGISTER_STRIDE:usize=12;
 pub(crate) const STAMP_VALUE:usize=0x780;
 pub(crate) const STRUCT3_STAMP:usize=ta::STRUCT3+0xf0;
-pub(crate) const FLUSH_STAMPS:usize=ta::STRUCT3+0xfc;
 pub(crate) const CONTEXT:usize=0xc;
-pub(crate) const SEQUENCE_LENGTH:usize=0x778;
 fn word(out:&mut[u8],off:usize,value:u32) {out[off..off+4].copy_from_slice(&value.to_le_bytes());}
 fn pointer(out:&mut[u8],off:usize,value:u64) {out[off..off+8].copy_from_slice(&value.to_le_bytes());}
 fn compact(address:u64)->Result<u64,Error> {
@@ -20,8 +16,6 @@ fn compact(address:u64)->Result<u64,Error> {
 }
 pub(crate) struct Command {
     pub(crate) context:u32,
-    /// The register list of the GPU: G15S's, or G15G's without [`G15G_OMIT`].
-    pub(crate) register_set:RegisterSet,
     pub(crate) notifier:FirmwareVa,
     pub(crate) manager:FirmwareVa,
     pub(crate) scene:FirmwareVa,
@@ -105,16 +99,13 @@ impl Command {
         for (offset,value) in [(0x14,self.notifier.get()),(0x24,self.manager.get()),
             (0x2c,self.scene.get()),(0x34,self.empty.get()),(0x740,registers),
             (0x760,self.tpc.get()),(0x768,self.tpc_bytes),(0x770,seq)] {pointer(bytes,offset,value);}
-        let g15g=self.register_set==RegisterSet::G15G;
-        let mut count=0;
-        for (register,value) in values.into_iter().filter(|(r,_)| !g15g || !G15G_OMIT.contains(r)) {
-            let n=count;count+=1;
+        for (n,(register,value)) in values.into_iter().enumerate() {
             word(bytes,REGISTERS+n*REGISTER_STRIDE,register);
             pointer(bytes,REGISTERS+n*REGISTER_STRIDE+4,value);
         }
-        bytes[0x748..0x74a].copy_from_slice(&(count as u16).to_le_bytes());
-        bytes[0x74a..0x74c].copy_from_slice(&((count*REGISTER_STRIDE) as u16).to_le_bytes());
-        word(bytes,SEQUENCE_LENGTH,ta::LENGTH as u32);
+        bytes[0x748..0x74a].copy_from_slice(&(REGISTER_COUNT as u16).to_le_bytes());
+        bytes[0x74a..0x74c].copy_from_slice(&((REGISTER_COUNT*REGISTER_STRIDE) as u16).to_le_bytes());
+        word(bytes,0x778,ta::LENGTH as u32);
         word(bytes,0x77c,1); // fragment event slot
         word(bytes,STAMP_VALUE,self.stamp_value);
         pointer(bytes,ta::STRUCT3+0x24,preemption[0]);
@@ -124,7 +115,7 @@ impl Command {
         pointer(bytes,ta::STRUCT3+0xe0,self.stamp.get());
         pointer(bytes,ta::STRUCT3+0xe8,self.fw_stamp.get());
         word(bytes,STRUCT3_STAMP,self.stamp_value);
-        word(bytes,FLUSH_STAMPS,1); // flush completion stamps
+        word(bytes,ta::STRUCT3+0xfc,1); // flush completion stamps
         word(bytes,ta::STRUCT3+0x100,ta::UUID);
         for (offset,value) in [(8,self.timestamps[0].get()),(16,self.timestamps[1].get()),
             (0x18,self.user_timestamps[0].get()),(0x20,self.user_timestamps[1].get()),
