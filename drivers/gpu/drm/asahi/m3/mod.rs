@@ -102,3 +102,5 @@ mod m3_tiler_command;
 mod m3_fragment_command;
 
 mod t8122_admission;
+
+mod m3_soc;
