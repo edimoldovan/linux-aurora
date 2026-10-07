@@ -20,6 +20,7 @@ use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::sync::atomic::{
     fence,
+    AtomicBool,
     AtomicU32,
     AtomicU64,
     AtomicU8,
@@ -524,28 +525,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         op: OpUnmap<'op, Self>,
         _ctx: &mut Self::SmContext<'ctx>,
     ) -> Result<OpUnmapped<'op, Self>, Error> {
-        let iova = op.va().addr();
-        let length = op.va().length();
-
-        mod_dev_dbg!(self.dev, "MMU: unmap: {:#x}:{:#x}\n", iova, length);
-
-        let _mutation = self.mapping_mutation();
-        self.page_table.unmap_pages(iova..(iova + length))?;
-
-        if let Some(asid) = self.slot() {
-            fence(Ordering::SeqCst);
-            self.tlbi_range(asid as u8, iova, length as usize);
-            mod_dev_dbg!(
-                self.dev,
-                "MMU: flush range: asid={:#x} start={:#x} len={:#x}\n",
-                asid,
-                iova,
-                length,
-            );
-            mem::sync();
-        }
-
-        self.tlbi_contexts_naming_root(iova, length as usize);
+        self.unmap_gpuva(op.va())?;
 
         let (op_unmapped, _va_removed) = op.remove();
 
@@ -618,15 +598,45 @@ impl gpuvm::DriverGpuVm for VmInner {
 }
 
 impl VmInner {
+    /// Remove hardware leaves for one complete user GPUVA without allocating.
+    fn unmap_gpuva(&mut self, va: &gpuvm::GpuVa<Self>) -> Result {
+        mod_dev_dbg!(self.dev, "MMU: unmap: {:#x}:{:#x}\n", va.addr(), va.length());
+
+        let _mutation = self.mapping_mutation();
+        self.page_table
+            .unmap_pages(va.addr()..(va.addr() + va.length()))?;
+
+        if let Some(asid) = self.slot() {
+            fence(Ordering::SeqCst);
+            self.tlbi_range(asid as u8, va.addr(), va.length() as usize);
+            mod_dev_dbg!(
+                self.dev,
+                "MMU: flush range: asid={:#x} start={:#x} len={:#x}\n",
+                asid,
+                va.addr(),
+                va.length(),
+            );
+            mem::sync();
+        }
+
+        self.tlbi_contexts_naming_root(va.addr(), va.length() as usize);
+
+        Ok(())
+    }
+
     /// A failed map has no GPUVA owner to retain its backing or remove its leaves.
     /// GPUVM has already split or removed overlaps throughout this operation's range.
     fn rollback_failed_map(&mut self, addr: u64, size: u64) {
-        if self.uat_inner.firmware == UatFirmware::Handoff {
-            return;
-        }
         // Include the current segment: map_pages can fail after writing some of its leaves.
         // The checked GPUVM operation supplies an aligned range without overflow.
         let result = self.page_table.discard_partial_map(addr..addr + size);
+        if self.uat_inner.firmware == UatFirmware::Handoff {
+            if let Some(asid) = self.slot() {
+                fence(Ordering::SeqCst);
+                self.tlbi_range(asid as u8, addr, size as usize);
+                mem::sync();
+            }
+        }
         self.tlbi_contexts_naming_root(addr, size as usize);
         if let Err(error) = result {
             dev_err!(
@@ -714,9 +724,23 @@ impl VmInner {
 
     /// Map an `mm::Node` representing an mapping in VA space.
     fn map_node(&mut self, node: &mm::Node<(), KernelMappingInner>, prot: Prot) -> Result {
+        let end = node
+            .start()
+            .checked_add(node.mapped_size as u64)
+            .ok_or(EOVERFLOW)?;
+        let _mutation = self.mapping_mutation();
+        self.page_table.prepare_map(node.start()..end)?;
+        let result = self.map_node_prepared(node, prot);
+        if result.is_err() {
+            self.rollback_failed_map(node.start(), node.mapped_size as u64);
+        }
+        result
+    }
+
+    /// Install only into the empty range reserved by `map_node`.
+    fn map_node_prepared(&mut self, node: &mm::Node<(), KernelMappingInner>, prot: Prot) -> Result {
         let mut iova = node.start();
         let segments = node.bo.as_ref().ok_or(EINVAL)?.get()?.data().segments.lock();
-        let _mutation = self.mapping_mutation();
         let mut offset = node.offset;
         let mut left = node.mapped_size;
 
@@ -798,14 +822,16 @@ no_debug!(Vm);
 
 /// An application TTBAT identity retained by a logical queue and its jobs.
 /// The root lease is dropped before the VM, so no page table can be freed
-/// while a context still names it. Installed firmware queues must retain this
-/// object through replacement retirement or processor stop.
+/// while an active context still names it. Installed firmware queues retain
+/// this object through replacement retirement or processor stop; a consumed
+/// closed-scheduler release may return its root identity while keeping storage.
 pub(crate) struct ExecutionContext {
     root: ExecutionRoot,
     vm: Vm,
 }
 
 struct ExecutionRoot {
+    released: AtomicBool,
     inner: Arc<UatInner>,
     id: u8,
     generation: u8,
@@ -824,16 +850,28 @@ impl ExecutionContext {
         &self.vm
     }
 
+    /// Called only after the closed scheduler's release was consumed and all
+    /// its commands retired. Installed storage may outlive this root lease.
+    pub(crate) fn release(&self) {
+        self.root.release();
+    }
+
     pub(crate) fn is_current(&self) -> bool {
         let inner = self.root.inner.lock();
+        if self.root.released.load(Ordering::Acquire) {
+            return false;
+        }
         let roots = &inner.ttbs()[usize::from(self.root.id)];
         roots.ttb0.load(Ordering::Acquire) == self.root.low
             && roots.ttb1.load(Ordering::Acquire) == self.root.high
     }
 }
 
-impl Drop for ExecutionRoot {
-    fn drop(&mut self) {
+impl ExecutionRoot {
+    fn release(&self) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let id = usize::from(self.id);
         let release = {
             let inner = self.inner.lock();
@@ -860,6 +898,12 @@ impl Drop for ExecutionRoot {
                 id
             );
         }
+    }
+}
+
+impl Drop for ExecutionRoot {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -914,10 +958,9 @@ impl Clone for VmBind {
     }
 }
 
-/// A mapping BO reference selecting the teardown protocol of its firmware.
+/// A mapping BO reference released under the immediate-mode GPUVA lock.
 /// Retain the owner until deferred cleanup completes, including its final BO.
 struct MappingBo {
-    deferred: bool,
     bo: Option<ARef<gpuvm::GpuVmBo<VmInner>>>,
     owner: ARef<gpuvm::GpuVm<VmInner>>,
 }
@@ -925,10 +968,8 @@ impl MappingBo {
     fn new(
         bo: ARef<gpuvm::GpuVmBo<VmInner>>,
         owner: ARef<gpuvm::GpuVm<VmInner>>,
-        deferred: bool,
     ) -> Self {
         Self {
-            deferred,
             bo: Some(bo),
             owner,
         }
@@ -942,12 +983,6 @@ impl Drop for MappingBo {
         let Some(bo) = self.bo.take() else {
             return;
         };
-        if !self.deferred {
-            // Handoff VMs retain the legacy ARef decrement and reservation
-            // locking behavior. Only published-root VMs use deferred cleanup.
-            drop(bo);
-            return;
-        }
         let raw = ARef::into_raw(bo);
         // SAFETY: GpuVmBo is repr(C) with drm_gpuvm_bo first. into_raw
         // transfers one live reference. Every Vm here uses IMMEDIATE_MODE;
@@ -974,6 +1009,27 @@ pub(crate) struct KernelMappingInner {
     prot: Prot,
     offset: usize,
     mapped_size: usize,
+}
+
+/// Prepared CPU timestamp access; destruction happens after completion signalling.
+pub(crate) struct TimestampMapping {
+    mapping: kernel::drm::gem::shmem::VMapOwned<gem::AsahiObject>,
+    offset: usize,
+}
+
+impl TimestampMapping {
+    pub(crate) fn write(&self, value: u64) {
+        let base = self.mapping.addr.cast::<u8>();
+        for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
+            // SAFETY: timestamp_mapping checked the complete eight-byte extent.
+            // The owned vmap pins its backing; byte atomics permit unaligned and
+            // overlapping timestamp destinations without mutable slice aliases.
+            let destination = unsafe {
+                &*base.add(self.offset + index).cast::<AtomicU8>()
+            };
+            destination.store(byte, Ordering::Relaxed);
+        }
+    }
 }
 
 /// An object mapping into a [`Vm`], which reserves the address range from use by other mappings.
@@ -1007,8 +1063,8 @@ impl KernelMapping {
     /// Writes a userspace timestamp through the retained GEM mapping. Byte
     /// stores support unaligned destinations and concurrent completion writes
     /// without creating mutable aliases. The complete timestamp is not atomic.
-    pub(crate) fn write_timestamp(&self, offset: usize, value: u64) -> Result {
-        use core::sync::atomic::AtomicU8;
+    /// Retain CPU access before this destination's completion fence is published.
+    pub(crate) fn timestamp_mapping(&self, offset: usize) -> Result<TimestampMapping> {
         use kernel::drm::gem::BaseObject;
         let gem = self.0._gem.as_ref().ok_or(EINVAL)?;
         if offset.checked_add(size_of::<u64>()).ok_or(EOVERFLOW)? > self.size() {
@@ -1019,15 +1075,10 @@ impl KernelMapping {
         if end > gem.size() {
             return Err(ERANGE);
         }
-        let vmap = gem.vmap::<0>()?;
-        for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
-            // SAFETY: The retained GEM/vmap covers each checked byte. AtomicU8
-            // has byte alignment and all concurrent completion writers use
-            // the same access width, without borrowing a mutable byte slice.
-            let destination = unsafe { &*vmap.addr.cast::<u8>().add(start + index).cast::<AtomicU8>() };
-            destination.store(byte, Ordering::Relaxed);
-        }
-        Ok(())
+        Ok(TimestampMapping {
+            mapping: gem.owned_vmap::<0>()?,
+            offset: start,
+        })
     }
 
     /// Gives a fresh kernel mapping a firmware-cached prefix, preserving its tail.
@@ -1100,13 +1151,7 @@ impl KernelMapping {
     /// Remap a cached mapping as uncached, then synchronously flush that range of VAs from the
     /// coprocessor cache. This is required to safely unmap cached/private mappings.
     fn remap_uncached_and_flush(&mut self) {
-        let mut vm_exec = unsafe {
-            self.0
-                .owner
-                .exec_lock(None, false)
-                .expect("Failed to exec_lock in remap_uncached_and_flush")
-        };
-        let owner = vm_exec.unique_gpuvm.data();
+        let mut owner = self.0.owner.lock_inner();
 
         mod_dev_dbg!(
             owner.dev,
@@ -1273,14 +1318,9 @@ impl Drop for KernelMapping {
             self.remap_uncached_and_flush();
         }
 
-        let mut vm_exec = unsafe {
-            self.0
-                .owner
-                .exec_lock(None, false)
-                .expect("exec_lock failed in KernelMapping::drop")
-        };
-
-        let owner = vm_exec.unique_gpuvm.data();
+        // Only VM page tables/binding state are touched here. The shared
+        // reservation is sufficient and avoids fallible exec allocation in Drop.
+        let mut owner = self.0.owner.lock_inner();
         mod_dev_dbg!(
             owner.dev,
             "MMU: unmap {:#x}:{:#x}\n",
@@ -1783,19 +1823,18 @@ impl Vm {
         }
         core::mem::drop(vm_bo_guard);
 
-        let deferred = inner.uat_inner.firmware != UatFirmware::Handoff;
-        let mut vm_bo = Some(MappingBo::new(vm_bo, self.gpuvm.clone(), deferred));
+        let mut vm_bo = Some(MappingBo::new(vm_bo, self.gpuvm.clone()));
         let uat_inner = inner.uat_inner.clone();
         // A failed reservation drops its payload while exec still owns GEM
-        // reservations. Published-root VMs attach BO/GEM only after success;
-        // handoff VMs retain their existing payload and decrement behavior.
+        // reservations. Attach BO/GEM references only after success, since
+        // their destructors may acquire the same reservation locks.
         let result = inner.mm.insert_node_in_range(
             KernelMappingInner {
                 owner: self.gpuvm.clone(),
                 uat_inner,
                 prot,
-                bo: if deferred { None } else { vm_bo.take() },
-                _gem: if deferred { None } else { Some(gem.into()) },
+                bo: None,
+                _gem: None,
                 offset: object_range.start,
                 mapped_size: size,
             },
@@ -1813,7 +1852,7 @@ impl Vm {
                 return Err(error);
             }
         };
-        if deferred {
+        {
             let payload = node.as_mut().inner_mut();
             payload.bo = vm_bo.take();
             payload._gem = Some(gem.into());
@@ -1868,17 +1907,17 @@ impl Vm {
         }
         core::mem::drop(vm_bo_guard);
 
-        let deferred = inner.uat_inner.firmware != UatFirmware::Handoff;
-        let mut vm_bo = Some(MappingBo::new(vm_bo, self.gpuvm.clone(), deferred));
+        let mut vm_bo = Some(MappingBo::new(vm_bo, self.gpuvm.clone()));
         let uat_inner = inner.uat_inner.clone();
-        // Published-root VMs defer BO/GEM attachment until reservation succeeds.
+        // Keep reservation-locking destructors out of the allocator payload
+        // until reservation succeeds.
         let result = inner.mm.reserve_node(
             KernelMappingInner {
                 owner: self.gpuvm.clone(),
                 uat_inner,
                 prot,
-                bo: if deferred { None } else { vm_bo.take() },
-                _gem: if deferred { None } else { Some(gem.into()) },
+                bo: None,
+                _gem: None,
                 offset: 0,
                 mapped_size: size,
             },
@@ -1893,7 +1932,7 @@ impl Vm {
                 return Err(error);
             }
         };
-        if deferred {
+        {
             let payload = node.as_mut().inner_mut();
             payload.bo = vm_bo.take();
             payload._gem = Some(gem.into());
@@ -1919,6 +1958,7 @@ impl Vm {
         prot: Prot,
         single_page: bool,
     ) -> Result {
+        gem::validate_vm_binding(gem, self)?;
         self.wait_for_user_map_admission()?;
         // TODO: hack, populate the GEM object sg table first
         {
@@ -2036,13 +2076,18 @@ impl Vm {
             0,
         )?;
 
+        let end = iova.checked_add(size as u64).ok_or(EOVERFLOW)?;
+        inner.page_table.prepare_map(iova..end)?;
         let mutation = inner.mapping_mutation();
         let ret = inner.page_table.map_pages(
-            iova..(iova + size as u64),
+            iova..end,
             phys as PhysicalAddr,
             prot,
             false,
         );
+        if ret.is_err() {
+            inner.rollback_failed_map(iova, size as u64);
+        }
         // Drop the exec_lock first, so that if map_node failed the
         // KernelMappingInner destructur does not deadlock.
         drop(mutation);
@@ -2118,15 +2163,19 @@ impl Vm {
 
         if let Some(bo) = vm_exec.unique_gpuvm.find_bo(gem) {
             mod_dev_dbg!(self.dev, "MMU: bo_unmap\n");
-            vm_exec.unique_gpuvm.bo_unmap(&mut ctx, &bo)?;
-            // The close callback or deferred object list retains this GEM, so
-            // clearing its candidate cannot release the final reference here.
-            self.untrack_context_object(gem);
-            self.untrack_shared_object(gem);
+            let result = vm_exec.unique_gpuvm.bo_unmap(&mut ctx, &bo);
+            if result.is_ok() {
+                // The close callback or deferred object list retains this GEM,
+                // so clearing its candidate cannot release its final reference.
+                self.untrack_context_object(gem);
+                self.untrack_shared_object(gem);
+            }
             mod_dev_dbg!(self.dev, "MMU: bo_unmap done\n");
-            // We need to drop the exec_lock first, then the GpuVmBo since that will take the lock itself.
+            // BO release can drain unrelated deferred GEMs, including on an
+            // unmap error. Always release reservations before dropping it.
             core::mem::drop(vm_exec);
             core::mem::drop(bo);
+            result?;
         }
         Ok(())
     }
@@ -2377,6 +2426,7 @@ impl Uat {
         let context = Arc::new(
             ExecutionContext {
                 root: ExecutionRoot {
+                    released: AtomicBool::new(false),
                     inner: self.inner.clone(),
                     id: id as u8,
                     generation,

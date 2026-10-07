@@ -61,6 +61,7 @@ impl Vm {
         prot: Prot,
         single_page: bool,
     ) -> Result<PreparedUserMap> {
+        gem::validate_vm_binding(gem, self)?;
         let context = self.prepare_context_binding(addr, size, offset)?;
         let resources = VmOpResources {
             preallocated_gpuvas: [

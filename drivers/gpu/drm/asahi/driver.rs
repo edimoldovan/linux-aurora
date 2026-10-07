@@ -83,6 +83,7 @@ impl drm::driver::Driver for AsahiDrmDriver {
     type ParentDevice<Ctx: DeviceContext> = platform::Device<Ctx>;
 
     const INFO: drm::driver::DriverInfo = INFO;
+    const MODULE: Option<&'static kernel::ThisModule> = Some(&crate::THIS_MODULE);
     const FEAT_RENDER: bool = true;
     const FEAT_SYNCOBJ: bool = true;
     const FEAT_SYNCOBJ_TIMELINE: bool = true;

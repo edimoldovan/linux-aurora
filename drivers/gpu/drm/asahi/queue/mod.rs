@@ -246,6 +246,8 @@ impl QueueJob::ver {
 
 #[versions(AGX)]
 impl sched::JobImpl for QueueJob::ver {
+    const MODULE: Option<&'static kernel::ThisModule> = Some(&crate::THIS_MODULE);
+
     fn prepare(job: &mut sched::Job<Self>) -> Option<Fence> {
         mod_dev_dbg!(job.dev, "QueueJob {}: Checking runnability\n", job.id);
 
@@ -330,10 +332,6 @@ impl sched::JobImpl for QueueJob::ver {
         // are "invisible" to the firmware. Incrementing the notifier threshold
         // earlier than this violates that which leads to circles like the
         // above. Deferring the increment to submit solves the race.
-        job.notifier.threshold.with(|raw, _inner| {
-            raw.increase(job.notification_count);
-        });
-
         let dev = job.dev.clone();
         let Some(guard) = dev.registration_guard() else {
             return Err(ENODEV);
@@ -388,6 +386,13 @@ impl sched::JobImpl for QueueJob::ver {
                     comp_sub = Some(wqjob.submit()?);
                 }
             }
+
+            // Prepared submissions still hold their workqueue locks and have not
+            // published cpu_wptr. Only count them after every fallible submit()
+            // succeeded, before the first run_job exposes commands to firmware.
+            job.notifier.threshold.with(|raw, _inner| {
+                raw.increase(job.notification_count);
+            });
 
             // Now we fully commit to running the job
             mod_dev_dbg!(job.dev, "QueueJob {}: Run fragment\n", job.id);
@@ -721,11 +726,11 @@ impl Queue for Queue::ver {
 
             match header.cmd_type as u32 {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
-                    last_compute = nr_commands;
+                    last_render = nr_commands;
                     nr_render += 1;
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => {
-                    last_render = nr_commands;
+                    last_compute = nr_commands;
                     nr_compute += 1;
                 }
                 _ => {}
