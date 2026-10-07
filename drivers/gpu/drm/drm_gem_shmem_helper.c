@@ -1001,6 +1001,11 @@ int drm_gem_shmem_mmap(struct drm_gem_shmem_object *shmem, struct vm_area_struct
 	    (!vma->vm_file || vma->vm_file->f_mapping != obj->dev->anon_inode->i_mapping))
 		return -EINVAL;
 
+	/* Revocation zaps the device anon mapping only. */
+	if (shmem->reclaimable_cpu_mappings &&
+	    (!vma->vm_file || vma->vm_file->f_mapping != obj->dev->anon_inode->i_mapping))
+		return -EINVAL;
+
 	dma_resv_lock(shmem->base.resv, NULL);
 	if (shmem->reclaimable_cpu_mappings) {
 		if (!refcount_inc_not_zero(&shmem->cpu_vma_count))

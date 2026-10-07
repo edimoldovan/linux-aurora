@@ -189,6 +189,7 @@ fn new_kernel_object_mapped(dev: &AsahiDrmDevice, size: usize, map_wc: bool) -> 
         align(size, mmu::UAT_PGSZ),
         shmem::ObjectConfig::<AsahiObject> {
             map_wc,
+            reclaimable_cpu_mappings: false,
             parent_resv_obj: None,
         },
         AsahiObjConfig {
@@ -219,6 +220,7 @@ pub(crate) fn new_object(
         align(size, mmu::UAT_PGSZ),
         shmem::ObjectConfig::<AsahiObject> {
             map_wc: flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_WRITEBACK == 0,
+            reclaimable_cpu_mappings: false,
             parent_resv_obj: parent_object,
         },
         AsahiObjConfig {
