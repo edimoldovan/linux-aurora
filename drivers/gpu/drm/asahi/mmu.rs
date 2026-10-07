@@ -117,6 +117,8 @@ mod bind;
 mod context;
 mod shared;
 mod lifetime;
+mod residency;
+pub(crate) use residency::VmShrinker;
 pub(crate) use bind::PreparedUserBindBatch;
 pub(crate) use lifetime::VmJobGuard;
 
@@ -335,6 +337,13 @@ impl core::ops::DerefMut for VmExecGuard {
     }
 }
 
+impl VmExecGuard {
+    /// Mark the exact retained logical mapping after page-table restoration.
+    fn set_invalidated(&mut self, addr: u64, range: u64, invalidated: bool) -> Result {
+        self.0.set_invalidated(addr, range, invalidated)
+    }
+}
+
 /// Take the exec lock of a VM's GPUVM.
 fn lock_vm(
     gpuvm: &gpuvm::GpuVm<VmInner>,
@@ -420,10 +429,16 @@ impl<'ctx> StepContext<'ctx> {
     }
 }
 
+/// Per-mapping metadata that survives backing eviction and GPUVA splits.
+#[derive(Default, Clone)]
+struct VmGpuVa {
+    prot: Option<Prot>,
+}
+
 impl gpuvm::DriverGpuVm for VmInner {
     type Driver = AsahiDrmDriver;
     type Object = gem::Object;
-    type VaData = ();
+    type VaData = VmGpuVa;
     type VmBoData = VmBoData;
     type SmContext<'ctx>
         = StepContext<'ctx>
@@ -513,7 +528,12 @@ impl gpuvm::DriverGpuVm for VmInner {
                 return Err(error);
             }
         };
-        let op = op.insert(gpuva, pin_init::init_zeroed());
+        let op = op.insert(
+            gpuva,
+            VmGpuVa {
+                prot: Some(ctx.prot),
+            },
+        );
 
         self.tlbi_contexts_naming_root(map_addr, map_length);
         Ok(op)
@@ -538,6 +558,9 @@ impl gpuvm::DriverGpuVm for VmInner {
         op: OpRemap<'op, Self>,
         ctx: &mut Self::SmContext<'ctx>,
     ) -> Result<OpRemapped<'op, Self>, Error> {
+        let orig_prot = op.va_to_unmap().data().prot.ok_or(EINVAL)?;
+        let orig_invalidated = op.va_to_unmap().flags().contains(GpuVaFlag::INVALIDATED);
+
         // Only unmap the hole between prev/next, if they exist
         let unmap_start = if let Some(op) = op.prev() {
             op.addr() + op.length()
@@ -563,7 +586,11 @@ impl gpuvm::DriverGpuVm for VmInner {
         let unmap_range = unmap_end - unmap_start;
 
         let _mutation = self.mapping_mutation();
-        self.page_table.unmap_pages(unmap_start..unmap_end)?;
+        if orig_invalidated {
+            self.page_table.discard_partial_map(unmap_start..unmap_end)?;
+        } else {
+            self.page_table.unmap_pages(unmap_start..unmap_end)?;
+        }
 
         if let Some(asid) = self.slot() {
             fence(Ordering::SeqCst);
@@ -585,8 +612,12 @@ impl gpuvm::DriverGpuVm for VmInner {
 
         let (op_remapped, remap_ret) = op.remap(
             [prev_gpuva, next_gpuva],
-            pin_init::init_zeroed(),
-            pin_init::init_zeroed(),
+            VmGpuVa {
+                prot: Some(orig_prot),
+            },
+            VmGpuVa {
+                prot: Some(orig_prot),
+            },
         );
 
         if let Some(unused_va) = remap_ret.unused_va {
@@ -603,8 +634,13 @@ impl VmInner {
         mod_dev_dbg!(self.dev, "MMU: unmap: {:#x}:{:#x}\n", va.addr(), va.length());
 
         let _mutation = self.mapping_mutation();
-        self.page_table
-            .unmap_pages(va.addr()..(va.addr() + va.length()))?;
+        if va.flags().contains(GpuVaFlag::INVALIDATED) {
+            self.page_table
+                .discard_partial_map(va.addr()..(va.addr() + va.length()))?;
+        } else {
+            self.page_table
+                .unmap_pages(va.addr()..(va.addr() + va.length()))?;
+        }
 
         if let Some(asid) = self.slot() {
             fence(Ordering::SeqCst);
@@ -709,6 +745,10 @@ impl VmInner {
         }
 
         let contexts = self.uat_inner.lock().contexts_naming_root(self.ttb());
+        self.tlbi_context_mask(iova, size, contexts);
+    }
+
+    fn tlbi_context_mask(&self, iova: u64, size: usize, contexts: u64) {
         if contexts == 0 {
             return;
         }
@@ -811,6 +851,7 @@ pub(crate) struct Vm {
     id: u64,
     mapping_epoch: Option<Arc<MappingEpoch>>,
     lifetime: Option<Arc<lifetime::VmLifetime>>,
+    residency: Option<Arc<residency::Gate>>,
     context_bindings: Option<Arc<context::ContextBindings>>,
     shared_bindings: Option<Arc<shared::SharedBindings>>,
     status: Option<Arc<crate::g17::status::VmStatus>>,
@@ -1003,7 +1044,7 @@ pub(crate) struct KernelMappingInner {
     // - Drop the GEM BO next, since BO free can take the resv lock itself
     // - Drop the owner GpuVm last, since that again can take resv locks when the refcount drops to 0
     bo: Option<MappingBo>,
-    _gem: Option<ARef<gem::Object>>,
+    _gem: Option<gem::KernelMappingPin>,
     owner: ARef<gpuvm::GpuVm<VmInner>>,
     uat_inner: Arc<UatInner>,
     prot: Prot,
@@ -1647,6 +1688,7 @@ impl Vm {
             gpuvm,
             mapping_epoch,
             lifetime: None,
+            residency: None,
             context_bindings: None,
             shared_bindings: None,
             status: None,
@@ -1659,6 +1701,7 @@ impl Vm {
     pub(crate) fn with_status(mut self) -> Result<Self> {
         self.status = Some(Arc::new(crate::g17::status::VmStatus::new(), GFP_KERNEL)?);
         self.lifetime = Some(lifetime::VmLifetime::new()?);
+        self.residency = Some(residency::Gate::new()?);
         self.context_bindings = Some(context::ContextBindings::new()?);
         self.shared_bindings = Some(shared::SharedBindings::new()?);
         Ok(self)
@@ -1800,6 +1843,7 @@ impl Vm {
             return Err(EINVAL);
         }
         let reserved_size = size.checked_add(guard_size).ok_or(EOVERFLOW)?;
+        let _residency = self.enter_residency()?;
         // TODO: hack, populate the GEM object sg table first
         {
             let dev = unsafe { self.dev.as_bound() };
@@ -1855,7 +1899,7 @@ impl Vm {
         {
             let payload = node.as_mut().inner_mut();
             payload.bo = vm_bo.take();
-            payload._gem = Some(gem.into());
+            payload._gem = Some(gem::KernelMappingPin::new(gem));
         }
 
         let ret = inner.map_node(&node, prot);
@@ -1880,6 +1924,7 @@ impl Vm {
         let reserved_size = size
             .checked_add(if guard { UAT_PGSZ } else { 0 })
             .ok_or(EOVERFLOW)?;
+        let _residency = self.enter_residency()?;
         // TODO: hack, populate the GEM object sg table first
         {
             let dev = unsafe { self.dev.as_bound() };
@@ -1935,7 +1980,7 @@ impl Vm {
         {
             let payload = node.as_mut().inner_mut();
             payload.bo = vm_bo.take();
-            payload._gem = Some(gem.into());
+            payload._gem = Some(gem::KernelMappingPin::new(gem));
         }
 
         let ret = inner.map_node(&node, prot);
@@ -1958,6 +2003,7 @@ impl Vm {
         prot: Prot,
         single_page: bool,
     ) -> Result {
+        let _residency = self.enter_residency_metadata()?;
         gem::validate_vm_binding(gem, self)?;
         self.wait_for_user_map_admission()?;
         // TODO: hack, populate the GEM object sg table first
@@ -2131,6 +2177,7 @@ impl Vm {
         size: u64,
         user: bool,
     ) -> Result {
+        let _residency = self.enter_retirement_residency();
         // Unmapping a range can only do a single split, so just preallocate
         // two GPUVAs.
         let mut resources = VmOpResources {
@@ -2165,6 +2212,7 @@ impl Vm {
     }
 
     fn drop_mappings_now(&self, gem: &gem::Object) -> Result {
+        let _residency = self.enter_retirement_residency();
         // Removing whole mappings only does unmaps, so no preallocated VAs
         let mut resources = VmOpResources {
             preallocated_gpuvas: [None, None, None],

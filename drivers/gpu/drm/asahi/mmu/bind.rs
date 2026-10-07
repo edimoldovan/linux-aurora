@@ -16,18 +16,19 @@ pub(crate) struct PreparedUserMap {
     offset: u64,
     single_page: bool,
     context: context::PreparedBinding,
+    _residency: Option<residency::Lease>,
 }
 
 pub(crate) struct PreparedUserUnmap {
+    _residency: Option<residency::Lease>,
     pub(super) iova: u64,
     pub(super) size: u64,
     pub(super) resources: VmOpResources,
 }
 
-// SAFETY: This owns only its numeric range and unused, unlinked split-node
-// allocations. step_remap moves each node out of ctx before linking it into
-// the VM, so a retained ctx never owns a linked GPUVA. The unmap context has
-// no borrowed object/lock state; lifetime.state serializes deferred ownership.
+// SAFETY: This owns a thread-safe residency lease, a numeric range and unused,
+// unlinked split-node allocations; step_remap moves each node out of ctx before
+// linking it, so a retained ctx never owns a linked GPUVA.
 unsafe impl Send for PreparedUserUnmap {}
 
 pub(super) enum PreparedUserBindOp {
@@ -68,6 +69,7 @@ impl Vm {
         single_page: bool,
     ) -> Result<PreparedUserMap> {
         gem::validate_vm_binding(gem, self)?;
+        let residency = self.enter_residency_metadata()?;
         let context = self.prepare_context_binding(addr, size, offset)?;
         let resources = VmOpResources {
             preallocated_gpuvas: [
@@ -93,6 +95,7 @@ impl Vm {
             return Err(EINVAL);
         }
         Ok(PreparedUserMap {
+            _residency: residency,
             gem: gem.into(),
             vm_bo,
             resources,
@@ -109,7 +112,9 @@ impl Vm {
         if (iova | size) & UAT_PGMSK as u64 != 0 || !self.gpuvm.range_valid(iova, size) {
             return Err(EINVAL);
         }
+        let residency = self.enter_residency_metadata()?;
         Ok(PreparedUserUnmap {
+            _residency: residency,
             iova,
             size,
             resources: VmOpResources {
