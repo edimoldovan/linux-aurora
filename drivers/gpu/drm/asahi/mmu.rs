@@ -2109,8 +2109,19 @@ impl Vm {
         self.unmap_range_commit(dev, iova, size, true)
     }
 
-    fn unmap_range_now(&self, iova: u64, size: u64) -> Result {
-        self.unmap_range_commit(None, iova, size, false)
+    fn unmap_prepared_cleanup(&self, unmap: &mut bind::PreparedUserUnmap) -> Result {
+        let mut inner = self.gpuvm.lock_inner();
+        let mut ctx = StepContext::new(None, Prot::default(), &mut unmap.resources)?;
+        // SAFETY: step_unmap/step_remap modify this VM's translations and
+        // immediate GPUVA metadata only, using the retained split nodes. They
+        // do not access external BO backing and defer all BO reference puts.
+        let result = unsafe { inner.sm_unmap_inner(unmap.iova, unmap.size, &mut ctx) };
+        if result.is_ok() {
+            self.untrack_shared_range(unmap.iova, unmap.size);
+        }
+        drop(inner);
+        self.bo_deferred_cleanup();
+        result
     }
 
     fn unmap_range_commit<'drm>(
@@ -2138,6 +2149,7 @@ impl Vm {
             match self.mapping_commit() {
                 Ok(guard) => guard,
                 Err(error) => {
+                    drop(vm_exec);
                     if self.defer_unmap(iova, size)? {
                         return Ok(());
                     }
@@ -2159,7 +2171,11 @@ impl Vm {
         };
         let mut ctx = StepContext::new(None, Prot::default(), &mut resources)?;
 
-        let mut vm_exec = unsafe { self.gpuvm.exec_lock(None, false)? };
+        // SAFETY: See `lock_vm()`.
+        let mut vm_exec = match unsafe { self.gpuvm.exec_lock(None, false) } {
+            Err(error) if error == ENOMEM => return self.drop_mappings_low_memory(gem),
+            result => result?,
+        };
 
         if let Some(bo) = vm_exec.unique_gpuvm.find_bo(gem) {
             mod_dev_dbg!(self.dev, "MMU: bo_unmap\n");
@@ -2175,9 +2191,26 @@ impl Vm {
             // unmap error. Always release reservations before dropping it.
             core::mem::drop(vm_exec);
             core::mem::drop(bo);
+            if result == Err(ENOMEM) {
+                return self.drop_mappings_low_memory(gem);
+            }
             result?;
         }
         Ok(())
+    }
+
+    /// Preserve the indexed fast path normally; memory pressure must not lose
+    /// accepted object cleanup just because an exec or operation list failed.
+    fn drop_mappings_low_memory(&self, gem: &gem::Object) -> Result {
+        let mut inner = self.gpuvm.lock_inner();
+        let result = inner.unmap_object(gem, VmInner::unmap_gpuva);
+        if result.is_ok() {
+            self.untrack_context_object(gem);
+            self.untrack_shared_object(gem);
+        }
+        drop(inner);
+        self.bo_deferred_cleanup();
+        result
     }
 
     /// Returns the dummy GEM object used to hold the shared DMA reservation locks

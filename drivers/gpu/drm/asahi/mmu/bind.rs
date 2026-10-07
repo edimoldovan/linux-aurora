@@ -21,8 +21,14 @@ pub(crate) struct PreparedUserMap {
 pub(crate) struct PreparedUserUnmap {
     pub(super) iova: u64,
     pub(super) size: u64,
-    resources: VmOpResources,
+    pub(super) resources: VmOpResources,
 }
+
+// SAFETY: This owns only its numeric range and unused, unlinked split-node
+// allocations. step_remap moves each node out of ctx before linking it into
+// the VM, so a retained ctx never owns a linked GPUVA. The unmap context has
+// no borrowed object/lock state; lifetime.state serializes deferred ownership.
+unsafe impl Send for PreparedUserUnmap {}
 
 pub(super) enum PreparedUserBindOp {
     Map(PreparedUserMap),
@@ -100,6 +106,9 @@ impl Vm {
     }
 
     pub(crate) fn prepare_user_unmap(&self, iova: u64, size: u64) -> Result<PreparedUserUnmap> {
+        if (iova | size) & UAT_PGMSK as u64 != 0 || !self.gpuvm.range_valid(iova, size) {
+            return Err(EINVAL);
+        }
         Ok(PreparedUserUnmap {
             iova,
             size,
@@ -119,7 +128,7 @@ impl Vm {
         &self,
         batch: &mut PreparedUserBindBatch,
     ) -> Result {
-        if self.defer_bind_batch(batch)? {
+        if self.defer_bind_batch(batch, 0)? {
             return Ok(());
         }
         let mut index = 0;
@@ -205,7 +214,7 @@ impl Vm {
             if let Some(result) = result {
                 result?;
                 index += 1;
-            } else if self.defer_bind_batch(batch)? {
+            } else if self.defer_bind_batch(batch, index)? {
                 return Ok(());
             }
         }
