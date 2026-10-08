@@ -1054,6 +1054,10 @@ impl gpu::Gpu for Gpu {
         self as Arc<dyn Any + Sync + Send>
     }
 
+    fn stats_snapshot(&self) -> Option<Arc<crate::stats::StatsSnapshot>> {
+        None
+    }
+
     fn manager(&self) -> Option<&dyn gpu::GpuManager> {
         None
     }

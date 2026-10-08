@@ -52,6 +52,9 @@ pub(crate) struct AsahiPlatformDriverData<'bound> {
     /// Raw `struct device *` of the platform device. Stored once at probe
     /// time so the `Drop` impl can find the sysfs file on unregister.
     raw_dev: *mut bindings::device,
+    raw_stats: *mut core::ffi::c_void,
+    // Own the allocation until unregister has drained all sysfs readers.
+    stats: Option<Arc<crate::stats::StatsSnapshot>>,
 }
 
 // SAFETY: `raw_dev` is only passed back to the sysfs shim, which serializes its own state.
@@ -252,6 +255,7 @@ impl platform::Driver for AsahiPlatformDriver {
         };
         gpu.init()?;
 
+        let stats = gpu.stats_snapshot();
         let data = try_pin_init!(AsahiDrmRegistrationData { gpu, resources });
 
         // SAFETY: `reg` is stored in `AsahiPlatformDriverData` and dropped when the driver is
@@ -261,13 +265,20 @@ impl platform::Driver for AsahiPlatformDriver {
         // Register the sysfs file on the platform device. Must happen after
         // the DRM device is registered so the device is fully bound.
         let raw_dev = pdev.as_ref().as_raw();
-        crate::sysfs_exports::register(raw_dev, *module_parameters::stats_export.value() != 0)?;
+        let snapshot = stats.as_ref().map_or(core::ptr::null(), Arc::as_ptr);
+        let raw_stats = crate::sysfs_exports::register(
+            raw_dev,
+            snapshot,
+            stats.is_some() && *module_parameters::stats_export.value() != 0,
+        )?;
 
         let driver = AsahiPlatformDriverData {
             _device: reg.device().into(),
             _reg: reg,
             g17: None,
             raw_dev,
+            raw_stats,
+            stats,
         };
 
         Ok(driver)
@@ -299,11 +310,22 @@ impl AsahiPlatformDriver {
                 return Err(error);
             }
         };
+        // G17's firmware channel format has no supported stats decoder yet.
+        let raw_dev = pdev.as_ref().as_raw();
+        let raw_stats = match crate::sysfs_exports::register(raw_dev, core::ptr::null(), false) {
+            Ok(handle) => handle,
+            Err(error) => {
+                gpu.shutdown();
+                return Err(error);
+            }
+        };
         Ok(AsahiPlatformDriverData {
             _device: reg.device().into(),
             _reg: reg,
             g17: Some(gpu),
-            raw_dev: core::ptr::null_mut(),
+            raw_dev,
+            raw_stats,
+            stats: None,
         })
     }
 }
@@ -313,8 +335,9 @@ impl Drop for AsahiPlatformDriverData<'_> {
         // SAFETY: `self.raw_dev` was set in `probe` from the platform
         // device's `as_raw()`, valid for the lifetime of the bound driver.
         if !self.raw_dev.is_null() {
-            crate::sysfs_exports::unregister(self.raw_dev);
+            crate::sysfs_exports::unregister(self.raw_dev, self.raw_stats);
         }
+        drop(self.stats.take());
         if let Some(gpu) = self.g17.as_ref() {
             // Also covers failure to allocate platform driver data after the probe body returned.
             gpu.shutdown();

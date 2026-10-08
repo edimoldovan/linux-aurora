@@ -84,7 +84,6 @@ use crate::{
     queue,
     regs,
     stats,
-    sysfs_exports,
     workqueue, //
 };
 
@@ -268,6 +267,9 @@ pub(crate) struct GpuManager {
 
 /// Operations the DRM driver performs on a GPU, independent of its firmware interface.
 pub(crate) trait Gpu: Send + Sync {
+    /// The firmware statistics snapshot of this GPU, if its firmware reports any.
+    fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>>;
+
     /// Cast as an Any type.
     fn as_any(&self) -> &dyn Any;
     /// Cast Arc<Self> as an Any type.
@@ -765,10 +767,6 @@ impl GpuManager::ver {
         let event_manager_clone = event_manager.clone();
         let buffer_mgr_clone = buffer_mgr.clone();
         let stats_snap = Arc::new(stats::StatsSnapshot::default(), GFP_KERNEL)?;
-        // Publish the snapshot pointer to the C sysfs shim. It is cleared
-        // (by the same shim) on registration removal; until then readers see
-        // a stable pointer and AtomicU* races that govern.
-        sysfs_exports::set_snapshot_ptr(Arc::as_ptr(&stats_snap));
         let stats_snap_clone = stats_snap.clone();
         let alloc_ref = &mut alloc;
         let rx_channels = KBox::init(
@@ -1269,6 +1267,10 @@ impl GpuManager::ver {
 
 #[versions(AGX)]
 impl Gpu for GpuManager::ver {
+    fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>> {
+        Some(self.stats.clone())
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
