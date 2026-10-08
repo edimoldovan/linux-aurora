@@ -72,3 +72,5 @@ mod agx_memory_stats;
 mod agx_timing_stats;
 
 mod m3_timeline;
+
+mod m3_batch_policy;
