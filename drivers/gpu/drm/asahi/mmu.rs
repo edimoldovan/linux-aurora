@@ -1595,7 +1595,7 @@ fn prefetch_sgt_segments(
     dev: &device::Device<Bound>,
     gem: &gem::Object,
 ) -> Result<KVVec<(DmaAddr, ResourceSize)>> {
-    let sgt = gem.sg_table(dev)?;
+    let sgt = crate::gem::held_sg_table(gem, dev)?;
 
     // self.segments.
     let mut segments = KVVec::with_capacity(sgt.iter().size_hint().0, GFP_KERNEL)?;
@@ -1846,7 +1846,7 @@ impl Vm {
         // TODO: hack, populate the GEM object sg table first
         {
             let dev = unsafe { self.dev.as_bound() };
-            let _sgt = gem.sg_table(dev)?;
+            let _sgt = crate::gem::held_sg_table(gem, dev)?;
         }
         let vm_bo = self
             .gpuvm
@@ -1927,7 +1927,7 @@ impl Vm {
         // TODO: hack, populate the GEM object sg table first
         {
             let dev = unsafe { self.dev.as_bound() };
-            let _sgt = gem.sg_table(dev)?;
+            let _sgt = crate::gem::held_sg_table(gem, dev)?;
         }
         let vm_bo = self
             .gpuvm
@@ -2008,7 +2008,7 @@ impl Vm {
         // TODO: hack, populate the GEM object sg table first
         {
             let dev = unsafe { self.dev.as_bound() };
-            let _sgt = gem.sg_table(dev)?;
+            let _sgt = crate::gem::held_sg_table(gem, dev)?;
         }
         let vm_bo = self
             .gpuvm

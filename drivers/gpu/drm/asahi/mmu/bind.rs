@@ -80,7 +80,7 @@ impl Vm {
         // SAFETY: As in `Vm::bind_object()`, the device is bound while its file can issue binds.
         let dev = unsafe { self.dev.as_bound() };
         // Populate the scatter-gather table before any GPUVM lock is taken.
-        gem.sg_table(dev)?;
+        crate::gem::held_sg_table(gem, dev)?;
         let vm_bo = self
             .gpuvm
             .obtain(gem, pin_init!(VmBoData { segments <- new_mutex!(None) }))?;
