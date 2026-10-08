@@ -232,6 +232,18 @@ enum drm_asahi_gpu_hal_generation {
  * version. Most features don't need to be here.
  */
 enum drm_asahi_feature {
+	/** @DRM_ASAHI_FEATURE_RENDER_TIMESTAMP_COPIES: Firmware runtime capability. */
+	DRM_ASAHI_FEATURE_RENDER_TIMESTAMP_COPIES = (1UL) << 4,
+
+	/** @DRM_ASAHI_FEATURE_COMPUTE_TIMESTAMP_COPIES: Firmware runtime capability. */
+	DRM_ASAHI_FEATURE_COMPUTE_TIMESTAMP_COPIES = (1UL) << 5,
+
+	/** @DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY_COMPUTE: Firmware runtime capability. */
+	DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY_COMPUTE = (1UL) << 7,
+
+	/** @DRM_ASAHI_FEATURE_CACHED_PROGRAM_PROBE: Firmware runtime capability. */
+	DRM_ASAHI_FEATURE_CACHED_PROGRAM_PROBE = (1UL) << 9,
+
 	/**
 	 * @DRM_ASAHI_FEATURE_SOFT_FAULTS: GPU has "soft fault" enabled. Shader
 	 * loads of unmapped memory will return zero. Shader stores to unmapped
@@ -269,6 +281,11 @@ enum drm_asahi_feature {
 	 * alone does not imply the hardware QUEUE_LIMITS query is available.
 	 */
 	DRM_ASAHI_FEATURE_SCHEDULED_QUEUES = (1UL) << 3,
+
+	/*
+	 * Bits 4, 5 and 7 are reported only by the J613 25G83 HAL200 runtime.
+	 * Bit 9 remains a diagnostic and is not advertised.
+	 */
 
 	/** @DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY: Render commands may request
 	 * fragment-only dependencies with DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY.
@@ -460,6 +477,12 @@ struct drm_asahi_get_params {
 	__u64 size;
 };
 
+/** VM creation flags. */
+enum drm_asahi_vm_create_flags {
+	/** @DRM_ASAHI_VM_CREATE_HAL200: Acknowledge the queried HAL200 command ABI. */
+	DRM_ASAHI_VM_CREATE_HAL200 = (1U << 0),
+};
+
 /**
  * struct drm_asahi_vm_create - Arguments passed to DRM_IOCTL_ASAHI_VM_CREATE
  */
@@ -488,8 +511,8 @@ struct drm_asahi_vm_create {
 	/** @vm_id: Returned VM ID */
 	__u32 vm_id;
 
-	/** @pad: MBZ */
-	__u32 pad;
+	/** @flags: HAL200 acknowledgement; zero on legacy devices. */
+	__u32 flags;
 };
 
 /**
@@ -1034,6 +1057,10 @@ struct drm_asahi_attachment {
 };
 
 enum drm_asahi_render_flags {
+	/** @DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY_COMPUTE: Requires the corresponding runtime feature. */
+	DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY_COMPUTE = (1U << 6),
+	/** @DRM_ASAHI_RENDER_CACHED_PROGRAM_PROBE: Bounded immutable firmware program diagnostic. */
+	DRM_ASAHI_RENDER_CACHED_PROGRAM_PROBE = (1U << 7),
 	/**
 	 * @DRM_ASAHI_RENDER_VERTEX_SCRATCH: A vertex stage shader uses scratch
 	 * memory.
@@ -1074,6 +1101,11 @@ enum drm_asahi_render_flags {
 	 * the normal header barriers; this flag changes only their stage scope.
 	 */
 	DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY = (1U << 5),
+
+	/*
+	 * Bits 6 and 7 are supported only by the J613 25G83 HAL200 runtime.
+	 * The legacy and G17P runtimes reject render commands that set them.
+	 */
 
 	/**
 	 * @DRM_ASAHI_RENDER_DBIAS_IS_INT: Use integer depth bias formula.
@@ -1476,6 +1508,9 @@ struct drm_asahi_cmd_render {
 	/** @bg_partial_rsrc_spec_hi: High half of @partial_bg.rsrc_spec */
 	__u32 bg_partial_rsrc_spec_hi;
 
+	/** @ts_frag_end_copies: End timestamp copies, requiring the corresponding feature bit. */
+	struct drm_asahi_timestamp ts_frag_end_copies[8];
+
 	/**
 	 * @prior_vdm: Historical render prefix, or zero for no added dependency.
 	 *
@@ -1536,6 +1571,9 @@ struct drm_asahi_cmd_compute {
 
 	/** @ts: Timestamps for the compute command */
 	struct drm_asahi_timestamps ts;
+
+	/** @ts_end_copies: End timestamp copies, requiring the corresponding feature bit. */
+	struct drm_asahi_timestamp ts_end_copies[8];
 
 	/**
 	 * @scs_layout: Packed G17P Gen1 shader-context scratch layout, or zero.
