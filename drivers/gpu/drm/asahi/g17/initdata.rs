@@ -285,11 +285,12 @@ impl InitData {
 
     /// Initialize a fresh physical compute QID's row before exposing its queue. An installed
     /// or rebound queue keeps the row's firmware-owned counters and must never call this again.
-    pub(super) fn initialize_compute_pool(&self, slot: u16, page_list_va: u64) -> Result {
+    /// Called for a fresh row or after its free-list release was consumed.
+    pub(super) fn initialize_compute_pool_blocks(&self, slot: u16, page_list_va: u64, blocks: usize) -> Result {
         if slot == 0 || slot > u16::from(super::fw::kick::QID_MAX) + 1 {
             return Err(EINVAL);
         }
-        let entry = abi::PagePoolDescriptor::compute(page_list_va);
+        let entry = abi::PagePoolDescriptor::compute_blocks(page_list_va, blocks);
         let size = core::mem::size_of::<abi::PagePoolDescriptor>();
         let offset = usize::from(slot) * size;
         let object = self.object(self.page_pool)?;
@@ -299,8 +300,8 @@ impl InitData {
             object.dword(offset + core::mem::offset_of!(abi::PagePoolDescriptor, counters))?;
         let count =
             object.dword(offset + core::mem::offset_of!(abi::PagePoolDescriptor, page_count))?;
-        // SAFETY: the whole fresh row was bounds checked, the QID has never been published,
-        // and the device mutex excludes another host publisher. No other row is touched.
+        // SAFETY: the whole fresh row was bounds checked, this is a fresh QID or its release
+        // was consumed, and the device mutex excludes another host publisher. No other row is touched.
         unsafe {
             pointer.write_bytes(0, size);
         }

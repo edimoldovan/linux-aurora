@@ -607,6 +607,7 @@ struct Shared {
     #[pin]
     drm: Mutex<Option<AsahiDevRef>>,
     clusters: u32,
+    active_cores: u32,
     descriptor_flags: [u32; 2],
     crashed: AtomicBool,
     feed: Arc<feed::Feed>,
@@ -856,11 +857,13 @@ impl Gpu {
         let preparations = preparation::Gate::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new()?;
+        let active_cores = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 drm <- new_mutex!(Some(dev.into()), "g17::Shared::drm"),
                 dev: dev.as_ref().as_ref().into(),
                 clusters: id.num_clusters,
+                active_cores,
                 descriptor_flags: [id.perf_control, id.perf_map[0]],
                 crashed: AtomicBool::new(false),
                 feed,

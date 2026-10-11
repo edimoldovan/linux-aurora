@@ -14,6 +14,7 @@ use kernel::prelude::*;
 pub(crate) mod buffer;
 pub(crate) mod channels;
 pub(crate) mod compute;
+pub(crate) mod compute_pool;
 pub(crate) mod context;
 pub(crate) mod freelist;
 pub(crate) mod initdata;

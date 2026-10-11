@@ -70,8 +70,8 @@ impl job::Backend for Backend {
         Some(self.shared.feed.clone())
     }
 
-    fn ensure_compute(&self) -> Result {
-        Backend::ensure_compute(self)
+    fn ensure_compute(&self, scs_pages: u16) -> Result {
+        Backend::ensure_compute(self, scs_pages)
     }
 
     fn fail_vm(&self, error: Error) {

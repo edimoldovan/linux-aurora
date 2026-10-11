@@ -238,7 +238,7 @@ pub(crate) trait Backend: Send + Sync {
     }
 
     /// Lazily create or rebind this logical queue's physical compute graph.
-    fn ensure_compute(&self) -> Result;
+    fn ensure_compute(&self, scs_pages: u16) -> Result;
     /// Settle outstanding work of a terminal VM before an ioctl error is published.
     fn fail_vm(&self, error: Error);
     /// Called after both scheduler entities have cancelled their queued jobs.

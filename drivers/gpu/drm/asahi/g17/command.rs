@@ -3,7 +3,7 @@
 //! Decode a submission and validate its user resources before publishing any work.
 
 use super::fw::{
-    compute::ScratchRequest,
+    compute::{IntersectionTables, ScratchRequest},
     kick::WriteRange,
     render::{RenderPass, UscProgram, ZlsSurface},
 };
@@ -14,6 +14,7 @@ use kernel::{prelude::*, uapi};
 const MAX_ATTACHMENTS: usize = crate::microseq::MAX_ATTACHMENTS;
 const USC_WINDOW_SIZE: u64 = 1 << 32;
 const MAX_SAMPLERS: u32 = 1024;
+const COMPUTE_BASE_SIZE: usize = core::mem::offset_of!(uapi::drm_asahi_cmd_compute, prior_cdm) + size_of::<u64>();
 const SAMPLER_SIZE: u64 = 8;
 const PAGE_SIZE: u64 = 0x4000;
 const ZLS_METADATA_STRIDE: u64 = 0x80;
@@ -78,7 +79,7 @@ impl Attachments {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Payload {
     Render(uapi::drm_asahi_cmd_render, [Attachments; 2]),
-    Compute(uapi::drm_asahi_cmd_compute, Attachments),
+    Compute(uapi::drm_asahi_cmd_compute, Attachments, IntersectionTables),
 }
 
 pub(crate) struct Command {
@@ -130,7 +131,11 @@ impl<'a> Parser<'a> {
                         Payload::Render(payload(bytes)?, [self.attachments[0], self.attachments[1]])
                     } else {
                         self.counts[1] += 1;
-                        Payload::Compute(payload(bytes)?, self.attachments[2])
+                        Payload::Compute(
+                            payload(&bytes[..bytes.len().min(COMPUTE_BASE_SIZE)])?,
+                            self.attachments[2],
+                            IntersectionTables::parse(bytes.get(COMPUTE_BASE_SIZE..).unwrap_or(&[]))?,
+                        )
                     };
                     return Ok(Some(Command { barriers, payload }));
                 }
@@ -283,6 +288,7 @@ pub(crate) enum Validated {
         timestamps: [uapi::drm_asahi_timestamps; 2],
     },
     Compute {
+        intersection: IntersectionTables,
         scratch: ScratchRequest,
         usc_base: u64,
         cdm_va: u64,
@@ -297,7 +303,7 @@ impl Payload {
     pub(crate) fn prior(&self) -> [u64; 2] {
         match self {
             Self::Render(cmd, _) => [cmd.prior_vdm, cmd.prior_cdm],
-            Self::Compute(cmd, _) => [cmd.prior_vdm, cmd.prior_cdm],
+            Self::Compute(cmd, _, _) => [cmd.prior_vdm, cmd.prior_cdm],
         }
     }
 
@@ -415,7 +421,7 @@ impl Payload {
                     timestamps: [cmd.ts_vtx, cmd.ts_frag],
                 })
             }
-            Self::Compute(cmd, attachments) => {
+            Self::Compute(cmd, attachments, intersection) => {
                 if cmd.flags != 0
                     || cmd.cdm_ctrl_stream_base & 3 != 0
                     || cmd.cdm_ctrl_stream_end & 3 != 0
@@ -432,7 +438,13 @@ impl Payload {
                 )?;
                 sampler(space, cmd.sampler_heap, cmd.sampler_count)?;
                 attachments.validate(space)?;
+                if intersection.enabled() {
+                    require_range(space, intersection.pool, intersection.pool_bytes, Access::Read)?;
+                    let code = intersection.default_program & 0x0000_ffff_ffff_ffff;
+                    if code != 0 { require_range(space, code, 64, Access::Read)?; }
+                }
                 Ok(Validated::Compute {
+                    intersection: *intersection,
                     scratch: ScratchRequest::new(cmd.scs_layout)?,
                     usc_base: window.base,
                     cdm_va: cmd.cdm_ctrl_stream_base,

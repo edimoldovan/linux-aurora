@@ -8,7 +8,7 @@
 //! reference and are released only after the owner's teardown is acknowledged.
 
 use super::fw::freelist::*;
-use super::fw::initdata::{FreeListArgs, FreeListClass, FreeListControl, FREE_LIST_BLOCK_SIZE};
+use super::fw::initdata::{FreeListArgs, FreeListClass, FreeListControl, FREE_LIST_BLOCK_PAGES, FREE_LIST_BLOCK_SIZE};
 use super::object::{Allocator, CpuMap, KernelObject};
 use crate::mmu;
 use core::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
@@ -90,9 +90,15 @@ impl Pages {
             layout,
         })
     }
-    /// Fresh zeroed compute backing, built without the device mutex.
-    pub(crate) fn compute(alloc: &Allocator<'_>) -> Result<Self> {
-        Self::new(alloc, COMPUTE_BLOCKS, RunLayout::Compute)
+    /// Fresh compute backing at the admitted capacity, built off-lock.
+    pub(crate) fn compute_sized(alloc: &Allocator<'_>, blocks: usize) -> Result<Self> {
+        if blocks < COMPUTE_BLOCKS || blocks > PAGE_LIST_SIZE / (FREE_LIST_BLOCK_PAGES as usize * 8) {
+            return Err(EINVAL);
+        }
+        Self::new(alloc, blocks, RunLayout::Compute)
+    }
+    pub(crate) fn map_client(&self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
+        self.backing.map_alias(vm, self.page_list_va(), mmu::PROT_GPU_SHARED_RW)
     }
     fn page_list_va(&self) -> u64 {
         self.backing.gpu_va()
@@ -437,12 +443,16 @@ pub(crate) struct ComputePool {
     id: u16,
 }
 impl ComputePool {
-    pub(crate) fn new(alloc: &Allocator<'_>, qid: u8) -> Result<Self> {
+    pub(crate) fn fits(&self, blocks: usize) -> bool {
+        self.pages.as_ref().is_some_and(|pages| pages.blocks >= blocks)
+    }
+
+    pub(crate) fn new(alloc: &Allocator<'_>, qid: u8, blocks: usize) -> Result<Self> {
         if qid > super::fw::kick::QID_MAX {
             return Err(EINVAL);
         }
         let id = u16::from(qid) + 1;
-        let pages = Pages::new(alloc, COMPUTE_BLOCKS, RunLayout::Compute)?;
+        let pages = Pages::compute_sized(alloc, blocks)?;
         let mut control = alloc.kernel(
             CONTROL_SIZE,
             mmu::UAT_PGSZ as u64,
@@ -462,7 +472,7 @@ impl ComputePool {
                 class: FreeListClass::One,
                 page_list_va: pages.page_list_va(),
                 run_list_va: pages.run_list_va(),
-                blocks: COMPUTE_BLOCKS as u32,
+                blocks: blocks as u32,
                 state_va: state.gpu_va(),
             }),
         )?;
@@ -517,7 +527,7 @@ impl ComputePool {
             class: FreeListClass::One,
             page_list_va: pages.page_list_va(),
             run_list_va: pages.run_list_va(),
-            blocks: COMPUTE_BLOCKS as u32,
+            blocks: pages.blocks as u32,
             state_va: self.state.gpu_va(),
         });
         header.unk_54[..8].copy_from_slice(&bytes);
