@@ -67,6 +67,10 @@ module! {
             // permissions: 0o644,
             description: "Debug flags",
         },
+        compute_preempt: i32 {
+            default: -1,
+            description: "Compute preemption (-1: G14X only; 0: off; nonzero: on)",
+        },
         fault_control: u32 {
             default: 0xb,
             // permissions: 0,
