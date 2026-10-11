@@ -11,6 +11,7 @@ pub(crate) const REGISTER_STRIDE:usize=12;
 pub(crate) const PARAMETERS:usize=0x790;
 pub(crate) const META:usize=0xbac;
 pub(crate) const STAMP_VALUE:usize=META+0x10;
+pub(crate) const FLUSH_STAMPS:usize=META+0x1c;
 fn word(out:&mut[u8],off:usize,value:u32) {out[off..off+4].copy_from_slice(&value.to_le_bytes());}
 fn pointer(out:&mut[u8],off:usize,value:u64) {out[off..off+8].copy_from_slice(&value.to_le_bytes());}
 /// The initial producer had different register/mirror values for tilebuffer
@@ -157,7 +158,7 @@ impl Command {
         word(bytes,0xb98,1); // retained no_clear_pipeline_textures
         pointer(bytes,META,self.stamp.get());pointer(bytes,META+8,self.fw_stamp.get());
         word(bytes,STAMP_VALUE,self.stamp_value);word(bytes,META+0x14,1); // event slot
-        word(bytes,META+0x1c,1); // flush completion stamps
+        word(bytes,FLUSH_STAMPS,1); // flush completion stamps
         word(bytes,META+0x20,fragment::UUID);word(bytes,0xbe8,1); // unk_buf2.unk_10
         for (offset,value) in [(8,self.timestamps[0].get()),(16,self.timestamps[1].get()),
             (0x18,self.user_timestamps[0].get()),(0x20,self.user_timestamps[1].get()),
