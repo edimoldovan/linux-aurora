@@ -23,49 +23,94 @@ pub(crate) const COMPUTE_QOS_CLASS: u8 = 0x08;
 /// Event mask of compute kicks.
 pub(crate) const COMPUTE_KICK_EVENT_MASK: [u64; 4] = [0, 0, 4, 0];
 
-const COMPUTE_REGISTERS: usize = 40;
+const COMPUTE_REGISTERS: usize = 41;
 const COMPUTE_REGISTERS_MAX: usize = COMPUTE_REGISTERS + 1;
 
 /// Validated per-command shader-context scratch request.
+///
+/// The layout word is Apple's packed SCS layout: depth (bits 0:15), levels
+/// (16:23), cliques (24:31), user (32:47) and driver (48:63).  The region the
+/// hardware needs is derived with G17P's Gen1 section model: fixed prefixes
+/// totalling [`Self::FIXED_BYTES`], then per-thread stack, per-thread driver
+/// and per-thread user bytes. Gen1 has no per-clique level payload. The scratch
+/// registers the program writes are the native `generateRegisterList`
+/// formulas use `com.apple.AGXG17P`; the
+/// disabled program keeps the native disabled constants.
 #[derive(Clone, Copy)]
 pub(crate) struct ScratchRequest {
     pages: u16,
+    window: u64,
+    stack: u64,
+    driver: u64,
+    tail: u64,
 }
 
 impl ScratchRequest {
+    /// Native ScsLayoutGen1::getSectionEnd(4).
     const FIXED_BYTES: u64 = 0x58000;
     const THREADS_PER_CLIQUE: u64 = 32;
     const BYTES_PER_STACK_ENTRY: u64 = 8;
     const PAGE_SHIFT: u32 = 12;
     const PAGE_SIZE: u64 = 1 << Self::PAGE_SHIFT;
     const PAGES_PER_MIB: u64 = 1 << (20 - Self::PAGE_SHIFT);
+    /// Window word when enabled: bit 24 plus the clique count at 16:23.
     const WINDOW_ENABLED: u64 = 1 << 24;
+    /// Native disabled window word, [`UNK_10791`].
+    const WINDOW_DISABLED: u64 = UNK_10791;
+    /// Native disabled stack word, [`UNK_1A0E9`].
+    const STACK_DISABLED: u64 = UNK_1A0E9;
+    /// Native tail reservation when enabled.
+    const TAIL_ENABLED: u64 = 8;
 
     /// Payload-free layouts request no scratch even if depth/cliques are set.
-    /// Otherwise round the fixed and per-thread sections and add a guard page.
+    /// Otherwise derive the Gen1 end and round it up with the native two-page
+    /// guard; the per-register words are the native formulas, so they are
+    /// checked here against Apple's own values before they reach hardware.
     pub(crate) fn new(layout: u64) -> Result<Self> {
         let depth = layout & u16::MAX as u64;
         let cliques = (layout >> 24) & u8::MAX as u64;
         let user = (layout >> 32) & u16::MAX as u64;
         let driver = (layout >> 48) & u16::MAX as u64;
         if user == 0 && driver == 0 {
-            return Ok(Self { pages: 0 });
+            return Ok(Self {
+                pages: 0,
+                window: Self::WINDOW_DISABLED,
+                stack: Self::STACK_DISABLED,
+                driver: 0,
+                tail: 0,
+            });
         }
         let threads = cliques.checked_mul(Self::THREADS_PER_CLIQUE).ok_or(EINVAL)?;
-        let per_thread = depth.checked_mul(Self::BYTES_PER_STACK_ENTRY)
-            .and_then(|bytes| bytes.checked_add(user))
-            .and_then(|bytes| bytes.checked_add(driver)).ok_or(EINVAL)?;
-        let bytes = threads.checked_mul(per_thread)
-            .and_then(|bytes| bytes.checked_add(Self::FIXED_BYTES))
+        let stack_bytes = threads
+            .checked_mul(depth.checked_mul(Self::BYTES_PER_STACK_ENTRY).ok_or(EINVAL)?)
+            .ok_or(EINVAL)?;
+        let driver_bytes = threads.checked_mul(driver).ok_or(EINVAL)?;
+        let user_bytes = threads.checked_mul(user).ok_or(EINVAL)?;
+        let end10 = Self::FIXED_BYTES
+            .checked_add(stack_bytes)
+            .and_then(|bytes| bytes.checked_add(driver_bytes))
+            .ok_or(EINVAL)?;
+        let end = end10
+            .checked_add(user_bytes)
             .and_then(|bytes| bytes.checked_add(2 * Self::PAGE_SIZE - 1))
             .ok_or(EINVAL)?;
-        let pages = bytes >> Self::PAGE_SHIFT;
-        Ok(Self { pages: u16::try_from(pages).map_err(|_| EINVAL)? })
+        let pages = end >> Self::PAGE_SHIFT;
+        Ok(Self {
+            pages: u16::try_from(pages).map_err(|_| EINVAL)?,
+            window: Self::WINDOW_ENABLED | (cliques << 16),
+            stack: depth & !7,
+            // G17P's native register list does not publish the Gen2 level
+            // region register. Preserve the historical zero slot.
+            driver: 0,
+            tail: Self::TAIL_ENABLED,
+        })
     }
 
     pub(crate) fn enabled(self) -> bool {
         self.pages != 0
     }
+
+    pub(crate) fn pages(self) -> u16 { self.pages }
 
     fn size_word(self) -> u64 {
         let pages = u64::from(self.pages);
@@ -73,7 +118,19 @@ impl ScratchRequest {
     }
 
     fn window_word(self) -> u64 {
-        if self.enabled() { Self::WINDOW_ENABLED } else { UNK_10791 }
+        self.window
+    }
+
+    fn stack_word(self) -> u64 {
+        self.stack
+    }
+
+    fn driver_word(self) -> u64 {
+        self.driver
+    }
+
+    fn tail_word(self) -> u64 {
+        self.tail
     }
 
     fn checkpoints(self) -> [u16; 4] {
@@ -106,10 +163,94 @@ const OPERAND_STATE_0A5C9: u64 = 0x9000;
 /// Checkpoints into the main register array, as entry counts: after the
 /// first 0x0a5c9 write, after the final 0x1a440 write (twice), and the full
 /// count.
-const CHECKPOINTS: [u16; 4] = [38, 39, 39, COMPUTE_REGISTERS as u16];
+const CHECKPOINTS: [u16; 4] = [39, 40, 40, COMPUTE_REGISTERS as u16];
+
+#[derive(Clone, Copy)]
+pub(crate) struct IntersectionTables {
+    pub(crate) pool: u64,
+    pub(crate) pool_bytes: u64,
+    auxiliary: u32,
+    first: u32,
+    count: u32,
+    pub(crate) default_program: u64,
+    default_control: u64,
+}
+
+impl IntersectionTables {
+    pub(crate) const NONE: Self = Self {
+        pool: 0, pool_bytes: 0, auxiliary: 0, first: 0, count: 0,
+        default_program: 0, default_control: 0,
+    };
+
+    pub(crate) fn new(pool: u64, pool_bytes: u64, first: u32, count: u32,
+                      default_program: u64, default_control: u64) -> Result<Self> {
+        if pool == 0 {
+            if pool_bytes != 0 || first != 0 || count != 0
+                || default_program != 0 || default_control != 0 {
+                return Err(EINVAL);
+            }
+            return Ok(Self::NONE);
+        }
+        // G17P HAL200 Gen1 publishes a byte-sized table length (25 bits),
+        // with a plain aligned address. Unlike G17X HAL300, its address has
+        // no bit 51 and its two pool registers use fixed native values.
+        // Keep the shared UAPI's 128-byte blocks and 16 KiB allocation units.
+        let end = pool.checked_add(pool_bytes).ok_or(EINVAL)?;
+        let blocks_end = u64::from(first) + u64::from(count);
+        let code = default_program & 0x0000_ffff_ffff_ffff;
+        if pool & 0x3fff != 0 || pool_bytes == 0 || pool_bytes & 0x3fff != 0
+            || end > (1u64 << 48) || (pool_bytes >> 14) >= (1u64 << 25)
+            || count == 0 || count >= (1 << 18) || blocks_end * 128 > pool_bytes
+            || code & 63 != 0
+            || default_control & !0x0000_7fff_0000_3fff != 0
+            || (code == 0 && (default_program != 0 || default_control != 0))
+            || (code != 0 && default_control & (1u64 << 40) == 0) {
+            return Err(EINVAL);
+        }
+        Ok(Self { pool, pool_bytes, auxiliary: 0, first, count, default_program, default_control })
+    }
+
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.get(48..).is_some_and(|tail| tail.iter().any(|&b| b != 0)) {
+            return Err(EINVAL);
+        }
+        let mut tail = [0u8; 48];
+        let count = bytes.len().min(tail.len());
+        tail[..count].copy_from_slice(&bytes[..count]);
+        let auxiliary = u32::from_le_bytes(tail[..4].try_into().unwrap());
+        if tail[4..8].iter().any(|&b| b != 0)
+            || (auxiliary != 0 && !(8..=32).contains(&auxiliary)) {
+            return Err(EINVAL);
+        }
+        let mut tables = Self::new(
+            u64::from_le_bytes(tail[8..16].try_into().unwrap()),
+            u64::from_le_bytes(tail[16..24].try_into().unwrap()),
+            u32::from_le_bytes(tail[24..28].try_into().unwrap()),
+            u32::from_le_bytes(tail[28..32].try_into().unwrap()),
+            u64::from_le_bytes(tail[32..40].try_into().unwrap()),
+            u64::from_le_bytes(tail[40..48].try_into().unwrap()),
+        )?;
+        if auxiliary != 0 && !tables.enabled() { return Err(EINVAL); }
+        tables.auxiliary = auxiliary;
+        Ok(tables)
+    }
+
+    pub(crate) fn enabled(self) -> bool { self.pool != 0 }
+
+    pub(crate) fn words(self) -> [u64; 6] {
+        if !self.enabled() { return [0; 6]; }
+        // AGXMetalG17P 26A428 endComputePass, both command encodings;
+        // pinned AGXG17P processComputeSetup copies these six words as-is.
+        [self.pool + u64::from(self.first) * 128,
+         0xc0000000 | (u64::from(self.count) << 7), 0x6f00000000,
+         0x3feff, self.default_program, self.default_control]
+    }
+}
+
 
 /// Inputs of one compute descriptor.
 pub(crate) struct ComputeArgs {
+    pub(crate) intersection: IntersectionTables,
     /// Scratch request validated with the userspace command.
     pub(crate) scratch: ScratchRequest,
     /// Base of the queue's USC window.
@@ -166,6 +307,7 @@ fn compute_registers(args: &ComputeArgs) -> Result<[RegisterWrite; COMPUTE_REGIS
     let operand = args.operand_state_va;
     let key = work_key(args.context_id, args.work_state);
     let ids = OBJECT_IDS.word();
+    let intersection = args.intersection.words();
 
     Ok([
         RegisterWrite::new(0x017d9, 1),
@@ -183,15 +325,20 @@ fn compute_registers(args: &ComputeArgs) -> Result<[RegisterWrite; COMPUTE_REGIS
         RegisterWrite::new(0x1a440, UNK_1A440),
         RegisterWrite::new(0x1a458, UNK_1A458),
         RegisterWrite::new(0x101d9, UNK_101D9),
-        RegisterWrite::new(0x1a089, 0),
-        RegisterWrite::new(0x1a091, 0),
-        RegisterWrite::new(0x1a059, 0),
-        RegisterWrite::new(0x1a061, 0),
-        RegisterWrite::new(0x1a0b9, 0),
-        RegisterWrite::new(0x1a0c1, 0),
+        RegisterWrite::new(0x1a089, intersection[0]),
+        RegisterWrite::new(0x1a091, intersection[1]),
+        RegisterWrite::new(0x1a059, intersection[2]),
+        RegisterWrite::new(0x1a061, intersection[3]),
+        RegisterWrite::new(0x1a0b9, intersection[4]),
+        RegisterWrite::new(0x1a0c1, intersection[5]),
         RegisterWrite::new(0x101d1, args.scratch.size_word()),
-        RegisterWrite::new(0x0d479, 0),
-        RegisterWrite::new(0x1a0e9, UNK_1A0E9),
+        RegisterWrite::new(0x0d479, if args.intersection.auxiliary == 0 {
+            args.scratch.tail_word()
+        } else {
+            u64::from(args.intersection.auxiliary)
+        }),
+        RegisterWrite::new(0x1a0e9, args.scratch.stack_word()),
+        RegisterWrite::new(0x1a141, args.scratch.driver_word()),
         RegisterWrite::new(0x107a1, args.scratch.window_word()),
         RegisterWrite::new(0x0a599, UNK_0A599),
         RegisterWrite::new(0x0d411, UNK_0D411),

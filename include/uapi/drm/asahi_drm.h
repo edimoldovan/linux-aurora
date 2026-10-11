@@ -1453,7 +1453,11 @@ struct drm_asahi_cmd_compute {
 	/** @ts: Timestamps for the compute command */
 	struct drm_asahi_timestamps ts;
 
-	/** @scs_layout: Reserved; must be zero. */
+	/**
+	 * @scs_layout: Packed G17P Gen1 shader-context scratch layout, or zero.
+	 * Bits 0:15 contain stack depth, 16:23 levels, 24:31 cliques,
+	 * 32:47 user bytes and 48:63 driver bytes. Non-G17P paths require zero.
+	 */
 	__u64 scs_layout;
 
 	/**
@@ -1473,6 +1477,23 @@ struct drm_asahi_cmd_compute {
 	 * queue's compute command count and the header's cdm_barrier instead.
 	 */
 	__u64 prior_cdm;
+
+	/** @cdm_auxiliary_allocation: G17P auxiliary allocation, zero or 8..32. */
+	__u32 cdm_auxiliary_allocation;
+	/** @reserved: MBZ. */
+	__u32 reserved;
+	/** @intersection_pool: 16-KiB aligned G17P intersection-table address. */
+	__u64 intersection_pool;
+	/** @intersection_pool_bytes: Mapped pool size in bytes, a multiple of 16 KiB. */
+	__u64 intersection_pool_bytes;
+	/** @intersection_first: First 128-byte entry in @intersection_pool. */
+	__u32 intersection_first;
+	/** @intersection_count: Number of 128-byte entries, less than 2^18. */
+	__u32 intersection_count;
+	/** @intersection_default_program: Encoded default G17P program address. */
+	__u64 intersection_default_program;
+	/** @intersection_default_control: Default G17P program control word. */
+	__u64 intersection_default_control;
 };
 
 /**

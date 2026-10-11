@@ -2239,7 +2239,11 @@ static_assert!(size_of::<PagePoolDescriptor>() == 0x20);
 impl PagePoolDescriptor {
     /// Complete row for a physical compute queue's independent 21-block pool.
     pub(crate) const fn compute(page_list_va: u64) -> Self {
-        let pages = 21 * FREE_LIST_BLOCK_PAGES as u64;
+        Self::compute_blocks(page_list_va, 21)
+    }
+
+    pub(crate) const fn compute_blocks(page_list_va: u64, blocks: usize) -> Self {
+        let pages = blocks as u64 * FREE_LIST_BLOCK_PAGES as u64;
         Self::new(page_list_va, pages << PAGE_POOL_FREE_PAGES_SHIFT, pages)
     }
 

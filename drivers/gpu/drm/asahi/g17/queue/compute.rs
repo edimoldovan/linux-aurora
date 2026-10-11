@@ -416,8 +416,8 @@ pub(crate) struct PoolBacking {
 }
 
 impl PoolBacking {
-    pub(crate) fn new(alloc: &Allocator<'_>, id: kick::Id) -> Result<Self> {
-        let pool = ComputePool::new(alloc, id.qid())?;
+    pub(crate) fn new(alloc: &Allocator<'_>, id: kick::Id, blocks: usize) -> Result<Self> {
+        let pool = ComputePool::new(alloc, id.qid(), blocks)?;
         Ok(Self { pool, id })
     }
 
@@ -459,6 +459,8 @@ pub(crate) struct Queue {
     /// the installed queue record still names them until the next owner binds.
     retained_owner: Option<crate::g17::context::FirmwarePages>,
     pool_phase: PoolPhase,
+    growing: bool,
+    growth_blocks: usize,
     /// A killed queue was recycled: its pool/ring must be vacated and re-armed
     /// fresh before any owner binds it (set by `recycle_killed`, cleared by `rearm`).
     needs_fresh_backing: bool,
@@ -518,6 +520,8 @@ impl Queue {
             owner: Some(owner),
             retained_owner: None,
             pool_phase: PoolPhase::Populated,
+            growing: false,
+            growth_blocks: 0,
             needs_fresh_backing: false,
             released_at: 0,
             free_list_generation: 0,
@@ -1042,6 +1046,7 @@ impl Queue {
         Ok(true)
     }
     pub(crate) fn reusable(&self) -> bool {
+        if self.growing { return false; }
         self.installed
             // A pool release in flight must be witnessed before any successor.
             && !matches!(self.pool_phase, PoolPhase::ReleaseSent(_))
@@ -1238,6 +1243,7 @@ impl Queue {
         consumer: u32,
         producer: u32,
     ) -> Result<Option<Vacated>> {
+        if self.growing { return Ok(None); }
         let PoolPhase::ReleaseSent(cursor) = self.pool_phase else {
             return Ok(None);
         };
@@ -1274,6 +1280,55 @@ impl Queue {
         self.needs_fresh_backing = false;
         Ok((self.pool.id(), self.pool.page_list_va()?))
     }
+    pub(crate) fn pool_fits(&self, required: usize) -> bool {
+        !self.growing && self.pool_phase == PoolPhase::Populated && self.pool.fits(required)
+    }
+
+    /// Only a capacity increase waits for this queue's previously published work.
+    /// Other queues and ordinary submissions keep their existing concurrency.
+    pub(crate) fn begin_growth(&mut self, init: &crate::g17::initdata::InitData, blocks: usize) -> Result<bool> {
+        if self.growing {
+            if blocks < self.growth_blocks { return Err(EAGAIN); }
+            self.growth_blocks = blocks;
+            return Ok(false);
+        }
+        if self.quarantined || self.released || self.exit.is_some()
+            || self.active.len != 0 || self.replays.len != 0 || self.previous.is_some()
+            || (self.installed && !self.retirement_ready)
+            || self.pool_phase != PoolPhase::Populated { return Err(EAGAIN); }
+        if self.installed {
+            let record = ControlRecord::FreeListRelease(self.pool.release_record(self.free_list_generation));
+            let cursor = Rings::publish_control(init, &record)?;
+            self.pool_phase = PoolPhase::ReleaseSent(cursor);
+        } else { self.pool_phase = PoolPhase::Vacant; }
+        self.growing = true;
+        self.growth_blocks = blocks;
+        Ok(self.installed)
+    }
+
+    pub(crate) fn finish_growth(&mut self, init: &crate::g17::initdata::InitData,
+        pages: &mut Option<crate::g17::freelist::Pages>,
+        alias: &mut Option<mmu::KernelMapping>, blocks: usize) -> Result<Vacated> {
+        if !self.growing || blocks < self.growth_blocks { return Err(EAGAIN); }
+        if let PoolPhase::ReleaseSent(cursor) = self.pool_phase {
+            let consumer = init.control_consumer()?.load(Ordering::Acquire);
+            let producer = init.control_producer()?.load(Ordering::Acquire);
+            if !crate::g17::freelist::control_consumed(consumer, producer, cursor)? {
+                return Err(EAGAIN);
+            }
+        }
+        let binding = self.binding.as_mut().ok_or(EFAULT)?;
+        let old_alias = binding.pool_alias.take();
+        let old_pages = self.pool.take_pages();
+        self.pool.rearm(pages.take().ok_or(EINVAL)?)?;
+        init.initialize_compute_pool_blocks(self.pool.id(), self.pool.page_list_va()?, blocks)?;
+        binding.pool_alias = alias.take();
+        self.pool_phase = PoolPhase::Populated;
+        self.growing = false;
+        self.growth_blocks = 0;
+        Ok(Vacated { _alias: old_alias, _pages: old_pages, _descriptors: None, _ring: None })
+    }
+
     /// Exact host identity remains valid even when several commands share an ioctl ID.
     pub(crate) fn owns_packet(&self, packet: &Arc<Packet>) -> bool {
         self.active
@@ -1506,6 +1561,7 @@ impl Queue {
         };
         let (epoch, addresses) = self.publication_preflight(&packet, host)?;
         let crate::g17::command::Validated::Compute {
+            intersection,
             scratch,
             usc_base,
             cdm_va,
@@ -1540,6 +1596,7 @@ impl Queue {
             self.graph.ensure_record_slot(slot)?;
         }
         let args = ComputeArgs {
+            intersection: *intersection,
             scratch: *scratch,
             usc_base: *usc_base,
             cdm_va: *cdm_va,

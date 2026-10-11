@@ -127,9 +127,9 @@ impl<B: Backend> Queue<B> {
         })
     }
 
-    fn ensure_compute(&mut self) -> Result {
+    fn ensure_compute(&mut self, scs_pages: u16) -> Result {
         // Admission is checked even when this queue already owns a scheduler.
-        self.backend.ensure_compute()?;
+        self.backend.ensure_compute(scs_pages)?;
         if self.compute.is_none() {
             self.compute = Some(Scheduler::new(
                 &self.dev,
@@ -174,7 +174,8 @@ impl<B: Backend> Queue<B> {
         self.prune_frontier(index);
         self.frontiers[index].reserve(1, GFP_KERNEL)?;
         if engine == Engine::Compute {
-            self.ensure_compute()?;
+            let Validated::Compute { scratch, .. } = &command else { return Err(EINVAL); };
+            self.ensure_compute(scratch.pages())?;
         }
         // Only earlier render ordinals covered by the explicit logical prefix
         // can delay host publication. These links never become GPU dependencies.
