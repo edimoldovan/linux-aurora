@@ -4,6 +4,22 @@
 pub(crate) const SLOTS: usize = 16;
 pub(crate) const MAX_PACKETS: usize = 8;
 
+/// One packet's bounded prefix may use both engines only after InitBM retired
+/// and while every prior batch is idle. Zero selects the single-engine policy.
+pub(crate) fn mixed_prefix(enabled:bool, chip:u32, initialized:bool, idle:bool,
+    kinds:impl Iterator<Item=bool>) -> usize {
+    if !enabled || chip!=0x6030 || !initialized || !idle {return 0;}
+    let mut count=0;
+    let mut render=false;
+    let mut compute=false;
+    for is_render in kinds.take(SLOTS) {
+        count+=1;
+        render|=is_render;
+        compute|=!is_render;
+    }
+    if render && compute {count} else {0}
+}
+
 /// Only an unpublished T6030 batch may defer an intermediate stamp flush.
 /// Its final pass and every pass with firmware-written user timestamps flush.
 pub(crate) fn coalesce_render_stamps(enabled:bool, chip:u32, overlap:bool,

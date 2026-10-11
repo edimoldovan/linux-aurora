@@ -58,6 +58,14 @@ pub(crate) enum Dependency {
     /// A queue waits for an earlier pass; qualified G15 internal type is one.
     PreviousPass,
 }
+/// Completion of an earlier command whose stamp allocation remains owned by
+/// the runtime until every queue in the publication has retired.
+#[derive(Clone, Copy)]
+pub(crate) struct CompletionDependency {
+    pub(crate) stamp: FirmwareVa,
+    pub(crate) value: u32,
+    pub(crate) event: u32,
+}
 pub(crate) struct Barrier {
     pub(crate) stamp: FirmwareVa,
     pub(crate) wait_value: u32,
