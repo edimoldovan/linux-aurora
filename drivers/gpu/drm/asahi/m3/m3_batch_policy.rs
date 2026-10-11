@@ -4,6 +4,14 @@
 pub(crate) const SLOTS: usize = 16;
 pub(crate) const MAX_PACKETS: usize = 8;
 
+/// Only an unpublished T6030 batch may defer an intermediate stamp flush.
+/// Its final pass and every pass with firmware-written user timestamps flush.
+pub(crate) fn coalesce_render_stamps(enabled:bool, chip:u32, overlap:bool,
+    slot:usize, count:usize, timestamps:[[u64;2];2]) -> bool {
+    enabled && chip==0x6030 && !overlap && count>1 && count<=SLOTS
+        && slot<count-1 && timestamps==[[0;2];2]
+}
+
 pub(crate) fn pending_position(urgencies: impl Iterator<Item=u8>, incoming:u8) -> usize {
     let mut len=0;
     for queued in urgencies {
