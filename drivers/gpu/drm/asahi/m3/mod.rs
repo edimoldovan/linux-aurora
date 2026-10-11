@@ -74,3 +74,5 @@ mod agx_timing_stats;
 mod m3_timeline;
 
 mod m3_batch_policy;
+
+mod m3_command_layout;
