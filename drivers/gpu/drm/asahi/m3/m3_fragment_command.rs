@@ -10,6 +10,7 @@ pub(crate) const REGISTER_COUNT:usize=79;
 pub(crate) const REGISTER_STRIDE:usize=12;
 pub(crate) const PARAMETERS:usize=0x790;
 pub(crate) const META:usize=0xbac;
+pub(crate) const SEQUENCE_LENGTH:usize=0x1c;
 pub(crate) const STAMP_VALUE:usize=META+0x10;
 pub(crate) const FLUSH_STAMPS:usize=META+0x1c;
 fn word(out:&mut[u8],off:usize,value:u32) {out[off..off+4].copy_from_slice(&value.to_le_bytes());}
@@ -120,7 +121,7 @@ impl Command {
         word(bytes,0xc,self.context);
         for (offset,value) in [(0x14,seq),(0x20,self.notifier.get()),(0x28,self.manager.get()),
             (0x30,self.scene.get()),(0x38,self.empty.get()),(0x40,self.tilemap.get()),(0x780,registers)] {pointer(bytes,offset,value);}
-        word(bytes,0x1c,fragment::LENGTH as u32);
+        word(bytes,SEQUENCE_LENGTH,fragment::LENGTH as u32);
         // The qualified patch path updates register MSAA but retains these
         // producer header values. Representation cleanup must not change that.
         pointer(bytes,0x48,0x88);word(bytes,0x50,1);

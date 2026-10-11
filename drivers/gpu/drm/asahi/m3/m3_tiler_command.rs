@@ -12,6 +12,7 @@ pub(crate) const STAMP_VALUE:usize=0x780;
 pub(crate) const STRUCT3_STAMP:usize=ta::STRUCT3+0xf0;
 pub(crate) const FLUSH_STAMPS:usize=ta::STRUCT3+0xfc;
 pub(crate) const CONTEXT:usize=0xc;
+pub(crate) const SEQUENCE_LENGTH:usize=0x778;
 fn word(out:&mut[u8],off:usize,value:u32) {out[off..off+4].copy_from_slice(&value.to_le_bytes());}
 fn pointer(out:&mut[u8],off:usize,value:u64) {out[off..off+8].copy_from_slice(&value.to_le_bytes());}
 fn compact(address:u64)->Result<u64,Error> {
@@ -113,7 +114,7 @@ impl Command {
         }
         bytes[0x748..0x74a].copy_from_slice(&(count as u16).to_le_bytes());
         bytes[0x74a..0x74c].copy_from_slice(&((count*REGISTER_STRIDE) as u16).to_le_bytes());
-        word(bytes,0x778,ta::LENGTH as u32);
+        word(bytes,SEQUENCE_LENGTH,ta::LENGTH as u32);
         word(bytes,0x77c,1); // fragment event slot
         word(bytes,STAMP_VALUE,self.stamp_value);
         pointer(bytes,ta::STRUCT3+0x24,preemption[0]);
