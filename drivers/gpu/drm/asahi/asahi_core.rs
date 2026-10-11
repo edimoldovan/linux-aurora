@@ -70,7 +70,7 @@ module! {
         },
         compute_preempt: i32 {
             default: -1,
-            description: "Compute preemption (-1: G14X only; 0: off; nonzero: on)",
+            description: "Compute preemption (-1: M2 Max or Debug0; 0: off; nonzero: on)",
         },
         fault_control: u32 {
             default: 0xb,
