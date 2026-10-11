@@ -4,6 +4,12 @@
 pub(crate) const SLOTS: usize = 16;
 pub(crate) const MAX_PACKETS: usize = 8;
 
+/// T6030 may omit internal measurements; application queries always record.
+/// Other chips retain their existing microsequences regardless of the switch.
+pub(crate) fn stage_timestamps(internal:bool,chip:u32,queries:[u64;2])->bool {
+    internal || chip!=0x6030 || queries!=[0;2]
+}
+
 /// One packet's bounded prefix may use both engines only after InitBM retired
 /// and while every prior batch is idle. Zero selects the single-engine policy.
 pub(crate) fn mixed_prefix(enabled:bool, chip:u32, initialized:bool, idle:bool,
