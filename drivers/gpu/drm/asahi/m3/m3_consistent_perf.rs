@@ -11,6 +11,15 @@ pub(crate) fn request(chip: u32, level: u64, busy: bool, top: u32) -> Option<u32
     }
 }
 
+pub(crate) const REFRESH_INTERVAL_NS: i64 = 1_000_000;
+
+/// Transitions apply immediately. While busy, recheck the firmware-owned word
+/// at most once per millisecond; an inactive request does no repeated accesses.
+pub(crate) fn refresh_due(desired: u32, previous: u32, since_check_ns: Option<i64>) -> bool {
+    desired != previous || (desired != 0 &&
+        since_check_ns.is_none_or(|ns| ns >= REFRESH_INTERVAL_NS))
+}
+
 /// Write a packed word with byte accesses, clearing it before raising it so
 /// intermediate values never exceed either the old or new complete request.
 /// The caller owns the four-byte span and publishes after these stores.
@@ -47,5 +56,17 @@ mod tests {
         assert_eq!(bytes, [0x5a, 0x20, 3, 0, 0, 0x5a, 0x5a, 0x5a]);
         unsafe { store_packed(bytes.as_mut_ptr().add(1), 0); }
         assert_eq!(bytes, [0x5a, 0, 0, 0, 0, 0x5a, 0x5a, 0x5a]);
+    }
+    #[test]
+    fn busy_refresh_is_bounded_and_zero_transitions_are_immediate() {
+        assert!(!refresh_due(0,0,None));
+        assert!(!refresh_due(0,0,Some(10_000_000)));
+        assert!(refresh_due(800,0,Some(0)));
+        assert!(refresh_due(0,800,Some(0)));
+        assert!(refresh_due(800,800,None));
+        for elapsed in [-1,0,999_999] {assert!(!refresh_due(800,800,Some(elapsed)));}
+        for elapsed in [1_000_000,1_000_001,10_000_000] {
+            assert!(refresh_due(800,800,Some(elapsed)));
+        }
     }
 }
