@@ -80,3 +80,5 @@ mod m3_command_layout;
 mod m3_active_power;
 
 mod m3_consistent_perf;
+
+mod m3_globals_debug;
