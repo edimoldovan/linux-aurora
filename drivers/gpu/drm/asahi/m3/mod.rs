@@ -78,3 +78,5 @@ mod m3_batch_policy;
 mod m3_command_layout;
 
 mod m3_active_power;
+
+mod m3_consistent_perf;

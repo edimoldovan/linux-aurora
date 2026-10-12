@@ -2,7 +2,7 @@
 
 //! Bounded, opt-in power-state reads while a T6030 batch is unstamped.
 
-pub(crate) const MAX_SAMPLES: u32 = 600;
+pub(crate) const MAX_SAMPLES: u32 = 1200;
 pub(crate) const SAMPLE_INTERVAL_NS: i64 = 100_000_000;
 
 pub(crate) fn due(enabled: bool, chip: u32, stamped: bool, samples: u32,
