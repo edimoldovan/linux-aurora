@@ -104,3 +104,5 @@ mod m3_fragment_command;
 mod t8122_admission;
 
 mod m3_soc;
+
+mod t8122_hwdata;

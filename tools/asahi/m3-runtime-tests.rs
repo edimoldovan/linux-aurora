@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Host tests for the production M3 admission, IO ownership and thermal policy.
+//! Host tests for the production M3 admission, IO ownership, thermal policy and the T8122
+//! HwDataA +0x418c block.
 //! Run: rustc --edition=2021 --test tools/asahi/m3-runtime-tests.rs -o /tmp/m3-runtime-tests
 #![allow(dead_code)]
 
@@ -12,3 +13,5 @@ mod m3_init_layout;
 mod m3_init_storage;
 #[path = "../../drivers/gpu/drm/asahi/m3/m3_thermal_policy.rs"]
 mod m3_thermal_policy;
+#[path = "../../drivers/gpu/drm/asahi/m3/t8122_hwdata.rs"]
+mod t8122_hwdata;
