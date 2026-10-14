@@ -156,10 +156,16 @@ impl Queue {
         complete_qos: &mut impl FnMut(crate::g17::qos::Owner) -> Result,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
-        if !self.exit.as_ref().is_some_and(|exit| exit.phase == Phase::Acknowledged) {
+        let Some(phase) = self.exit.as_ref().map(|exit| exit.phase) else {
+            return Ok(());
+        };
+        if !matches!(phase, Phase::Acknowledged | Phase::Unproven) {
             return Ok(());
         }
-        if self.active.len != 0 {
+        // An unproven kill (acknowledged before the scheduler page showed the killed
+        // state) is re-read on later passes and settles only once the page proves it,
+        // even after its commands were retired by other means.
+        if self.active.len != 0 || phase == Phase::Unproven {
             if !recovery_closed {
                 return Ok(());
             }

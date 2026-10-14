@@ -1192,6 +1192,33 @@ impl Queue {
         {
             return Ok(false);
         }
+        self.recycle_settled()?;
+        Ok(true)
+    }
+    /// A quarantined queue whose owner closed and whose every retained command was
+    /// already settled, by the exact retirement witness or by an acknowledged kill,
+    /// holds no pending command: the firmware consumed its item ring exactly as after
+    /// a kill. Neither `reusable` nor `exit_candidate` matches it, so without this it
+    /// keeps its QID and USC pool backing until processor stop, and repeated client
+    /// failures exhaust the compute pool VA range. Return it to service as
+    /// `recycle_killed` does.
+    pub(crate) fn recycle_quarantined_idle(&mut self) -> Result<bool> {
+        if !self.installed
+            || !self.quarantined
+            || !self.released
+            || self.growing
+            || self.exit.is_some()
+            || self.awaiting_witness
+            || self.active.len != 0
+            || self.replays.len != 0
+            || self.previous.is_some()
+        {
+            return Ok(false);
+        }
+        self.recycle_settled()?;
+        Ok(true)
+    }
+    fn recycle_settled(&mut self) -> Result {
         self.graph.reset_items()?;
         self.exit = None;
         self.quarantined = false;
@@ -1213,7 +1240,7 @@ impl Queue {
         self.retirement_ready = true;
         self.released_at = now_ns();
         self.needs_fresh_backing = true;
-        Ok(true)
+        Ok(())
     }
     pub(crate) fn released_at(&self) -> u64 {
         self.released_at
