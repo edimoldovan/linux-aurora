@@ -1253,6 +1253,7 @@ impl super::Firmware {
             .filter_map(|entry| entry.queue.as_deref_mut())
         {
             queue.recycle_killed()?;
+            queue.recycle_quarantined_idle()?;
             if let Some(binding) = queue.detach_exited_owner() {
                 deferred.defer_binding(binding);
             }
