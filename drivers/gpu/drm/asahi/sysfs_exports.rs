@@ -3,8 +3,8 @@
 //! Per-device sysfs registration. The caller retains the snapshot Arc until
 //! unregister has drained active readers and freed the C attribute wrapper.
 
-use core::ffi::{c_int, c_void};
 use crate::stats::StatsSnapshot;
+use core::ffi::{c_int, c_void};
 
 extern "C" {
     fn asahi_sysfs_register(
@@ -23,7 +23,16 @@ pub(crate) fn register(
     export_enabled: bool,
 ) -> kernel::error::Result<*mut c_void> {
     let mut handle = core::ptr::null_mut();
-    let ret = unsafe { asahi_sysfs_register(dev.cast(), snapshot, export_enabled as c_int, &mut handle) };
+    // SAFETY: The bound driver keeps the device and optional snapshot alive until
+    // unregister drains readers. `handle` is writable for the duration of the call.
+    let ret = unsafe {
+        asahi_sysfs_register(
+            dev.cast(),
+            snapshot,
+            c_int::from(export_enabled),
+            &mut handle,
+        )
+    };
     if ret < 0 {
         Err(kernel::error::Error::from_errno(ret))
     } else {
@@ -33,5 +42,7 @@ pub(crate) fn register(
 
 /// Drain readers before the caller drops its snapshot Arc.
 pub(crate) fn unregister(dev: *mut kernel::bindings::device, handle: *mut c_void) {
+    // SAFETY: `handle` was returned by register for this device. The driver still
+    // owns the device and optional snapshot while the C helper drains readers.
     unsafe { asahi_sysfs_unregister(dev.cast(), handle) };
 }

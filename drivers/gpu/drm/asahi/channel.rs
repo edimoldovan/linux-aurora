@@ -666,11 +666,13 @@ impl StatsChannel::ver {
                                 // rem * util * 1e9 / (100 * ts_hz), which
                                 // cannot overflow u64 (rem < ts_hz <= 24e6
                                 // on supported SoCs).
-                                let util = [*util1, *util2, *util3, *util4]
-                                    .into_iter()
-                                    .max()
-                                    .unwrap_or(0)
-                                    .min(100) as u64;
+                                let util = u64::from(
+                                    [*util1, *util2, *util3, *util4]
+                                        .into_iter()
+                                        .max()
+                                        .unwrap_or(0)
+                                        .min(100),
+                                );
                                 let ts = timestamp.0;
                                 if self.last_util_ts != 0 && ts > self.last_util_ts {
                                     let delta = ts - self.last_util_ts;
