@@ -368,6 +368,7 @@ impl crate::g17::Shared {
         // Replay only at this outer boundary, after recovery has settled.
         // Publication may service events but must never recurse into replay.
         firmware.replay_compute(deferred)?;
+        firmware.replay_render(deferred)?;
         drop(state);
         self.observe_renders(masks, deferred)?;
         let mut state = self.state.lock();
@@ -409,6 +410,7 @@ impl crate::g17::Shared {
         let backpressured = firmware.render_control_backpressured();
         let polling = backpressured
             || firmware.queues.replay_outer_wait.is_some()
+            || firmware.queues.render.replay_polling()
             || firmware.queues.teardown.polling(now)
             || firmware.compute_exit_polling(now)
             || firmware
