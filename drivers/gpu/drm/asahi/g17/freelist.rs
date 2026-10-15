@@ -139,8 +139,12 @@ impl RenderBacking {
         alloc: &Allocator<'_>,
         render_global: &mmu::Vm,
         client: &mmu::Vm,
+        blocks: usize,
     ) -> Result<Self> {
-        let pages = Pages::new(alloc, RENDER_BLOCKS, RunLayout::Render)?;
+        if blocks < RENDER_BLOCKS || blocks > PAGE_LIST_SIZE / (FREE_LIST_BLOCK_PAGES as usize * 8) {
+            return Err(EINVAL);
+        }
+        let pages = Pages::new(alloc, blocks, RunLayout::Render)?;
         let address = pages.page_list_va();
         let global = pages
             .backing
@@ -161,6 +165,7 @@ impl RenderBacking {
 /// consumed and the client VM is evicted; a fresh backing is installed before
 /// the pool is staged again.
 pub(crate) struct RenderPool {
+    blocks: usize,
     backing: Arc<Mutex<Option<RenderBacking>>>,
     /// Page-list VA of the installed backing; zero while vacant.
     page_list: AtomicU64,
@@ -182,9 +187,10 @@ impl RenderPool {
         ids: &Arc<RenderIds>,
         render_global: &mmu::Vm,
         client: &mmu::Vm,
+        blocks: usize,
     ) -> Result<Self> {
         let id = RenderId::new(ids)?;
-        let backing = RenderBacking::new(alloc, render_global, client)?;
+        let backing = RenderBacking::new(alloc, render_global, client, blocks)?;
         let address = backing.pages.page_list_va();
         let run_list_va = backing.pages.run_list_va();
         let state = alloc.kernel(
@@ -207,7 +213,7 @@ impl RenderPool {
                     class: FreeListClass::Two,
                     page_list_va: address,
                     run_list_va,
-                    blocks: RENDER_BLOCKS as u32,
+                    blocks: blocks as u32,
                     state_va: state.gpu_va(),
                 },
                 0,
@@ -222,6 +228,7 @@ impl RenderPool {
             GFP_KERNEL,
         )?;
         Ok(Self {
+            blocks,
             backing,
             page_list: AtomicU64::new(address),
             epoch: AtomicU64::new(0),
@@ -279,7 +286,7 @@ impl RenderPool {
         if !self.vacant() {
             return Ok(());
         }
-        self.rearm(RenderBacking::new(alloc, render_global, client)?)
+        self.rearm(RenderBacking::new(alloc, render_global, client, self.blocks)?)
     }
 
     pub(crate) fn serial(&self) -> u64 {
@@ -303,7 +310,7 @@ impl RenderPool {
     }
     pub(crate) fn end_va(&self) -> u64 {
         self.run_list_va()
-            + (RENDER_BLOCKS * size_of::<super::fw::initdata::FreeListRunSlot>()) as u64
+            + (self.blocks * size_of::<super::fw::initdata::FreeListRunSlot>()) as u64
     }
 
     /// Fresh pools are already populated. Reuse requires the previous release
@@ -319,7 +326,7 @@ impl RenderPool {
                 class: FreeListClass::Two,
                 page_list_va: self.page_list_va(),
                 run_list_va: self.run_list_va(),
-                blocks: RENDER_BLOCKS as u32,
+                blocks: self.blocks as u32,
                 state_va: self.state.gpu_va(),
             },
             submitted,

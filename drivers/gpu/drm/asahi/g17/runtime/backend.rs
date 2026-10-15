@@ -70,6 +70,10 @@ impl job::Backend for Backend {
         Some(self.shared.feed.clone())
     }
 
+    fn render_scs_blocks(&self, pages: [u16; 2]) -> Result<usize> {
+        crate::g17::fw::render_rt::required_blocks(self.shared.active_cores, pages)
+    }
+
     fn ensure_compute(&self, scs_pages: u16) -> Result {
         Backend::ensure_compute(self, scs_pages)
     }

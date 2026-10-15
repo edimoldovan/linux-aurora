@@ -14,7 +14,7 @@ use super::{
     status::VmStatus,
 };
 use crate::mmu::{self, ExecutionContext, Vm, UAT_PGSZ};
-use core::sync::atomic::{fence, AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use identity::{RenderSlots, WorkStates, FREE, NODE_STRIDE, STATE_COUNT};
 use kernel::{
     new_mutex,
@@ -120,6 +120,7 @@ pub(crate) struct Context {
     work: Arc<Mutex<WorkStorage>>,
     work_base: u64,
     render: Arc<Mutex<Option<Arc<RenderPool>>>>,
+    render_blocks: AtomicUsize,
     /// Fixed for the context's life. Physical queues bound to it carry this
     /// profile in every record, ring, doorbell and registration.
     policy: Policy,
@@ -192,6 +193,7 @@ impl Context {
             work,
             work_base,
             render,
+            render_blocks: AtomicUsize::new(super::fw::freelist::RENDER_BLOCKS),
             policy,
         })
     }
@@ -277,6 +279,14 @@ impl Context {
         }
         Ok(result)
     }
+    pub(crate) fn reserve_render_blocks(&self, blocks: usize) -> Result {
+        if self.is_published() || self.render.lock().is_some() { return Err(EBUSY); }
+        self.render_blocks.store(blocks, Ordering::Release);
+        Ok(())
+    }
+    pub(crate) fn render_blocks(&self) -> usize {
+        self.render_blocks.load(Ordering::Acquire)
+    }
     pub(crate) fn render_pool(
         &self,
         alloc: &Allocator<'_>,
@@ -293,7 +303,7 @@ impl Context {
             return Ok(pool.clone());
         }
         let pool = Arc::new(
-            RenderPool::new(alloc, ids, render_global, self.vm())?,
+            RenderPool::new(alloc, ids, render_global, self.vm(), self.render_blocks())?,
             GFP_KERNEL,
         )?;
         *render = Some(pool.clone());

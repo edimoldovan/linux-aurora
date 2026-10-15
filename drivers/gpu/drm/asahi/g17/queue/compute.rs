@@ -1678,7 +1678,7 @@ impl Queue {
             mcache: None,
             event_mask: COMPUTE_KICK_EVENT_MASK,
             register_arrays: ComputeDescriptor::register_bindings(descriptor_low, *scratch)?,
-            compute_scratch: scratch.enabled(),
+            scs_enabled: scratch.enabled(),
             priority: policy.priority(),
         };
         let published = host.next_compute_publication()?;

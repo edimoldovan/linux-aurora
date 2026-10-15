@@ -66,6 +66,11 @@ mod render;
 
 /// Trait implemented by all versioned queues.
 pub(crate) trait Queue: Send + Sync {
+    fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
+        if layouts != [0; 2] { return Err(EINVAL); }
+        Ok(())
+    }
+
     fn submit(
         &mut self,
         reg_data: &AsahiRegData<'_>,

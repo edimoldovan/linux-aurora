@@ -244,6 +244,10 @@ pub(crate) trait Backend: Send + Sync {
 
     /// Lazily create or rebind this logical queue's physical compute graph.
     fn ensure_compute(&self, scs_pages: u16) -> Result;
+    fn render_scs_blocks(&self, pages: [u16; 2]) -> Result<usize> {
+        if pages != [0; 2] { return Err(EINVAL); }
+        Ok(super::fw::freelist::RENDER_BLOCKS)
+    }
     /// Settle outstanding work of a terminal VM before an ioctl error is published.
     fn fail_vm(&self, error: Error);
     /// Called after both scheduler entities have cancelled their queued jobs.
