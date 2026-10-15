@@ -11,6 +11,7 @@ mod observe;
 mod pools;
 mod prepare;
 mod recovery;
+mod replay;
 mod settle;
 mod submit;
 pub(super) mod teardown;

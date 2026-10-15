@@ -213,6 +213,7 @@ impl ParkedPair {
             terminal: None,
             previous: self.previous.take(),
             displaced: None,
+            replay: None,
             context_update: true,
         }))
     }

@@ -185,6 +185,11 @@ impl Packet {
     pub(crate) fn is_published(&self) -> bool {
         self.publication.load(Ordering::Acquire) == 2
     }
+    /// A published group retired by firmware without executing is published
+    /// again from the same packet. Publication state returns to "begun".
+    pub(crate) fn reset_publication_for_replay(&self) {
+        self.publication.store(1, Ordering::Release);
+    }
     pub(crate) fn cancel_requested(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }

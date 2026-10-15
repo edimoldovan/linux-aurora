@@ -70,7 +70,7 @@ impl crate::g17::Firmware {
                 .and_then(Option::as_ref)
                 .and_then(|entry| entry.pair.as_ref())
                 .ok_or(EIO)?;
-            if !pair.contains_packet(packet) {
+            if pair.replay_contains(packet) || !pair.contains_packet(packet) {
                 return Ok(());
             }
             let generation = self.recovery.generation();
