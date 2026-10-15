@@ -23,7 +23,7 @@ use super::kick::{
 use super::queue::CommandTag;
 use super::{
     clear, offset_va, sampler_max, stamp_value, timestamp_end_va, work_key, ObjectIds, UNK_0A599,
-    UNK_0D411, UNK_101D9, UNK_10791, UNK_1A0E9, UNK_1C8F8,
+    UNK_0D411, UNK_101D9, UNK_1C8F8,
 };
 
 /// Size of a tiling descriptor.
@@ -54,7 +54,11 @@ const DEFLAKE_20: u64 = 0x20;
 const DEFLAKE_2A0: u64 = 0x2a0;
 
 const TA_REGISTERS: usize = 73;
+const TA_REGISTERS_MAX: usize = TA_REGISTERS + 1;
+const TA_SCS_ENABLE_INDEX: usize = 1;
 const FRAGMENT_REGISTERS: usize = 89;
+const FRAGMENT_REGISTERS_MAX: usize = FRAGMENT_REGISTERS + 1;
+const FRAGMENT_SCS_ENABLE_INDEX: usize = 1;
 const PARTIAL_STORE_REGISTERS: usize = 16;
 const PARTIAL_RESUME_REGISTERS: usize = 23;
 const PARTIAL_LOAD_REGISTERS: usize = 10;
@@ -122,8 +126,6 @@ const UNK_15359_PARTIAL: u64 = 0x20;
 /// Required value of register 0x15049 and of fragment descriptor field
 /// +0x1f50.
 const UNK_15049: u64 = 0x10_0000;
-/// Value of the fragment register 0x10791.
-const UNK_10791_FRAGMENT: u64 = UNK_10791 | 1 << 9;
 /// USC program offsets carry tag bits that are not part of the address.
 const USC_OFFSET_TAG_MASK: u32 = 7;
 
@@ -303,6 +305,7 @@ pub(crate) struct RenderStage {
 pub(crate) struct RenderArgs<'a> {
     /// Render-pass state.
     pub(crate) pass: &'a RenderPass,
+    pub(crate) ray_query: [super::render_rt::RayQueryStage; 2],
     /// Kernel-owned objects.
     pub(crate) resources: &'a RenderResources,
     /// Submission ordinal of the render queue pair, from zero.
@@ -481,7 +484,7 @@ fn ta_registers(
     args: &RenderArgs<'_>,
     g: &Geometry,
     w: &PassWords,
-) -> Result<[RegisterWrite; TA_REGISTERS]> {
+) -> Result<[RegisterWrite; TA_REGISTERS_MAX]> {
     let p = args.pass;
     let r = args.resources;
     let tilemap = user_offset(r.tilemap_va)?;
@@ -497,9 +500,12 @@ fn ta_registers(
     }
     let key = work_key(r.context_id, args.ta.state_word);
     let ids = r.ta_ids.word();
+    let rt = args.ray_query[0];
+    let ift = rt.intersection.words();
 
     Ok([
         RegisterWrite::new(0x01748, 1),
+        RegisterWrite::new(0x017d9, 1),
         RegisterWrite::new(0x10141, 0x200),
         RegisterWrite::new(0x1c039, tilemap),
         RegisterWrite::new(0x1c9c8, tilemap),
@@ -545,16 +551,16 @@ fn ta_registers(
         RegisterWrite::new(0x1c898, 0),
         RegisterWrite::new(0x101e1, UNK_101D9),
         RegisterWrite::new(0x1c9e8, w.layer_mode & LAYER_MODE_PIPE_MASK),
-        RegisterWrite::new(0x1a099, 0),
-        RegisterWrite::new(0x1a0a1, 0),
-        RegisterWrite::new(0x1a069, 0),
-        RegisterWrite::new(0x1a071, 0),
-        RegisterWrite::new(0x1a0c9, 0),
-        RegisterWrite::new(0x1a0d1, 0),
-        RegisterWrite::new(0x101c9, 0),
-        RegisterWrite::new(0x0d471, 0),
-        RegisterWrite::new(0x1a0f1, UNK_1A0E9),
-        RegisterWrite::new(0x10799, UNK_10791),
+        RegisterWrite::new(0x1a099, ift[0]),
+        RegisterWrite::new(0x1a0a1, ift[1]),
+        RegisterWrite::new(0x1a069, ift[2]),
+        RegisterWrite::new(0x1a071, ift[3]),
+        RegisterWrite::new(0x1a0c9, ift[4]),
+        RegisterWrite::new(0x1a0d1, ift[5]),
+        RegisterWrite::new(0x101c9, rt.scratch.size_word()),
+        RegisterWrite::new(0x0d471, rt.scratch.tail_word()),
+        RegisterWrite::new(0x1a0f1, rt.scratch.stack_word()),
+        RegisterWrite::new(0x10799, rt.scratch.window_word()),
         RegisterWrite::new(0x1c830, r.pb_slot as u64),
         RegisterWrite::new(0x1ca30, r.pm_scratch),
         RegisterWrite::new(0x16c39, r.pm_scratch),
@@ -579,7 +585,7 @@ fn fragment_registers(
     args: &RenderArgs<'_>,
     g: &Geometry,
     w: &PassWords,
-) -> [RegisterWrite; FRAGMENT_REGISTERS] {
+) -> [RegisterWrite; FRAGMENT_REGISTERS_MAX] {
     let p = args.pass;
     let r = args.resources;
     let mut tile_state = TILE_STATE_BASE
@@ -591,9 +597,12 @@ fn fragment_registers(
     }
     let key = work_key(r.context_id, args.fragment.state_word);
     let ids = r.fragment_ids.word();
+    let rt = args.ray_query[1];
+    let ift = rt.intersection.words();
 
     [
         RegisterWrite::new(0x01739, 1),
+        RegisterWrite::new(0x017d9, 1),
         RegisterWrite::new(0x10009, w.utile_config),
         // End-of-tile resource specifier.
         RegisterWrite::new(0x15379, w.eot_rsrc_spec),
@@ -611,7 +620,7 @@ fn fragment_registers(
         RegisterWrite::new(0x16030, g.macro_size),
         RegisterWrite::new(0x100d9, g.screen),
         RegisterWrite::new(0x0a301, 0),
-        RegisterWrite::new(0x10791, UNK_10791_FRAGMENT),
+        RegisterWrite::new(0x10791, rt.scratch.window_word() | 1 << 9),
         RegisterWrite::new(0x16098, r.heapmeta_va),
         RegisterWrite::new(0x15109, p.scissor_va),
         RegisterWrite::new(0x15101, p.depth_bias_va),
@@ -659,15 +668,15 @@ fn fragment_registers(
         RegisterWrite::new(0x101e9, UNK_101D9),
         RegisterWrite::new(0x160a8, 0),
         RegisterWrite::new(0x16068, tile_state),
-        RegisterWrite::new(0x1a0a9, 0),
-        RegisterWrite::new(0x1a0b1, 0),
-        RegisterWrite::new(0x1a079, 0),
-        RegisterWrite::new(0x1a081, 0),
-        RegisterWrite::new(0x1a0d9, 0),
-        RegisterWrite::new(0x1a0e1, 0),
-        RegisterWrite::new(0x101c1, 0),
-        RegisterWrite::new(0x0d469, 0),
-        RegisterWrite::new(0x1a0f9, UNK_1A0E9),
+        RegisterWrite::new(0x1a0a9, ift[0]),
+        RegisterWrite::new(0x1a0b1, ift[1]),
+        RegisterWrite::new(0x1a079, ift[2]),
+        RegisterWrite::new(0x1a081, ift[3]),
+        RegisterWrite::new(0x1a0d9, ift[4]),
+        RegisterWrite::new(0x1a0e1, ift[5]),
+        RegisterWrite::new(0x101c1, rt.scratch.size_word()),
+        RegisterWrite::new(0x0d469, rt.scratch.tail_word()),
+        RegisterWrite::new(0x1a0f9, rt.scratch.stack_word()),
         RegisterWrite::new(0x0a5a9, UNK_0A599),
         RegisterWrite::new(0x0d429, UNK_0D411),
         RegisterWrite::new(0x160e0, ids),
@@ -907,9 +916,16 @@ impl TaDescriptor {
         self.pb_va = resources.pb_va;
         self.scene_va = resources.scene_va;
         self.scene_end_va = resources.scene_end_va;
-        self.checkpoints = TA_CHECKPOINTS;
+        let scs_register = args.ray_query[0].scratch.enabled();
+        self.checkpoints = TA_CHECKPOINTS.map(|count| count + u16::from(scs_register));
         self.unk_48 = (args.ordinal as u32).wrapping_add((args.ordinal / 2) as u32);
-        self.registers.set(array_va, &registers)?;
+        if scs_register {
+            self.registers.set(array_va, &registers)?;
+        } else {
+            let mut trimmed = [registers[0]; TA_REGISTERS];
+            trimmed[TA_SCS_ENABLE_INDEX..].copy_from_slice(&registers[TA_SCS_ENABLE_INDEX + 1..]);
+            self.registers.set(array_va, &trimmed)?;
+        }
         self.tpc_va = resources.tpc_va;
         self.tpc_size = resources.tpc_size;
         self.fragment_qid = args.fragment.qid.into();
@@ -963,10 +979,11 @@ impl TaDescriptor {
     /// descriptor's address as seen by the pass's VM.
     pub(crate) fn register_bindings(
         descriptor_va: u64,
+        scs_register: bool,
     ) -> Result<[Option<RegisterArrayBinding>; 4]> {
         let array = RegisterArrayBinding::new(
             offset_va(descriptor_va, Self::ARRAY_OFFSET)?,
-            TA_CHECKPOINTS[0] as u8,
+            TA_CHECKPOINTS[0] as u8 + u8::from(scs_register),
         )?;
         Ok([Some(array), None, None, None])
     }
@@ -1153,13 +1170,14 @@ impl FragmentDescriptor {
     /// the descriptor's address as seen by the pass's VM.
     pub(crate) fn register_bindings(
         descriptor_va: u64,
+        scs_register: bool,
     ) -> Result<[Option<RegisterArrayBinding>; 4]> {
         let array = |index, checkpoint: usize| -> Result<Option<RegisterArrayBinding>> {
             let va = offset_va(descriptor_va, Self::array_offset(index))?;
             Ok(Some(RegisterArrayBinding::new(va, checkpoint as u8)?))
         };
         Ok([
-            array(0, FRAGMENT_CHECKPOINTS[0] as usize)?,
+            array(0, FRAGMENT_CHECKPOINTS[0] as usize + usize::from(scs_register))?,
             array(1, PARTIAL_STORE_REGISTERS)?,
             array(2, PARTIAL_RESUME_REGISTERS)?,
             array(3, PARTIAL_LOAD_REGISTERS)?,
@@ -1226,9 +1244,19 @@ impl FragmentSlot {
         desc.merge_upper_x = pass.merge_upper_x;
         desc.merge_upper_y = pass.merge_upper_y;
         desc.tiles = geometry.tiles_x * geometry.tiles_y;
-        desc.checkpoints = FRAGMENT_CHECKPOINTS;
-        desc.entries = FRAGMENT_REGISTERS as u16;
-        desc.arrays[0].set(arrays[0], &fragment_registers(args, &geometry, &words))?;
+        let scs_register = args.ray_query[1].scratch.enabled();
+        let extra = u16::from(scs_register);
+        desc.checkpoints = FRAGMENT_CHECKPOINTS.map(|count| count + extra);
+        desc.entries = FRAGMENT_REGISTERS as u16 + extra;
+        let registers = fragment_registers(args, &geometry, &words);
+        if scs_register {
+            desc.arrays[0].set(arrays[0], &registers)?;
+        } else {
+            let mut trimmed = [registers[0]; FRAGMENT_REGISTERS];
+            trimmed[FRAGMENT_SCS_ENABLE_INDEX..]
+                .copy_from_slice(&registers[FRAGMENT_SCS_ENABLE_INDEX + 1..]);
+            desc.arrays[0].set(arrays[0], &trimmed)?;
+        }
         desc.arrays[1].set(arrays[1], &partial_store_registers(pass, &words))?;
         desc.arrays[2].set(arrays[2], &partial_resume_registers(pass, &words))?;
         desc.arrays[3].set(arrays[3], &partial_load_registers(pass, &words))?;

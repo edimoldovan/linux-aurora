@@ -112,16 +112,16 @@ impl ScratchRequest {
 
     pub(crate) fn pages(self) -> u16 { self.pages }
 
-    fn size_word(self) -> u64 {
+    pub(crate) fn size_word(self) -> u64 {
         let pages = u64::from(self.pages);
         pages | (pages.div_ceil(Self::PAGES_PER_MIB) << 16)
     }
 
-    fn window_word(self) -> u64 {
+    pub(crate) fn window_word(self) -> u64 {
         self.window
     }
 
-    fn stack_word(self) -> u64 {
+    pub(crate) fn stack_word(self) -> u64 {
         self.stack
     }
 
@@ -129,7 +129,7 @@ impl ScratchRequest {
         self.driver
     }
 
-    fn tail_word(self) -> u64 {
+    pub(crate) fn tail_word(self) -> u64 {
         self.tail
     }
 

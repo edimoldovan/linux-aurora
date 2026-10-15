@@ -21,6 +21,7 @@ pub(crate) mod initdata;
 pub(crate) mod kick;
 pub(crate) mod queue;
 pub(crate) mod render;
+pub(crate) mod render_rt;
 pub(crate) mod qos;
 
 /// Clears a firmware structure in place.

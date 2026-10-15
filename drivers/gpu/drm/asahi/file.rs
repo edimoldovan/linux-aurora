@@ -1156,7 +1156,7 @@ impl File {
         let _ = file_vm;
         core::mem::drop(guard);
 
-        let queue = device.gpu.new_queue(
+        let mut queue = device.gpu.new_queue(
             vm,
             ualloc,
             ualloc_priv,
@@ -1164,6 +1164,8 @@ impl File {
             uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_REALTIME - data.priority,
             data.usc_exec_base,
         )?;
+
+        queue.reserve_render_scs(data.render_scs_layout)?;
 
         data.queue_id = resv.index().try_into()?;
         resv.fill(Arc::pin_init(new_mutex!(queue), GFP_KERNEL)?)?;

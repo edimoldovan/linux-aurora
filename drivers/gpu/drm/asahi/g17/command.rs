@@ -6,6 +6,7 @@ use super::fw::{
     compute::{IntersectionTables, ScratchRequest},
     kick::WriteRange,
     render::{RenderPass, UscProgram, ZlsSurface},
+    render_rt::RayQueryStage,
 };
 use crate::util::{AnyBitPattern, Reader};
 use core::ops::Range;
@@ -14,6 +15,7 @@ use kernel::{prelude::*, uapi};
 const MAX_ATTACHMENTS: usize = crate::microseq::MAX_ATTACHMENTS;
 const USC_WINDOW_SIZE: u64 = 1 << 32;
 const MAX_SAMPLERS: u32 = 1024;
+const RENDER_BASE_SIZE: usize = core::mem::offset_of!(uapi::drm_asahi_cmd_render, prior_cdm) + size_of::<u64>();
 const COMPUTE_BASE_SIZE: usize = core::mem::offset_of!(uapi::drm_asahi_cmd_compute, prior_cdm) + size_of::<u64>();
 const SAMPLER_SIZE: u64 = 8;
 const PAGE_SIZE: u64 = 0x4000;
@@ -78,7 +80,7 @@ impl Attachments {
 // Commands stay inline in the submission plan, avoiding an allocation per render pass.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Payload {
-    Render(uapi::drm_asahi_cmd_render, [Attachments; 2]),
+    Render(uapi::drm_asahi_cmd_render, [Attachments; 2], [RayQueryStage; 2]),
     Compute(uapi::drm_asahi_cmd_compute, Attachments, IntersectionTables),
 }
 
@@ -128,7 +130,11 @@ impl<'a> Parser<'a> {
                         == uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER
                     {
                         self.counts[0] += 1;
-                        Payload::Render(payload(bytes)?, [self.attachments[0], self.attachments[1]])
+                        Payload::Render(
+                            payload(&bytes[..bytes.len().min(RENDER_BASE_SIZE)])?,
+                            [self.attachments[0], self.attachments[1]],
+                            RayQueryStage::parse_pair(bytes.get(RENDER_BASE_SIZE..).unwrap_or(&[]))?,
+                        )
                     } else {
                         self.counts[1] += 1;
                         Payload::Compute(
@@ -284,6 +290,7 @@ fn surface(
 pub(crate) enum Validated {
     Render {
         pass: RenderPass,
+        ray_query: [RayQueryStage; 2],
         attachments: [Attachments; 2],
         timestamps: [uapi::drm_asahi_timestamps; 2],
     },
@@ -302,7 +309,7 @@ pub(crate) enum Validated {
 impl Payload {
     pub(crate) fn prior(&self) -> [u64; 2] {
         match self {
-            Self::Render(cmd, _) => [cmd.prior_vdm, cmd.prior_cdm],
+            Self::Render(cmd, _, _) => [cmd.prior_vdm, cmd.prior_cdm],
             Self::Compute(cmd, _, _) => [cmd.prior_vdm, cmd.prior_cdm],
         }
     }
@@ -313,7 +320,7 @@ impl Payload {
         space: &impl AddressSpace,
     ) -> Result<Validated> {
         match self {
-            Self::Render(cmd, attachments) => {
+            Self::Render(cmd, attachments, ray_query) => {
                 if cmd.flags & !RENDER_FLAGS != 0
                     || !(1..=MAX_DIMENSION).contains(&cmd.width_px)
                     || !(1..=MAX_DIMENSION).contains(&cmd.height_px)
@@ -415,8 +422,16 @@ impl Payload {
                         | (u64::from(cmd.bg_eot_partial_rsrc_spec_hi) << 32),
                     rsrc_spec_hi: cmd.flags & RSRC_SPEC_HI != 0,
                 };
+                for stage in ray_query {
+                    if stage.intersection.enabled() {
+                        require_range(space, stage.intersection.pool, stage.intersection.pool_bytes, Access::Read)?;
+                        let code = stage.intersection.default_program & 0x0000_ffff_ffff_ffff;
+                        if code != 0 { require_range(space, code, 64, Access::Read)?; }
+                    }
+                }
                 Ok(Validated::Render {
                     pass,
+                    ray_query: *ray_query,
                     attachments: *attachments,
                     timestamps: [cmd.ts_vtx, cmd.ts_frag],
                 })

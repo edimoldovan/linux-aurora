@@ -298,6 +298,12 @@ enum drm_asahi_feature {
 	 * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS.
 	 */
 	DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS = (1UL) << 7,
+	/**
+	 * @DRM_ASAHI_FEATURE_RENDER_RAY_QUERY: Render commands accept per-stage
+	 * ray query state (struct drm_asahi_render_ray_query_stage) and queues
+	 * accept render_scs_layout.
+	 */
+	DRM_ASAHI_FEATURE_RENDER_RAY_QUERY = (1UL) << 8,
 };
 
 /**
@@ -817,6 +823,13 @@ struct drm_asahi_queue_create {
 	 * fix a 4GiB VA carveout for USC memory and pass its base address here.
 	 */
 	__u64 usc_exec_base;
+
+	/**
+	 * @render_scs_layout: Largest ray query scratch layouts of the vertex and
+	 * fragment stages this queue will submit, used to size its render pool.
+	 * Requires DRM_ASAHI_FEATURE_RENDER_RAY_QUERY; zero otherwise.
+	 */
+	__u64 render_scs_layout[2];
 };
 
 /**
@@ -1219,6 +1232,42 @@ struct drm_asahi_bg_eot {
 };
 
 /**
+ * struct drm_asahi_render_ray_query_stage - Ray query state of one render stage
+ *
+ * Index 0 describes the vertex (tiling) stage and index 1 the fragment stage
+ * of a render command. An all-zero entry disables ray queries in that stage.
+ * Requires DRM_ASAHI_FEATURE_RENDER_RAY_QUERY.
+ */
+struct drm_asahi_render_ray_query_stage {
+	/** @scs_layout: Per-thread ray query scratch layout, as for compute. */
+	__u64 scs_layout;
+
+	/** @intersection_aux: Auxiliary intersection table word. */
+	__u32 intersection_aux;
+
+	/** @intersection_pad: MBZ */
+	__u32 intersection_pad;
+
+	/** @intersection_pool: GPU VA of the intersection program pool. */
+	__u64 intersection_pool;
+
+	/** @intersection_pool_bytes: Size of the intersection program pool. */
+	__u64 intersection_pool_bytes;
+
+	/** @intersection_first: First intersection table entry. */
+	__u32 intersection_first;
+
+	/** @intersection_count: Number of intersection table entries. */
+	__u32 intersection_count;
+
+	/** @intersection_default: GPU VA of the default intersection program. */
+	__u64 intersection_default;
+
+	/** @intersection_default_control: Control word of the default program. */
+	__u64 intersection_default_control;
+};
+
+/**
  * struct drm_asahi_cmd_render - Command to submit 3D
  *
  * This command submits a single render pass. The hardware control stream may
@@ -1415,6 +1464,12 @@ struct drm_asahi_cmd_render {
 	 * queue's compute command count and the header's cdm_barrier instead.
 	 */
 	__u64 prior_cdm;
+
+	/**
+	 * @ray_query: Ray query state of the vertex and fragment stages. Older
+	 * userspace omits it; a shorter command is read with both stages zeroed.
+	 */
+	struct drm_asahi_render_ray_query_stage ray_query[2];
 };
 
 /**

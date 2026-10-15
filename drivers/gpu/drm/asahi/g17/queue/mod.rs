@@ -171,6 +171,10 @@ impl<B: Backend> Queue<B> {
             Validated::Compute { .. } => Engine::Compute,
         };
         let index = engine.index();
+        if let Validated::Render { ray_query, .. } = &command {
+            let blocks = self.backend.render_scs_blocks(ray_query.map(|stage| stage.scratch.pages()))?;
+            if blocks > self.context.render_blocks() { return Err(EINVAL); }
+        }
         self.prune_frontier(index);
         self.frontiers[index].reserve(1, GFP_KERNEL)?;
         if engine == Engine::Compute {
@@ -354,6 +358,13 @@ impl<B: Backend> Queue<B> {
 }
 
 impl<B: Backend> crate::queue::Queue for Queue<B> {
+    fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
+        let pages = [super::fw::compute::ScratchRequest::new(layouts[0])?.pages(),
+                     super::fw::compute::ScratchRequest::new(layouts[1])?.pages()];
+        let blocks = self.backend.render_scs_blocks(pages)?;
+        self.context.reserve_render_blocks(blocks)
+    }
+
     fn submit(
         &mut self,
         id: u64,

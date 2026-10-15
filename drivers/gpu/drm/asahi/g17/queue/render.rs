@@ -321,7 +321,7 @@ impl Pair {
             return Err(EBUSY);
         }
         let Validated::Render {
-            pass, attachments, ..
+            pass, attachments, ray_query, ..
         } = &packet.command
         else {
             return Err(EINVAL);
@@ -385,6 +385,7 @@ impl Pair {
         let qids = self.qids();
         let args = abi::RenderArgs {
             pass,
+            ray_query: *ray_query,
             resources: &resources,
             ordinal,
             ta: abi::RenderStage {
@@ -585,7 +586,7 @@ impl Pair {
             self.memory.graph.queues.gpu_va()
                 + u64::from(qid) * size_of::<queue::QueueRecord>() as u64
         });
-        let Validated::Render { pass, .. } = &packet.command else {
+        let Validated::Render { pass, ray_query, .. } = &packet.command else {
             return Err(EINVAL);
         };
         let own_tiling = KickDependency::new(qids[0], kicks[0]).ok_or(EINVAL)?;
@@ -609,13 +610,16 @@ impl Pair {
             mcache,
             event_mask: abi::RENDER_KICK_EVENT_MASK,
             register_arrays: arrays,
-            compute_scratch: false,
+            scs_enabled: ray_query[stage].scratch.enabled(),
             priority: policy.priority(),
         };
         let ta_args = args(
             0,
             tiling_barriers,
-            abi::TaDescriptor::register_bindings(self.memory.graph.descriptor_client(0, ordinal))?,
+            abi::TaDescriptor::register_bindings(
+                self.memory.graph.descriptor_client(0, ordinal),
+                ray_query[0].scratch.enabled(),
+            )?,
             None,
         );
         let fragment_args = args(
@@ -623,6 +627,7 @@ impl Pair {
             &barriers.fragment[..barriers.fragment_count],
             abi::FragmentDescriptor::register_bindings(
                 self.memory.graph.descriptor_client(1, ordinal),
+                ray_query[1].scratch.enabled(),
             )?,
             mcache,
         );
