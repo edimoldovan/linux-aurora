@@ -83,11 +83,25 @@ impl Transaction {
 }
 
 impl Queue {
+    /// A command with ray traversal scratch is never killed. On Neo, killing a
+    /// traversal that stopped making progress either crashed the GPU firmware
+    /// when the queue's pool was then released, or stalled every later render
+    /// when it was retained; left alone, the rest of the GPU kept working. Such
+    /// a queue stays quarantined and retained until its commands retire.
+    fn active_traversal(&self) -> bool {
+        self.active.iter().any(|active| {
+            matches!(
+                &active.packet.command,
+                crate::g17::command::Validated::Compute { scratch, .. } if scratch.enabled()
+            )
+        })
+    }
     pub(crate) fn exit_candidate(&self, context: &Arc<Context>, age: u64) -> bool {
         self.context().is_some_and(|bound| Arc::ptr_eq(bound, context))
             && self.released
             && self.active.len != 0
             && self.exit.is_none()
+            && !self.active_traversal()
             && (self.quarantined || self.retired_by_teardown)
             && age
                 >= if self.quarantined {
