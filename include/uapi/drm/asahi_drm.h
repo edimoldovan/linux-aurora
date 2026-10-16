@@ -294,6 +294,10 @@ enum drm_asahi_feature {
 
 	DRM_ASAHI_FEATURE_COMPUTE_WIDE_VISIBILITY = (1UL) << 8,
 
+	/*
+	 * Bits 10 to 15 are reported only by the G17P runtime.
+	 */
+
 	/**
 	 * @DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS: Every hardware command of
 	 * a submission waits for all of the submission's input syncs, including
@@ -302,7 +306,7 @@ enum drm_asahi_feature {
 	 * submissions and relies on this must pass its input syncs to each of
 	 * them.
 	 */
-	DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS = (1UL) << 3,
+	DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS = (1UL) << 10,
 
 	/**
 	 * @DRM_ASAHI_FEATURE_VM_STATUS_MIRROR: GET_PARAMS supports
@@ -313,32 +317,32 @@ enum drm_asahi_feature {
 	 * a successful wait a load of the word replaces the VM_STATUS query.
 	 * Registration may still be refused.
 	 */
-	DRM_ASAHI_FEATURE_VM_STATUS_MIRROR = (1UL) << 4,
+	DRM_ASAHI_FEATURE_VM_STATUS_MIRROR = (1UL) << 11,
 
 	/**
 	 * @DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS: Render and compute payloads
 	 * support exact queue-local historical prefixes in prior_vdm/prior_cdm.
 	 * These fields supplement the header barriers.
 	 */
-	DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS = (1UL) << 5,
+	DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS = (1UL) << 12,
 
 	/**
 	 * @DRM_ASAHI_FEATURE_FEW_PRIMITIVES: Render commands accept
 	 * DRM_ASAHI_RENDER_FEW_PRIMITIVES.
 	 */
-	DRM_ASAHI_FEATURE_FEW_PRIMITIVES = (1UL) << 6,
+	DRM_ASAHI_FEATURE_FEW_PRIMITIVES = (1UL) << 13,
 
 	/**
 	 * @DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS: Render commands accept
 	 * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS.
 	 */
-	DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS = (1UL) << 7,
+	DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS = (1UL) << 14,
 	/**
 	 * @DRM_ASAHI_FEATURE_RENDER_RAY_QUERY: Render commands accept per-stage
 	 * ray query state (struct drm_asahi_render_ray_query_stage) and queues
 	 * accept render_scs_layout.
 	 */
-	DRM_ASAHI_FEATURE_RENDER_RAY_QUERY = (1UL) << 8,
+	DRM_ASAHI_FEATURE_RENDER_RAY_QUERY = (1UL) << 15,
 };
 
 /**
