@@ -732,11 +732,11 @@ impl Shared {
     }
 
     fn queue_grow(self: &Arc<Self>) {
-        let _ = workqueue::system_unbound().enqueue::<Arc<Self>, GROW_WORK>(self.clone());
+        let _ = workqueue::system_dfl().enqueue::<Arc<Self>, GROW_WORK>(self.clone());
     }
 
     fn queue_reclaims(self: &Arc<Self>) {
-        let _ = workqueue::system_unbound().enqueue::<Arc<Self>, RECLAIM_WORK>(self.clone());
+        let _ = workqueue::system_dfl().enqueue::<Arc<Self>, RECLAIM_WORK>(self.clone());
     }
 
     fn drain_reclaims(self: &Arc<Self>) {

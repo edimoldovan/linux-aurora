@@ -27,7 +27,7 @@ impl Shared {
     /// the event worker hands the detector's request to the actuator.
     pub(in crate::g17) fn queue_feed(self: &Arc<Self>) {
         if self.feed.take_pending() {
-            let _ = workqueue::system_unbound().enqueue::<Arc<Self>, FEED_WORK>(self.clone());
+            let _ = workqueue::system_dfl().enqueue::<Arc<Self>, FEED_WORK>(self.clone());
         }
     }
 }
