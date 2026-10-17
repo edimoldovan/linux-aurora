@@ -19,6 +19,7 @@ mod gpu;
 mod hw;
 mod initdata;
 mod mem;
+mod m3;
 mod microseq;
 mod mmu;
 mod object;

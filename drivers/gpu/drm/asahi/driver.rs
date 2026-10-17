@@ -133,6 +133,7 @@ impl drm::driver::Driver for AsahiDrmDriver {
 pub(crate) enum ProbeConfig {
     Legacy(&'static hw::HwConfig),
     G17(&'static g17::Config),
+    M3(crate::m3::Chip),
 }
 
 // OF Device ID table.
@@ -176,6 +177,22 @@ kernel::of_device_table!(
             of::DeviceId::new(c"apple,agx-t6022"),
             ProbeConfig::Legacy(&hw::t602x::HWCONFIG_T6022)
         ),
+        (
+            of::DeviceId::new(c"apple,agx-t8122"),
+            ProbeConfig::M3(crate::m3::Chip::T8122)
+        ),
+        (
+            of::DeviceId::new(c"apple,agx-t6030"),
+            ProbeConfig::M3(crate::m3::Chip::T6030)
+        ),
+        (
+            of::DeviceId::new(c"apple,agx-t6031"),
+            ProbeConfig::M3(crate::m3::Chip::T6031)
+        ),
+        (
+            of::DeviceId::new(c"apple,agx-t6032"),
+            ProbeConfig::M3(crate::m3::Chip::T6032)
+        ),
     ]
 );
 
@@ -207,6 +224,7 @@ impl platform::Driver for AsahiPlatformDriver {
         let cfg = match info.ok_or(ENODEV)? {
             ProbeConfig::Legacy(cfg) => *cfg,
             ProbeConfig::G17(cfg) => return AsahiPlatformDriver::probe_g17(pdev, cfg),
+            ProbeConfig::M3(chip) => return Err(crate::m3::refuse_probe(pdev, *chip)),
         };
 
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
