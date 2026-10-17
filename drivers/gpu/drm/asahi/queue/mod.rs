@@ -609,6 +609,13 @@ const SQ_RENDER: usize = 0;
 const SQ_COMPUTE: usize = 1;
 const SQ_COUNT: usize = 2;
 
+/// Bytes of a render command this queue implements. The fields from `prior_vdm` on belong to
+/// other runtimes and must be zero here, as must any bytes beyond the kernel's structure.
+const RENDER_SUPPORTED_SIZE: usize = core::mem::offset_of!(uapi::drm_asahi_cmd_render, prior_vdm);
+/// Bytes of a compute command this queue implements; see [`RENDER_SUPPORTED_SIZE`].
+const COMPUTE_SUPPORTED_SIZE: usize =
+    core::mem::offset_of!(uapi::drm_asahi_cmd_compute, scs_layout);
+
 // SAFETY: All bit patterns are valid by construction.
 unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_header {}
 unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_render {}
@@ -869,7 +876,11 @@ impl Queue for Queue::ver {
 
             match header.cmd_type as u32 {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
-                    let render: uapi::drm_asahi_cmd_render = cmdbuf.read_up_to(header_size)?;
+                    let render: uapi::drm_asahi_cmd_render = cmdbuf
+                        .read_supported(header_size, RENDER_SUPPORTED_SIZE)
+                        .inspect_err(|_| {
+                            cls_pr_debug!(Errors, "Unsupported render command fields\n")
+                        })?;
 
                     self.inner.submit_render(
                         &gpu,
@@ -895,7 +906,11 @@ impl Queue for Queue::ver {
                     )?;
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => {
-                    let compute: uapi::drm_asahi_cmd_compute = cmdbuf.read_up_to(header_size)?;
+                    let compute: uapi::drm_asahi_cmd_compute = cmdbuf
+                        .read_supported(header_size, COMPUTE_SUPPORTED_SIZE)
+                        .inspect_err(|_| {
+                            cls_pr_debug!(Errors, "Unsupported compute command fields\n")
+                        })?;
 
                     self.inner.submit_compute(
                         &gpu,
