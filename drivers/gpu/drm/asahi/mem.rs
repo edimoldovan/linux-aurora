@@ -148,8 +148,8 @@ const TLBI_RANGE_MAX: usize = 0x200_0000;
 const TLBI_RANGE_SCALE1_MIN: usize = 0x10_0000;
 /// Translation granule field value for 16 KiB pages.
 const TLBI_TG_16K: u64 = 2;
-/// Width of the base address field of a range TLBI operand.
-const TLBI_RANGE_BADDR_MASK: u64 = (1 << 38) - 1;
+/// Base address field of a range TLBI operand, bits 36:0. Bits 38:37 hold the TTL hint.
+const TLBI_RANGE_BADDR_MASK: u64 = (1 << 37) - 1;
 
 /// Invalidate a range of pages for a given ASID with a single range operation.
 ///
