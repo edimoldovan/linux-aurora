@@ -662,7 +662,7 @@ impl WorkQueue::ver {
         let preempt_auto = true;
         #[ver(G != G14X)]
         let preempt_auto = false;
-        let preempt = match *module_parameters::compute_preempt.value() {
+        let preempt = match module_parameters::compute_preempt.value() {
             -1 => preempt_auto,
             value => value != 0,
         };

@@ -262,7 +262,8 @@ impl QueueJob::ver {
 #[versions(AGX)]
 impl sched::JobImpl for QueueJob::ver {
     type TimeoutData = QueueTimeout;
-    const MODULE: Option<&'static kernel::ThisModule> = Some(&crate::THIS_MODULE);
+    const MODULE: Option<&'static kernel::ThisModule> =
+        Some(kernel::module::this_module::<crate::LocalModule>());
 
     fn timeout_data(&self) -> QueueTimeout {
         QueueTimeout { dev: self.dev.clone(), id: self.id }

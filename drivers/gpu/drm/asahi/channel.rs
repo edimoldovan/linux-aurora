@@ -631,7 +631,7 @@ impl StatsChannel::ver {
                     // accessing the enum view is valid.
                     let msg = unsafe { msg.msg };
                     cls_dev_dbg!(StatsCh, self.dev, "Stats: {:?}\n", msg);
-                    if *module_parameters::stats_export.value() != 0 {
+                    if module_parameters::stats_export.value() != 0 {
                         // Retain the latest values for /sys/class/drm/card*/
                         // device/agx_stats. Read-only with respect to
                         // scheduling or power behaviour: the firmware already

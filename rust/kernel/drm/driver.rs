@@ -134,10 +134,6 @@ pub trait Driver {
     /// Driver metadata
     const INFO: DriverInfo;
 
-    /// Module implementing the driver callbacks. Loadable drivers should provide
-    /// their `THIS_MODULE` so open files and exported DMA buffers retain the code.
-    const MODULE: Option<&'static crate::ThisModule> = None;
-
     /// IOCTL list. See `kernel::drm::ioctl::declare_drm_ioctls!{}`.
     const IOCTLS: &'static [drm::ioctl::DrmIoctlDescriptor];
 
