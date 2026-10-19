@@ -385,6 +385,23 @@ struct VmOpResources {
     preallocated_gpuvas: [Option<GpuVaAlloc<VmInner>>; 3],
 }
 
+impl VmOpResources {
+    /// Resources for unmapping a range.
+    ///
+    /// An unmap splits at most the two mappings that straddle its ends. Each split takes two
+    /// GPUVAs before it knows which pieces survive and returns the unused one, so cutting the tail
+    /// of one mapping and the head of the next needs three GPUVAs at the second split.
+    fn for_unmap() -> Result<Self> {
+        Ok(Self {
+            preallocated_gpuvas: [
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
+            ],
+        })
+    }
+}
+
 struct StepContext<'ctx> {
     dev: Option<&'ctx device::Device<Bound>>,
     prot: Prot,
@@ -585,6 +602,18 @@ impl gpuvm::DriverGpuVm for VmInner {
 
         let unmap_range = unmap_end - unmap_start;
 
+        // GPUVM must be able to record the surviving pieces once their hole is gone from the page
+        // tables, so take the allocations first. `remap()` takes one for each side and hands back
+        // the one for a side that does not survive.
+        let prev_gpuva = ctx.preallocated_gpuva()?;
+        let next_gpuva = match ctx.preallocated_gpuva() {
+            Ok(gpuva) => gpuva,
+            Err(error) => {
+                ctx.return_preallocated_gpuva(prev_gpuva);
+                return Err(error);
+            }
+        };
+
         let _mutation = self.mapping_mutation();
         if orig_invalidated {
             self.page_table.discard_partial_map(unmap_start..unmap_end)?;
@@ -606,9 +635,6 @@ impl gpuvm::DriverGpuVm for VmInner {
         }
 
         self.tlbi_contexts_naming_root(unmap_start, unmap_range as usize);
-
-        let prev_gpuva = ctx.preallocated_gpuva()?;
-        let next_gpuva = ctx.preallocated_gpuva()?;
 
         let (op_remapped, remap_ret) = op.remap(
             [prev_gpuva, next_gpuva],
@@ -2181,15 +2207,7 @@ impl Vm {
         user: bool,
     ) -> Result {
         let _residency = self.enter_retirement_residency();
-        // Unmapping a range can only do a single split, so just preallocate
-        // two GPUVAs.
-        let mut resources = VmOpResources {
-            preallocated_gpuvas: [
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                None,
-            ],
-        };
+        let mut resources = VmOpResources::for_unmap()?;
         let mut ctx = StepContext::new(dev, Prot::default(), &mut resources)?;
 
         let mut vm_exec = unsafe { self.gpuvm.exec_lock(None, false)? };

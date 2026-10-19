@@ -116,13 +116,7 @@ impl Vm {
             _residency: residency,
             iova,
             size,
-            resources: VmOpResources {
-                preallocated_gpuvas: [
-                    Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                    Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                    None,
-                ],
-            },
+            resources: VmOpResources::for_unmap()?,
         })
     }
 
