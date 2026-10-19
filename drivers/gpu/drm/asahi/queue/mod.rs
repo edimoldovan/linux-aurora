@@ -609,12 +609,14 @@ const SQ_RENDER: usize = 0;
 const SQ_COMPUTE: usize = 1;
 const SQ_COUNT: usize = 2;
 
-/// Bytes of a render command this queue implements. The fields from `prior_vdm` on belong to
-/// other runtimes and must be zero here, as must any bytes beyond the kernel's structure.
-const RENDER_SUPPORTED_SIZE: usize = core::mem::offset_of!(uapi::drm_asahi_cmd_render, prior_vdm);
+/// Bytes of a render command this queue implements. The fields from `ts_frag_end_copies` on
+/// belong to other runtimes and must be zero here, as must any bytes beyond the kernel's
+/// structure.
+const RENDER_SUPPORTED_SIZE: usize =
+    core::mem::offset_of!(uapi::drm_asahi_cmd_render, ts_frag_end_copies);
 /// Bytes of a compute command this queue implements; see [`RENDER_SUPPORTED_SIZE`].
 const COMPUTE_SUPPORTED_SIZE: usize =
-    core::mem::offset_of!(uapi::drm_asahi_cmd_compute, scs_layout);
+    core::mem::offset_of!(uapi::drm_asahi_cmd_compute, ts_end_copies);
 
 // SAFETY: All bit patterns are valid by construction.
 unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_header {}
