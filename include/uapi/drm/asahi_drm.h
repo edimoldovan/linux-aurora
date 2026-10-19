@@ -196,32 +196,38 @@ struct drm_asahi_params_global {
 	__u64 command_timestamp_frequency_hz;
 
 	/**
-	 * @usc_generation: Instruction set generation of the unified shader
-	 * cores: 2 for G13 and G14, 3 for G15 and newer.
+	 * @usc_generation: Unified shader core (USC) ISA generation.
+	 *
+	 * This is 2 for G13/G14 and 3 for G15. It does not distinguish the
+	 * binary encoding groups within AGX3.
 	 */
 	__u32 usc_generation;
 
 	/**
-	 * @gpu_hal_generation: Command stream generation, from
-	 * enum drm_asahi_gpu_hal_generation.
+	 * @gpu_hal_generation: Apple GPU HAL/command-stream generation, a value
+	 * of enum drm_asahi_gpu_hal_generation.
+	 *
+	 * G13-G15 on 14.x report DRM_ASAHI_GPU_HAL_LEGACY.
+	 * The exact J613 25G83 runtime and the G17P runtime report
+	 * DRM_ASAHI_GPU_HAL_200.
 	 */
 	__u32 gpu_hal_generation;
 };
 
 /**
- * enum drm_asahi_gpu_hal_generation - GPU command stream generation
- *
- * The command stream generation determines the layout of the control streams
- * and descriptors that userspace builds for the GPU.
+ * enum drm_asahi_gpu_hal_generation - GPU HAL/command-stream generation
  */
 enum drm_asahi_gpu_hal_generation {
-	/** @DRM_ASAHI_GPU_HAL_LEGACY: Unnumbered generation of G13 to G15. */
+	/** @DRM_ASAHI_GPU_HAL_LEGACY: GPU predates the numbered HAL generations. */
 	DRM_ASAHI_GPU_HAL_LEGACY = 0,
 
-	/** @DRM_ASAHI_GPU_HAL_200: Generation 200, used by G17P. */
+	/**
+	 * @DRM_ASAHI_GPU_HAL_200: HAL200 command stream, reported by the J613
+	 * 25G83 runtime and by the G17P runtime.
+	 */
 	DRM_ASAHI_GPU_HAL_200 = 200,
 
-	/** @DRM_ASAHI_GPU_HAL_300: Generation 300. */
+	/** @DRM_ASAHI_GPU_HAL_300: HAL300 command stream. Never reported by this kernel. */
 	DRM_ASAHI_GPU_HAL_300 = 300,
 };
 
@@ -258,16 +264,14 @@ enum drm_asahi_feature {
 	 */
 	DRM_ASAHI_FEATURE_SOFT_FAULTS = (1UL) << 0,
 
-	/**
-	 * @DRM_ASAHI_FEATURE_VM_STATUS: GET_PARAMS supports
-	 * DRM_ASAHI_PARAM_GROUP_VM_STATUS.
-	 */
+	/** @DRM_ASAHI_FEATURE_VM_STATUS: GET_PARAMS VM_STATUS is supported. */
 	DRM_ASAHI_FEATURE_VM_STATUS = (1UL) << 1,
 
 	/**
-	 * @DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES: Each queue reserves its own
-	 * hardware execution state when it is created, and GET_PARAMS
-	 * supports DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS.
+	 * @DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES: GET_PARAMS group
+	 * DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS is available, and each queue
+	 * reserves its own hardware execution state when it is created. Only
+	 * the G17P runtime sets this bit.
 	 */
 	DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES = (1UL) << 2,
 
@@ -337,6 +341,7 @@ enum drm_asahi_feature {
 	 * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS.
 	 */
 	DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS = (1UL) << 14,
+
 	/**
 	 * @DRM_ASAHI_FEATURE_RENDER_RAY_QUERY: Render commands accept per-stage
 	 * ray query state (struct drm_asahi_render_ray_query_stage) and queues
@@ -345,88 +350,59 @@ enum drm_asahi_feature {
 	DRM_ASAHI_FEATURE_RENDER_RAY_QUERY = (1UL) << 15,
 };
 
-/**
- * define DRM_ASAHI_PARAM_GROUP_VM_STATUS - GET_PARAMS group for
- * struct drm_asahi_vm_status
- */
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
-
-/**
- * define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS - GET_PARAMS group for
- * struct drm_asahi_queue_limits
- */
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
 
 /**
  * define DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR - GET_PARAMS group for
- * struct drm_asahi_vm_status_mirror
+ * struct drm_asahi_vm_status_mirror, available with
+ * DRM_ASAHI_FEATURE_VM_STATUS_MIRROR
  */
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR 3
 
-/**
- * struct drm_asahi_vm_status - VM status, GET_PARAMS group
- * DRM_ASAHI_PARAM_GROUP_VM_STATUS
- *
- * This is an in/out query on a VM of the calling file. Userspace sets
- * &drm_asahi_get_params.pointer to this structure and
- * &drm_asahi_get_params.size to its size.
- *
- * The kernel records the failure of an accepted job before it signals the
- * job's fences, so userspace must query the status after a successful syncobj
- * wait before it treats the work as successfully executed. A signalled
- * syncobj alone does not indicate successful execution. An execution failure
- * also marks other VMs whose work can no longer make progress. A query never
- * resets or recovers the GPU.
- *
- * Invalid requests fail with EINVAL (non-zero @flags or @pad, wrong size),
- * ENOENT (@vm_id unknown to the calling file) or EFAULT, and write nothing.
+/* GET_PARAMS group VM_STATUS is an in/out query on the calling file's VM.
+ * Set pointer to this structure and size to sizeof(structure).
+ * vm_id selects the VM; flags and pad must be zero. error is output only.
+ * error == 0 means no observed submission error; a negative Linux errno is
+ * sticky for this VM's lifetime. The first error is retained. Creating a new
+ * queue or successfully waiting another fence does not clear it.
+ * An execution-domain failure also marks other queried VMs lost when their
+ * hardware owner cannot progress. A query never recovers/resets firmware.
+ * The driver publishes an accepted job's failure before signaling its fence.
+ * Thus userspace must query after a successful DRM syncobj wait/poll before
+ * treating that fence as successful execution. Syncobj signal alone is not
+ * an execution-success indication.
+ * The feature bit is the availability contract; older kernels leave it zero.
+ * Kernel errors for invalid requests: EINVAL flags/pad/size, ENOENT foreign or
+ * missing vm_id, EFAULT inaccessible pointer. No output on invalid request.
  */
 struct drm_asahi_vm_status {
-	/** @vm_id: VM to query */
-	__u32 vm_id;
-
-	/** @flags: MBZ */
-	__u32 flags;
-
-	/**
-	 * @error: Output: 0 if no submission error was observed, otherwise the
-	 * first error as a negative errno. The error is sticky for the lifetime
-	 * of the VM: neither creating queues nor waiting on other fences clears
-	 * it.
-	 */
-	__s32 error;
-
-	/** @pad: MBZ */
-	__u32 pad;
+   __u32 vm_id;
+   __u32 flags;
+   __s32 error;
+   __u32 pad;
 };
 
 /**
- * struct drm_asahi_queue_limits - Queue limits, GET_PARAMS group
- * DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS
+ * struct drm_asahi_queue_limits - GET_PARAMS group2 output, feature bit2.
+ * @max_queues: Maximum independent DRM queues on the physical device. This is
+ * a hardware resource bound, shared by all files/VMs; it is not a promise that
+ * all slots are currently free. QUEUE_CREATE reserves a queue's hardware state
+ * and execution context, returning an allocation error if resources run out.
+ * @max_in_flight_per_queue: Hardware scheduler credits per queue. Software
+ * may enqueue additional jobs, which wait behind preceding work/dependencies.
+ * @flags: Reserved, zero.
+ * @pad: Reserved, zero.
  *
- * The query neither allocates nor resets anything.
+ * The query is available only when DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES is
+ * set, which only the G17P runtime does; otherwise it fails with EINVAL. A
+ * query does not allocate or reset anything.
  */
 struct drm_asahi_queue_limits {
-	/**
-	 * @max_queues: Maximum number of queues on the device, shared by all
-	 * files and VMs. This is a hardware bound, not a promise that as many
-	 * are currently available: QUEUE_CREATE reserves a queue's hardware
-	 * state and fails once it runs out.
-	 */
-	__u32 max_queues;
-
-	/**
-	 * @max_in_flight_per_queue: Number of jobs of a queue that the
-	 * hardware may run at once. Further jobs wait behind the preceding work
-	 * and their dependencies.
-	 */
-	__u32 max_in_flight_per_queue;
-
-	/** @flags: Reserved, zero */
-	__u32 flags;
-
-	/** @pad: Reserved, zero */
-	__u32 pad;
+    __u32 max_queues;
+    __u32 max_in_flight_per_queue;
+    __u32 flags;
+    __u32 pad;
 };
 
 /**
@@ -459,8 +435,14 @@ struct drm_asahi_vm_status_mirror {
  */
 struct drm_asahi_get_params {
 	/**
-	 * @param_group: Parameter group: 0 for struct drm_asahi_params_global,
-	 * otherwise one of DRM_ASAHI_PARAM_GROUP_*.
+	 * @param_group: Parameter group to fetch: 0 for struct
+	 * drm_asahi_params_global, DRM_ASAHI_PARAM_GROUP_VM_STATUS when
+	 * DRM_ASAHI_FEATURE_VM_STATUS is set, or
+	 * DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS when
+	 * DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES is set, or
+	 * DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR when
+	 * DRM_ASAHI_FEATURE_VM_STATUS_MIRROR is set. Any other group, or a
+	 * group whose feature bit is clear, fails with EINVAL.
 	 */
 	__u32 param_group;
 
@@ -468,8 +450,8 @@ struct drm_asahi_get_params {
 	__u32 pad;
 
 	/**
-	 * @pointer: User pointer to the parameter struct. The VM status groups
-	 * also read their input from it.
+	 * @pointer: User pointer to parameter struct. The VM status groups also
+	 * read their input from it.
 	 */
 	__u64 pointer;
 
@@ -1087,11 +1069,10 @@ enum drm_asahi_render_flags {
 	DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING = (1U << 2),
 
 	/**
-	 * @DRM_ASAHI_RENDER_RSRC_SPEC_HI: The command carries the high halves
-	 * of the background and end-of-tile resource specifiers
-	 * (&drm_asahi_cmd_render.bg_rsrc_spec_hi and the following fields).
-	 * Kernels that do not know the flag reject the command instead of
-	 * silently truncating the specifiers.
+	 * @DRM_ASAHI_RENDER_RSRC_SPEC_HI: The appended resource-specifier high
+	 * dwords are present. A kernel that cannot use them rejects the flag
+	 * instead of silently truncating the values. This kernel accepts it
+	 * from the G17P runtime only.
 	 */
 	DRM_ASAHI_RENDER_RSRC_SPEC_HI = (1U << 4),
 
@@ -1500,16 +1481,16 @@ struct drm_asahi_cmd_render {
 	/** @ts_frag: Timestamps for the fragment portion of the render */
 	struct drm_asahi_timestamps ts_frag;
 
-	/** @bg_eot_rsrc_spec_hi: High half of @eot.rsrc_spec */
+	/** @bg_eot_rsrc_spec_hi: High dword of @eot.rsrc_spec */
 	__u32 bg_eot_rsrc_spec_hi;
 
-	/** @bg_eot_partial_rsrc_spec_hi: High half of @partial_eot.rsrc_spec */
+	/** @bg_eot_partial_rsrc_spec_hi: High dword of @partial_eot.rsrc_spec */
 	__u32 bg_eot_partial_rsrc_spec_hi;
 
-	/** @bg_rsrc_spec_hi: High half of @bg.rsrc_spec */
+	/** @bg_rsrc_spec_hi: High dword of @bg.rsrc_spec */
 	__u32 bg_rsrc_spec_hi;
 
-	/** @bg_partial_rsrc_spec_hi: High half of @partial_bg.rsrc_spec */
+	/** @bg_partial_rsrc_spec_hi: High dword of @partial_bg.rsrc_spec */
 	__u32 bg_partial_rsrc_spec_hi;
 
 	/** @ts_frag_end_copies: End timestamp copies, requiring the corresponding feature bit. */
