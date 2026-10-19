@@ -15,10 +15,12 @@ use core::mem::MaybeUninit;
 use kernel::{
     bindings, c_str,
     device::Core,
-    devres::Devres,
     error::{from_err_ptr, to_result},
     io::{
-        mem::IoMem,
+        mem::{
+            DevresIoMem,
+            IoMem, //
+        },
         Io,
         IoBase, //
     },
@@ -553,7 +555,7 @@ impl Resources<'_> {
 #[derive(Clone)]
 pub(crate) struct G17Resources {
     dev: ARef<platform::Device>,
-    sgx: Arc<Devres<IoMem<'static, SGX_SIZE>>>,
+    sgx: Arc<DevresIoMem<SGX_SIZE>>,
 }
 
 impl G17Resources {
