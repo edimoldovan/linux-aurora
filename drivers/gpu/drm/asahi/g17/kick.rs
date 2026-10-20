@@ -17,7 +17,7 @@ use crate::{hw::t8140, mem, mmu};
 
 pub(super) const QID_COUNT: usize = QID_MAX as usize + 1;
 
-/// QIDs kept free for render pairs when compute queues fill the table.
+/// Minimum render-channel capacity protected from compute-only allocation.
 const COMPUTE_RENDER_RESERVE: usize = 16;
 
 /// Stable physical-channel identity. The owner must not be reused within a
@@ -47,6 +47,7 @@ struct Identity {
 /// One shared namespace for tiling, fragment and compute queues.
 pub(crate) struct QueueIds {
     entries: [Option<Identity>; QID_COUNT],
+    initial_render: [Option<Id>; 2],
     compute_publication: u64,
     leased: usize,
 }
@@ -55,9 +56,27 @@ impl QueueIds {
     pub(crate) fn new() -> impl Init<Self, Error> {
         kernel::try_init!(Self {
             entries <- pin_init::init_array_from_fn(|_| None),
+            initial_render: [None; 2],
             compute_publication: 0,
             leased: 0,
         })
+    }
+
+    /// Keep the initial render reservations until another engine needs their
+    /// capacity. No graph receives these tokens, so an unpublished reservation
+    /// can be replaced without changing an installed physical channel.
+    pub(crate) fn reserve_initial_render(&mut self) -> Result {
+        if self.leased != 0 {
+            return Err(EINVAL);
+        }
+        for (qid, engine) in [DataMaster::Tiling, DataMaster::Fragment]
+            .into_iter()
+            .enumerate()
+        {
+            let id = self.reserve(qid as u64 + 1, engine, Some(qid as u8))?;
+            self.initial_render[qid] = Some(id);
+        }
+        Ok(())
     }
 
     /// Reuses only an exact owner/engine match. Preferred placement is for
@@ -83,15 +102,45 @@ impl QueueIds {
                 Err(EINVAL)
             };
         }
-        // Healthy existing channels keep their QID. Never recycle a published
-        // identity to recover capacity after a fault; leave eight render pairs.
-        if engine == DataMaster::Compute && QID_COUNT - self.leased <= COMPUTE_RENDER_RESERVE {
-            return Err(ENOSPC);
+        let initial = if engine == DataMaster::Compute && self.leased == QID_COUNT {
+            self.initial_render
+                .iter()
+                .copied()
+                .enumerate()
+                .find_map(|(slot, id)| {
+                    id.filter(|id| self.can_cancel_unpublished(*id))
+                        .map(|id| (slot, id))
+                })
+        } else {
+            None
+        };
+        // Existing render identities already satisfy this reservation. Counting
+        // them twice can refuse compute even while physical QIDs remain free.
+        // Published identities always retain their original lifetime rules.
+        if engine == DataMaster::Compute {
+            let render = self
+                .entries
+                .iter()
+                .flatten()
+                .filter(|entry| {
+                    matches!(entry.id.engine, DataMaster::Tiling | DataMaster::Fragment)
+                })
+                .count();
+            // Replacing an initial reservation consumes one render identity.
+            // Include that transition when protecting render's minimum, and
+            // count the replacement as available compute capacity.
+            let replacement = usize::from(initial.is_some());
+            if QID_COUNT - self.leased + replacement
+                <= COMPUTE_RENDER_RESERVE.saturating_sub(render - replacement)
+            {
+                return Err(ENOSPC);
+            }
         }
         let index = preferred
             .map(usize::from)
             .filter(|index| self.entries.get(*index).is_some_and(Option::is_none))
             .or_else(|| self.entries.iter().position(Option::is_none))
+            .or_else(|| initial.map(|(_, id)| usize::from(id.qid)))
             .ok_or(ENOSPC)?;
         let id = Id {
             qid: index as u8,
@@ -102,7 +151,11 @@ impl QueueIds {
             id,
             published: false,
         });
-        self.leased += 1;
+        if let Some((slot, _)) = initial {
+            self.initial_render[slot] = None;
+        } else {
+            self.leased += 1;
+        }
         Ok(id)
     }
 
@@ -125,6 +178,13 @@ impl QueueIds {
         }
         entry.published = true;
         Ok(())
+    }
+
+    pub(crate) fn can_cancel_unpublished(&self, id: Id) -> bool {
+        self.entries
+            .get(usize::from(id.qid))
+            .and_then(Option::as_ref)
+            .is_some_and(|entry| entry.id == id && !entry.published)
     }
 
     pub(crate) fn cancel_unpublished(&mut self, id: Id) -> Result {
