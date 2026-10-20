@@ -389,6 +389,26 @@ pub(super) enum Rebind {
     Fresh,
 }
 
+
+#[kunit_tests(asahi_g17_uninstalled_cleanup)]
+mod uninstalled_cleanup_tests {
+    use super::*;
+    #[test]
+    fn empty_reservation_prevents_reuse_until_explicit_cancellation() {
+        let mut registry = KBox::init(Registry::new(1, [0; 2]), GFP_KERNEL).unwrap();
+        let first = registry.reserve_compute(1).unwrap();
+        assert!(registry.reserved(first).is_ok());
+        assert!(registry.reserve_compute(1).is_err());
+        let second = registry.reserve_compute(2).unwrap();
+        assert_ne!(first.id.qid(), second.id.qid());
+        registry.cancel_compute(first).unwrap();
+        assert!(registry.reserved(first).is_err());
+        let next = registry.reserve_compute(3).unwrap();
+        assert_eq!(first.id.qid(), next.id.qid());
+        assert!(first.id != next.id);
+    }
+}
+
 /// An immutable logical owner shared by its two scheduler entities. Installed
 /// physical graphs retain the context independently of this frontend lifetime.
 pub(super) struct Backend {
@@ -567,6 +587,20 @@ impl Backend {
         result
     }
 
+    /// The caller keeps its preparation lease through this two-phase rollback.
+    /// An empty registry entry prevents reusing the QID/free-list identity while
+    /// its old aliases still occupy canonical or client addresses. Recovery joins
+    /// this lease before removing the session, even if its epoch was invalidated.
+    fn finish_uninstalled_compute(
+        &self, retired: Option<(ComputeReservation, KBox<compute::Queue>)>,
+    ) -> Result {
+        let Some((reservation, queue)) = retired else { return Ok(()); };
+        drop(queue);
+        let mut state = self.shared.state.lock();
+        let firmware = state.as_deref_mut().ok_or(ENODEV)?;
+        firmware.queues.cancel_compute(reservation)
+    }
+
     fn grow_compute(&self, required: usize) -> Result {
         use kernel::time::{delay::fsleep, Delta};
         {
@@ -626,17 +660,15 @@ impl Backend {
                         let Some(entry) = firmware.queues.compute[index].as_mut() else { continue; };
                         let Some(queue) = entry.queue.as_deref_mut() else { continue; };
                         if queue.abort_growth(token)? == Some(true) {
-                            // Only an uninstalled graph can return true. Cancel
-                            // its unpublished QID, then destroy it off-lock.
-                            firmware.queues.qids.cancel_unpublished(entry.reservation.id)?;
-                            retired = entry.queue.take();
-                            firmware.queues.compute[index] = None;
+                            // Keep the empty entry and QID reserved until all
+                            // graph aliases have been destroyed outside the lock.
+                            retired = entry.queue.take().map(|queue| (entry.reservation, queue));
                             break;
                         }
                     }
                 }
                 drop(state);
-                drop(retired);
+                self.finish_uninstalled_compute(retired)?;
                 self.shared.queue_events();
             }
         }
