@@ -24,6 +24,21 @@ config DRM_ASAHI
 	help
 	  DRM driver for Apple AGX GPUs (G13x, found in the M1 SoC family)
 
+config DRM_ASAHI_G16
+	bool "Apple M4 (G16G) support (experimental)"
+	depends on DRM_ASAHI && ARM64
+	depends on APPLE_PMP=y || APPLE_PMP=DRM_ASAHI
+	depends on THERMAL_OF
+	select CRYPTO_LIB_SHA256
+	help
+	  Rust Asahi backend for the qualified J713/T8132 GPU firmware.
+	  Load asahi explicitly after the native display and GFX TVM supplier
+	  are ready. Firmware-visible storage remains retained until a verified
+	  retirement or reboot. Keep the working kernel available during bring-up.
+	  A rendering VM pins about 0.7 GiB; memory-cgroup limits are advisable.
+	  An aborted receipt disables that command class until reboot.
+	  Suspend, hibernation and kexec are blocked while native graphics owns DMA.
+
 config DRM_ASAHI_DEBUG_ALLOCATOR
 	bool "Use debug allocator"
 	depends on DRM_ASAHI
