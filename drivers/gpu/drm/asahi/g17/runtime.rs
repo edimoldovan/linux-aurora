@@ -668,6 +668,10 @@ impl Backend {
                     }
                 }
                 drop(state);
+                // Tentative replacement mappings also belong to this builder.
+                // Discard them before a fresh QID can acquire a successor.
+                drop(alias.take());
+                drop(pages.take());
                 self.finish_uninstalled_compute(retired)?;
                 self.shared.queue_events();
             }
