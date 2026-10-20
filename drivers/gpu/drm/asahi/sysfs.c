@@ -32,9 +32,21 @@ struct asahi_stats_snapshot {
 	u64 jobs;
 };
 
+/* Mirror of the repr(C) Rust `memacct::Ledger`, in bytes. */
+struct asahi_gpu_memory {
+	u64 user_committed;
+	u64 user_resident;
+	u64 kernel_resident;
+	u64 refused;
+	u64 limit;
+	u64 client_limit;
+};
+
 struct asahi_stats_attribute {
 	struct device_attribute attr;
+	struct device_attribute memory_attr;
 	const struct asahi_stats_snapshot *snapshot;
+	const struct asahi_gpu_memory *memory;
 	bool export_enabled;
 };
 
@@ -72,19 +84,51 @@ static ssize_t agx_stats_show(struct device *dev,
 	return n;
 }
 
+/*
+ * GPU memory held by the driver, in bytes: user objects created (committed)
+ * and held by the GPU (resident), held kernel objects, the limits that admit
+ * user objects (0: none) and the number of refused creations.
+ */
+static ssize_t gpu_memory_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct asahi_stats_attribute *stats =
+		container_of(attr, struct asahi_stats_attribute, memory_attr);
+	const struct asahi_gpu_memory *mem = stats->memory;
+	ssize_t n = 0;
+
+	n += scnprintf(buf + n, PAGE_SIZE - n, "user_committed %llu\n",
+		       (unsigned long long)READ_ONCE(mem->user_committed));
+	n += scnprintf(buf + n, PAGE_SIZE - n, "user_resident %llu\n",
+		       (unsigned long long)READ_ONCE(mem->user_resident));
+	n += scnprintf(buf + n, PAGE_SIZE - n, "kernel_resident %llu\n",
+		       (unsigned long long)READ_ONCE(mem->kernel_resident));
+	n += scnprintf(buf + n, PAGE_SIZE - n, "limit %llu\n",
+		       (unsigned long long)READ_ONCE(mem->limit));
+	n += scnprintf(buf + n, PAGE_SIZE - n, "client_limit %llu\n",
+		       (unsigned long long)READ_ONCE(mem->client_limit));
+	n += scnprintf(buf + n, PAGE_SIZE - n, "refused %llu\n",
+		       (unsigned long long)READ_ONCE(mem->refused));
+
+	return n;
+}
 
 /*
  * Called from Rust's `AsahiDriver::probe` after the DRM device is
  * registered. Returns 0 on success, or a negative errno.
  */
 int asahi_sysfs_register(struct device *dev, const void *snapshot,
-			 int export_enabled, void **handle)
+			 int export_enabled, const void *memory, void **handle)
 {
 	struct asahi_stats_attribute *stats;
 	int ret;
 
-	if (!dev || !handle || (export_enabled && !snapshot))
+	if (!dev || !handle || !memory || (export_enabled && !snapshot))
 		return -ENODEV;
+
+	BUILD_BUG_ON(offsetof(struct asahi_gpu_memory, refused) != 24);
+	BUILD_BUG_ON(offsetof(struct asahi_gpu_memory, client_limit) != 40);
+	BUILD_BUG_ON(sizeof(struct asahi_gpu_memory) != 48);
 
 	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, pstate) != 16);
 	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, busy_ns) != 40);
@@ -102,8 +146,21 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 	stats->snapshot = snapshot;
 	stats->export_enabled = export_enabled;
 
+	sysfs_attr_init(&stats->memory_attr.attr);
+	stats->memory_attr.attr.name = "gpu_memory";
+	stats->memory_attr.attr.mode = 0444;
+	stats->memory_attr.show = gpu_memory_show;
+	stats->memory = memory;
+
 	ret = device_create_file(dev, &stats->attr);
 	if (ret) {
+		kfree(stats);
+		return ret;
+	}
+
+	ret = device_create_file(dev, &stats->memory_attr);
+	if (ret) {
+		device_remove_file(dev, &stats->attr);
 		kfree(stats);
 		return ret;
 	}
@@ -121,6 +178,7 @@ void asahi_sysfs_unregister(struct device *dev, void *handle)
 		return;
 
 	/* Removal drains active show callbacks before either allocation dies. */
+	device_remove_file(dev, &stats->memory_attr);
 	device_remove_file(dev, &stats->attr);
 	kfree(stats);
 }

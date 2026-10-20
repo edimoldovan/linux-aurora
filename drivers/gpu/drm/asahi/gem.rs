@@ -40,6 +40,7 @@ use crate::{
         AsahiDrmDriver, //
     },
     file,
+    memacct,
     mmu,
 };
 
@@ -60,6 +61,8 @@ pub(crate) struct AsahiObject {
     kernel: bool,
     /// Driver aliases outside the user GPUVA tree; they pin the backing.
     kernel_mappings: AtomicU64,
+    /// Memory accounting and process attribution of the held backing.
+    charge: memacct::Charge,
 }
 
 /// Type alias for the shmem GEM object type for this driver.
@@ -74,6 +77,9 @@ pub(crate) type Object = shmem::Object<AsahiObject>;
 /// comes with unevictable, as `mapping_set_inaccessible()` sets it; nothing reads or writes a GEM
 /// shmem file through its mapping. Releasing idle backing or purging clears the mark, so the
 /// released pages can be swapped and migrated again.
+///
+/// The same transitions charge and uncharge the held pages (see [`memacct`]): a held user object
+/// counts towards the resident set of the process that created it.
 pub(crate) fn set_mapping_held(gem: &Object, held: bool) {
     let raw = gem.as_raw();
     // SAFETY: `gem` keeps the GEM object alive. A shmem-backed object's `filp` and its
@@ -99,6 +105,7 @@ pub(crate) fn set_mapping_held(gem: &Object, held: bool) {
     } else {
         flags.fetch_and(!inaccessible, Ordering::Relaxed);
     }
+    gem.charge.set_held(held);
 }
 
 /// Takes the SG table of `gem`, which holds its pages for the device, and marks the
@@ -211,6 +218,7 @@ pub(crate) struct AsahiObjConfig {
     flags: u32,
     exportable: bool,
     kernel: bool,
+    charge: memacct::Charge,
 }
 
 /// Create a new kernel-owned GEM object.
@@ -229,7 +237,7 @@ pub(crate) fn new_kernel_object_wc(dev: &AsahiDrmDevice, size: usize) -> Result<
 /// Validate before rounding: wrapping a user size can create a much smaller
 /// backing than requested (or panic with overflow checks). Kernel callers use
 /// the same boundary so malformed calculated sizes cannot bypass this check.
-fn checked_object_size(size: usize) -> Result<usize> {
+pub(crate) fn checked_object_size(size: usize) -> Result<usize> {
     if size == 0 { return Err(EINVAL); }
     size.checked_add(mmu::UAT_PGMSK)
         .map(|rounded| rounded & !mmu::UAT_PGMSK)
@@ -238,9 +246,10 @@ fn checked_object_size(size: usize) -> Result<usize> {
 
 
 fn new_kernel_object_mapped(dev: &AsahiDrmDevice, size: usize, map_wc: bool) -> Result<ObjectRef> {
+    let size = checked_object_size(size)?;
     let gem = shmem::Object::<AsahiObject>::new(
         dev,
-        checked_object_size(size)?,
+        size,
         shmem::ObjectConfig::<AsahiObject> {
             reclaimable_cpu_mappings: false,
             map_wc,
@@ -250,6 +259,7 @@ fn new_kernel_object_mapped(dev: &AsahiDrmDevice, size: usize, map_wc: bool) -> 
             flags: 0,
             exportable: false,
             kernel: true,
+            charge: memacct::Charge::kernel(&memacct::LEDGER, size as u64),
         },
     )?;
 
@@ -259,12 +269,16 @@ fn new_kernel_object_mapped(dev: &AsahiDrmDevice, size: usize, map_wc: bool) -> 
 }
 
 /// Create a new user-owned GEM object with the given flags.
+///
+/// `commit` is the admission of `size` (already rounded by [`checked_object_size`]) for the
+/// creating client; the object is attributed to the current process.
 pub(crate) fn new_object(
     dev: &AsahiDrmDevice,
     size: usize,
     flags: u32,
     parent_object: Option<&shmem::Object<AsahiObject>>,
     reclaim_cpu: bool,
+    commit: memacct::Commit,
 ) -> Result<ARef<Object>> {
     if (flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0) != parent_object.is_some()
     {
@@ -283,6 +297,7 @@ pub(crate) fn new_object(
             flags,
             exportable: parent_object.is_none(),
             kernel: false,
+            charge: memacct::Charge::user_current(commit),
         },
     )?;
 
@@ -308,16 +323,21 @@ impl DriverObject for AsahiObject {
             exportable: args.exportable,
             kernel: args.kernel,
             kernel_mappings: AtomicU64::new(0),
+            charge: args.charge,
         })
     }
 
     /// Objects the DRM core allocates for us (dma-bufs imported from other devices and dumb
     /// buffers) are shared user objects, like a GEM_CREATE object without flags.
+    ///
+    /// Their memory is not counted: an import's backing belongs to, and is charged by, its
+    /// exporter, and the driver offers no dumb buffers (it has no KMS).
     fn core_object_args(_dev: &AsahiDrmDevice, _size: usize) -> Result<Self::Args> {
         Ok(AsahiObjConfig {
             flags: 0,
             exportable: true,
             kernel: false,
+            charge: memacct::Charge::none(),
         })
     }
 

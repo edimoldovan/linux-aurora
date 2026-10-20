@@ -3,7 +3,7 @@
 //! Per-device sysfs registration. The caller retains the snapshot Arc until
 //! unregister has drained active readers and freed the C attribute wrapper.
 
-use crate::stats::StatsSnapshot;
+use crate::{memacct::Ledger, stats::StatsSnapshot};
 use core::ffi::{c_int, c_void};
 
 extern "C" {
@@ -11,12 +11,15 @@ extern "C" {
         dev: *mut c_void,
         snapshot: *const StatsSnapshot,
         export_enabled: c_int,
+        memory: *const Ledger,
         handle: *mut *mut c_void,
     ) -> c_int;
     fn asahi_sysfs_unregister(dev: *mut c_void, handle: *mut c_void);
 }
 
 /// Register only after initialization succeeds, keeping the snapshot Arc alive.
+///
+/// Also registers `gpu_memory`, which shows the static GPU memory ledger.
 pub(crate) fn register(
     dev: *mut kernel::bindings::device,
     snapshot: *const StatsSnapshot,
@@ -30,6 +33,7 @@ pub(crate) fn register(
             dev.cast(),
             snapshot,
             c_int::from(export_enabled),
+            &crate::memacct::LEDGER,
             &mut handle,
         )
     };

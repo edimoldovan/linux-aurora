@@ -217,6 +217,7 @@ impl platform::Driver for AsahiPlatformDriver {
         info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         debug::update_debug_flags();
+        crate::memacct::LEDGER.configure();
 
         dev_info!(pdev.as_ref(), "Probing...\n");
 

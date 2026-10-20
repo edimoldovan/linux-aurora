@@ -16,6 +16,7 @@ use crate::{
         AsahiDrmDevice, //
     },
     gem,
+    memacct,
     mmu,
     module_parameters,
     queue,
@@ -234,6 +235,8 @@ pub(crate) struct File {
     queues: xarray::XArray<Arc<Mutex<KBox<dyn queue::Queue>>>>,
     // #[pin]
     objects: xarray::XArray<KBox<Object>>,
+    /// GPU memory this client created and holds.
+    mem: Arc<memacct::Client>,
 }
 
 /// Convenience type alias for our DRM `File` type.
@@ -253,9 +256,20 @@ impl drm::file::DriverFile for File {
             let gpu = &reg_data.gpu;
             let id = gpu.ids().file.next();
             let user_range = gpu.uat_geometry().user_usable_range();
+            let mem = memacct::Client::new()?;
 
             mod_dev_dbg!(device, "[File {}]: DRM device opened\n", id);
-            Ok(KBox::pin_init(File::new(id, user_range), GFP_KERNEL)?)
+            Ok(KBox::pin_init(File::new(id, user_range, mem), GFP_KERNEL)?)
+        })
+    }
+
+    /// The objects this client created, which `memacct` attributes to it, not every object it
+    /// has a handle to: an imported or shared buffer is counted once, by its creator.
+    fn memory_stats(&self) -> Option<drm::file::MemoryStats> {
+        Some(drm::file::MemoryStats {
+            private: self.mem.committed(),
+            resident: Some(self.mem.resident()),
+            ..Default::default()
         })
     }
 
@@ -268,7 +282,11 @@ impl drm::file::DriverFile for File {
 unsafe impl AnyBitPattern for uapi::drm_asahi_gem_bind_op {}
 
 impl File {
-    fn new(id: u64, user_range: Range<u64>) -> impl PinInit<Self, Error> {
+    fn new(
+        id: u64,
+        user_range: Range<u64>,
+        mem: Arc<memacct::Client>,
+    ) -> impl PinInit<Self, Error> {
         unsafe {
             pin_init::pin_init_from_closure(move |slot: *mut Self| {
                 let raw_vms = addr_of_mut!((*slot).vms);
@@ -293,6 +311,7 @@ impl File {
 
                 (*slot).id = id;
                 (*slot).user_range = user_range;
+                addr_of_mut!((*slot).mem).write(mem);
                 Ok(())
             })
         }
@@ -633,7 +652,15 @@ impl File {
             None
         };
 
-        let gem = gem::new_object(device, data.size.try_into()?, data.flags, resv_obj, reclaim_cpu)?;
+        let size = gem::checked_object_size(data.size.try_into()?)?;
+        let commit = memacct::LEDGER.admit(&file.inner().mem, size as u64).inspect_err(|_| {
+            cls_pr_debug!(
+                Errors,
+                "gem_create: {:#x} bytes refused by the GPU memory limits\n",
+                size
+            );
+        })?;
+        let gem = gem::new_object(device, size, data.flags, resv_obj, reclaim_cpu, commit)?;
 
         let handle = gem.create_handle(file)?;
         data.handle = handle;
