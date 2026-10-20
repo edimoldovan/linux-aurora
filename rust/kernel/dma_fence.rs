@@ -14,6 +14,48 @@ use core::ops::{Deref, DerefMut};
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+/// A lockdep annotation for code required to complete a published DMA fence.
+///
+/// Keep this guard alive across all locks and operations on the mandatory signalling
+/// path, including deferred completion, and drop it before unrelated reclaiming work.
+/// The guard may nest but must be dropped by the task that created it.
+#[must_use]
+pub struct SignallingGuard {
+    #[cfg(CONFIG_LOCKDEP)]
+    cookie: bool,
+    // The lockdep cookie belongs to the current task, so this guard is !Send and !Sync.
+    _not_send_sync: core::marker::PhantomData<*mut ()>,
+}
+
+impl SignallingGuard {
+    /// Begins a DMA fence signalling critical section for lockdep.
+    pub fn new() -> Self {
+        Self {
+            // SAFETY: This annotation has no preconditions and supports nesting and
+            // atomic context. Drop closes it on the same task using its returned cookie.
+            #[cfg(CONFIG_LOCKDEP)]
+            cookie: unsafe { bindings::dma_fence_begin_signalling() },
+            _not_send_sync: core::marker::PhantomData,
+        }
+    }
+}
+
+impl Default for SignallingGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for SignallingGuard {
+    fn drop(&mut self) {
+        // SAFETY: The non-transferable guard owns this task's matching begin cookie.
+        #[cfg(CONFIG_LOCKDEP)]
+        unsafe {
+            bindings::dma_fence_end_signalling(self.cookie)
+        };
+    }
+}
+
 mod private {
     /// Marker that a trait cannot be implemented outside of this mod
     pub trait Sealed {}

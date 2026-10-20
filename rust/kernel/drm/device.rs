@@ -300,6 +300,26 @@ impl<T: drm::Driver, C: DeviceContext> Device<T, C> {
         self.dev.get()
     }
 
+    /// Reports that device execution is unavailable and the recovery method is unknown.
+    ///
+    /// May sleep: call in task context outside fence signalling and driver locks.
+    /// A registration guard keeps the parent bound throughout event delivery; a device
+    /// still being probed or already unplugged cannot deliver the event.
+    pub fn report_wedged(&self) -> Result {
+        // SAFETY: Every device context satisfies the weaker Normal context invariants.
+        let normal = unsafe { self.assume_ctx::<Normal>() };
+        let _registration = normal.registration_guard().ok_or(ENODEV)?;
+        let raw = self.as_raw();
+        // SAFETY: The referenced device and its registered primary node remain live under
+        // the registration guard. A probe failure has already been rejected above.
+        if unsafe { (*raw).primary.is_null() } {
+            return Err(ENODEV);
+        }
+        // SAFETY: The device/node are live, 0 asks DRM to report an unknown recovery method,
+        // and a NULL task means no userspace task is attributed as guilty.
+        crate::error::to_result(unsafe { bindings::drm_dev_wedged_event(raw, 0, ptr::null_mut()) })
+    }
+
     /// # Safety
     ///
     /// `ptr` must be a valid pointer to a `struct device` embedded in `Self`.
