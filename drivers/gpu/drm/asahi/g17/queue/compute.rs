@@ -780,9 +780,7 @@ impl Queue {
                     .skip(1)
                     .find_map(|a| a.observed.map(|o| o.timestamps[1]));
                 let stamp = self.graph.stamp()?;
-                let record_aged = front
-                    .observed_at
-                    .is_some_and(|at| now_ns().saturating_sub(at) >= retirement::STAMP_GRACE_NS);
+                let record_aged = retirement::record_aged(front.observed_at, now_ns());
                 let timestamps = retirement::poll(
                     &ticket,
                     front.observed,
