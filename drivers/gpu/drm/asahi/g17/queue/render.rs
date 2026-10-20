@@ -173,6 +173,10 @@ pub(crate) struct Pair {
 }
 impl Pair {
     #[inline(never)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The packet constructor spells out the paired render firmware inputs."
+    )]
     pub(crate) fn new(
         alloc: &Allocator<'_>,
         pool: &Arc<Pool>,
@@ -1084,62 +1088,60 @@ impl Pair {
         let qos = self.qos_owners();
         let pool = self.free_list.id();
         let buffer = self.buffer_id();
-        loop {
-            let Some(front) = self.active.front_mut() else {
-                return Ok(false);
-            };
-            if !front.outer_published {
-                return Ok(false);
-            }
-            if !Arc::ptr_eq(&front.packet.context, &self.memory.context)
-                || !self.memory.owns(front.ticket.ordinal)
-            {
+        let Some(front) = self.active.front_mut() else {
+            return Ok(false);
+        };
+        if !front.outer_published {
+            return Ok(false);
+        }
+        if !Arc::ptr_eq(&front.packet.context, &self.memory.context)
+            || !self.memory.owns(front.ticket.ordinal)
+        {
+            return Err(EIO);
+        }
+        let mut observer = Observer {
+            memory: &self.memory,
+            qids,
+            host,
+        };
+        let result = if let Some(observed) = observed {
+            if observed.ticket != front.ticket {
                 return Err(EIO);
             }
-            let mut observer = Observer {
-                memory: &self.memory,
-                qids,
-                host,
-            };
-            let result = if let Some(observed) = observed {
-                if observed.ticket != front.ticket {
-                    return Err(EIO);
-                }
-                retirement::poll_observed(&mut front.ticket, &mut observer, observed.snapshot)
-            } else {
-                retirement::poll(&mut front.ticket, &mut observer)
-            };
-            let timestamps = match result {
-                Ok(retirement::Poll::Complete(timestamps)) => timestamps,
-                Ok(retirement::Poll::Pending) => return self.replay_abandoned(host, defer),
-                Ok(retirement::Poll::Retry) => return Ok(false),
-                Err(error) => {
-                    self.quarantine(error, defer)?;
-                    return Ok(false);
-                }
-            };
-            let ordinal = front.ticket.ordinal;
-            let context_update = front.context_update;
-            self.note_retirement(ordinal, context_update);
-            let front = self.active.front_mut().ok_or(EIO)?;
-            if !front.flist_completed {
-                host.complete_render(
-                    (!front.qos_completed).then_some(qos),
-                    pool,
-                    front.generation,
-                    buffer,
-                )?;
-                front.qos_completed = true;
-                front.flist_completed = true;
+            retirement::poll_observed(&mut front.ticket, &mut observer, observed.snapshot)
+        } else {
+            retirement::poll(&mut front.ticket, &mut observer)
+        };
+        let timestamps = match result {
+            Ok(retirement::Poll::Complete(timestamps)) => timestamps,
+            Ok(retirement::Poll::Pending) => return self.replay_abandoned(host, defer),
+            Ok(retirement::Poll::Retry) => return Ok(false),
+            Err(error) => {
+                self.quarantine(error, defer)?;
+                return Ok(false);
             }
-            defer(Deferred::Retired(
-                front.packet.completion.clone(),
-                Ok(timestamps),
-            ))?;
-            self.memory.retire(ordinal)?;
-            self.active.pop().ok_or(EIO)?;
-            return Ok(true);
+        };
+        let ordinal = front.ticket.ordinal;
+        let context_update = front.context_update;
+        self.note_retirement(ordinal, context_update);
+        let front = self.active.front_mut().ok_or(EIO)?;
+        if !front.flist_completed {
+            host.complete_render(
+                (!front.qos_completed).then_some(qos),
+                pool,
+                front.generation,
+                buffer,
+            )?;
+            front.qos_completed = true;
+            front.flist_completed = true;
         }
+        defer(Deferred::Retired(
+            front.packet.completion.clone(),
+            Ok(timestamps),
+        ))?;
+        self.memory.retire(ordinal)?;
+        self.active.pop().ok_or(EIO)?;
+        Ok(true)
     }
 
     /// The front group was retired and unlinked by firmware without executing
@@ -1621,6 +1623,10 @@ impl Pair {
         self.owner = None;
     }
     #[inline(never)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Binding keeps the render owners and first packet explicit."
+    )]
     pub(crate) fn prepare_bind(
         &mut self,
         alloc: &Allocator<'_>,

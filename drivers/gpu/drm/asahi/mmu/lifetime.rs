@@ -618,8 +618,8 @@ impl Vm {
         let mut failure = None;
         loop {
             let close = state.close_ranges.take();
-            let unmaps = core::mem::replace(&mut state.unmaps, KVec::new());
-            let objects = core::mem::replace(&mut state.objects, KVec::new());
+            let unmaps = core::mem::take(&mut state.unmaps);
+            let objects = core::mem::take(&mut state.objects);
             drop(state);
             if let Some((user, kernel)) = close {
                 if let Err(error) = self.unmap_user_ranges_now(user, kernel) {

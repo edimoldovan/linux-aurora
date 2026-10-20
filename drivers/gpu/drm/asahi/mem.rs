@@ -83,7 +83,7 @@ pub(crate) fn tlbi_range(asid: Asid, va: usize, len: usize) {
     let end_pg = (va + len + mmu::UAT_PGMSK) >> mmu::UAT_PGBIT;
 
     const BADDR_MASK: u64 = (1 << 37) - 1;
-    let mut val: u64 = ((asid as u64) << 48) | (2 << 46) | (start_pg as u64 & BADDR_MASK);
+    let mut val: u64 = (u64::from(asid) << 48) | (2 << 46) | (start_pg as u64 & BADDR_MASK);
     let pages = end_pg - start_pg;
 
     // Guess? It's possible that the page count is in terms of 4K pages
@@ -185,7 +185,7 @@ pub(crate) fn tlbi_range_or_asid(asid: Asid, va: usize, len: usize) {
     };
     let num = ((len - 1) >> unit_shift) as u64;
 
-    let val = ((asid as u64) << 48)
+    let val = (u64::from(asid) << 48)
         | (TLBI_TG_16K << 46)
         | (scale << 44)
         | (num << 39)

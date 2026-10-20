@@ -611,7 +611,7 @@ impl RegisterWindow {
         let start = self.va & !mask;
         let span = self
             .va
-            .checked_add(self.size as u64)?
+            .checked_add(u64::from(self.size))?
             .checked_sub(start)?
             .checked_add(mask)?
             & !mask;

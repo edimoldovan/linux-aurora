@@ -357,12 +357,12 @@ impl Geometry {
         ) {
             return Err(EINVAL);
         }
-        let width = pass.width as u64;
-        let height = pass.height as u64;
+        let width = u64::from(pass.width);
+        let height = u64::from(pass.height);
         let tiles_x = width.div_ceil(TILE_SIZE);
         let tiles_y = height.div_ceil(TILE_SIZE);
-        let utiles_x = TILE_SIZE / pass.utile_width as u64;
-        let utiles_y = TILE_SIZE / pass.utile_height as u64;
+        let utiles_x = TILE_SIZE / u64::from(pass.utile_width);
+        let utiles_y = TILE_SIZE / u64::from(pass.utile_height);
         let utiles = utiles_x * utiles_y;
         let mtile_x = tiles_x.div_ceil(MACRO_TILES).next_multiple_of(4);
         let mtile_y = tiles_y.div_ceil(MACRO_TILES).next_multiple_of(4);
@@ -411,7 +411,7 @@ impl PassWords {
         // The tile configuration carries the empty-tile request for every
         // target; the tiling layer mode only for layered ones.
         let mut tile_config = TILE_CONFIG_BASE;
-        let mut layer_mode = LAYER_MODE_BASE | (pass.layers as u64 - 1);
+        let mut layer_mode = LAYER_MODE_BASE | (u64::from(pass.layers) - 1);
         if layered {
             tile_config |= TILE_CONFIG_LAYERED;
             layer_mode |= LAYER_MODE_LAYERED;
@@ -441,19 +441,19 @@ impl PassWords {
         }
         let rsrc_spec = |spec: u64| match pass.rsrc_spec_hi {
             true => spec,
-            false => spec & u32::MAX as u64,
+            false => spec & u64::from(u32::MAX),
         };
-        let usc = |offset: u32| offset_va(pass.usc_base, (offset & !USC_OFFSET_TAG_MASK) as u64);
+        let usc = |offset: u32| offset_va(pass.usc_base, u64::from(offset & !USC_OFFSET_TAG_MASK));
 
         Ok(Self {
-            utile_config: (pass.utile_width as u64 / 16) << UTILE_CONFIG_WIDTH_SHIFT
-                | (pass.utile_height as u64 / 16) << UTILE_CONFIG_HEIGHT_SHIFT
-                | pass.samples_log2 as u64,
+            utile_config: (u64::from(pass.utile_width) / 16) << UTILE_CONFIG_WIDTH_SHIFT
+                | (u64::from(pass.utile_height) / 16) << UTILE_CONFIG_HEIGHT_SHIFT
+                | u64::from(pass.samples_log2),
             tile_config,
             layer_mode,
-            tib_blocks: (pass.sample_size as u64
-                * pass.utile_width as u64
-                * pass.utile_height as u64
+            tib_blocks: (u64::from(pass.sample_size)
+                * u64::from(pass.utile_width)
+                * u64::from(pass.utile_height)
                 * samples)
                 .div_ceil(TIB_BLOCK_SIZE),
             partial_zls_control,
@@ -491,9 +491,9 @@ fn ta_registers(
     let layermeta = user_offset(r.layermeta_va)?;
     let heapmeta = user_offset(r.heapmeta_va)? | 1 << 63;
     let tpc = user_offset(r.tpc_va)?;
-    let deflake = user_offset32(r.deflake_va)? as u64;
-    let deflake_20 = user_offset32(offset_va(r.deflake_va, DEFLAKE_20)?)? as u64;
-    let deflake_2a0 = user_offset32(offset_va(r.deflake_va, DEFLAKE_2A0)?)? as u64;
+    let deflake = u64::from(user_offset32(r.deflake_va)?);
+    let deflake_20 = u64::from(user_offset32(offset_va(r.deflake_va, DEFLAKE_20)?)?);
+    let deflake_2a0 = u64::from(user_offset32(offset_va(r.deflake_va, DEFLAKE_2A0)?)?);
     let vdm = user_offset(p.vdm_va)?;
     if vdm >= VDM_OFFSET_LIMIT {
         return Err(EINVAL);
@@ -561,7 +561,7 @@ fn ta_registers(
         RegisterWrite::new(0x0d471, rt.scratch.tail_word()),
         RegisterWrite::new(0x1a0f1, rt.scratch.stack_word()),
         RegisterWrite::new(0x10799, rt.scratch.window_word()),
-        RegisterWrite::new(0x1c830, r.pb_slot as u64),
+        RegisterWrite::new(0x1c830, u64::from(r.pb_slot)),
         RegisterWrite::new(0x1ca30, r.pm_scratch),
         RegisterWrite::new(0x16c39, r.pm_scratch),
         RegisterWrite::new(0x1c910, r.pm_metric),
@@ -573,7 +573,7 @@ fn ta_registers(
         RegisterWrite::new(0x10209, key),
         RegisterWrite::new(0x1c9f0, key),
         RegisterWrite::new(0x14320, key),
-        RegisterWrite::new(0x14308, r.free_list_slot as u64),
+        RegisterWrite::new(0x14308, u64::from(r.free_list_slot)),
         RegisterWrite::new(0x14318, r.ta_status_va | 1),
         RegisterWrite::new(0x01740, 1),
         RegisterWrite::new(0x1c880, deflake_2a0),
@@ -609,8 +609,8 @@ fn fragment_registers(
         RegisterWrite::new(0x15381, w.eot_va),
         RegisterWrite::new(0x15369, w.bg_rsrc_spec),
         RegisterWrite::new(0x15371, w.bg_va),
-        RegisterWrite::new(0x15131, p.merge_upper_x as u64),
-        RegisterWrite::new(0x15139, p.merge_upper_y as u64),
+        RegisterWrite::new(0x15131, u64::from(p.merge_upper_x)),
+        RegisterWrite::new(0x15139, u64::from(p.merge_upper_y)),
         RegisterWrite::new(0x100a1, 0),
         RegisterWrite::new(0x15069, 0),
         RegisterWrite::new(0x15071, 0),
@@ -625,15 +625,15 @@ fn fragment_registers(
         RegisterWrite::new(0x15109, p.scissor_va),
         RegisterWrite::new(0x15101, p.depth_bias_va),
         RegisterWrite::new(0x15021, w.aux_fb_flags),
-        RegisterWrite::new(0x15211, (p.height as u64) << 32 | p.width as u64),
+        RegisterWrite::new(0x15211, u64::from(p.height) << 32 | u64::from(p.width)),
         RegisterWrite::new(0x15049, UNK_15049),
         RegisterWrite::new(0x10051, w.tib_blocks),
         RegisterWrite::new(0x15321, p.depth_dimensions),
-        RegisterWrite::new(0x15301, p.depth_clear as u64),
-        RegisterWrite::new(0x15309, (p.stencil_clear | STENCIL_CLEAR_BASE) as u64),
+        RegisterWrite::new(0x15301, u64::from(p.depth_clear)),
+        RegisterWrite::new(0x15309, u64::from(p.stencil_clear | STENCIL_CLEAR_BASE)),
         RegisterWrite::new(0x15311, p.occlusion_query_va),
         RegisterWrite::new(0x15319, p.zls_control),
-        RegisterWrite::new(0x15349, ZLS_SWIZZLE as u64),
+        RegisterWrite::new(0x15349, u64::from(ZLS_SWIZZLE)),
         RegisterWrite::new(0x15351, 0),
         RegisterWrite::new(0x15329, p.depth.va),
         RegisterWrite::new(0x15331, p.depth.va),
@@ -682,11 +682,11 @@ fn fragment_registers(
         RegisterWrite::new(0x160e0, ids),
         RegisterWrite::new(0x01499, ids),
         RegisterWrite::new(0x0a341, ids),
-        RegisterWrite::new(0x1c838, r.pb_slot as u64),
+        RegisterWrite::new(0x1c838, u64::from(r.pb_slot)),
         RegisterWrite::new(0x1ca28, r.pm_scratch),
         RegisterWrite::new(0x10211, key),
         RegisterWrite::new(0x10420, key),
-        RegisterWrite::new(0x14048, r.free_list_slot as u64),
+        RegisterWrite::new(0x14048, u64::from(r.free_list_slot)),
         RegisterWrite::new(0x14080, r.fragment_status_va | 1),
         RegisterWrite::new(0x01731, 1),
         RegisterWrite::new(0x16020, 1),
@@ -716,7 +716,7 @@ fn partial_store_registers(
         RegisterWrite::new(0x15221, 0),
         RegisterWrite::new(0x15229, 0),
         RegisterWrite::new(0x15319, w.partial_zls_control),
-        RegisterWrite::new(0x15349, ZLS_SWIZZLE as u64),
+        RegisterWrite::new(0x15349, u64::from(ZLS_SWIZZLE)),
     ]
 }
 
@@ -742,13 +742,13 @@ fn partial_resume_registers(
         RegisterWrite::new(0x15439, p.stencil.compression_stride),
         RegisterWrite::new(0x15221, 0),
         RegisterWrite::new(0x15229, 0),
-        RegisterWrite::new(0x15309, (p.stencil_clear | STENCIL_CLEAR_BASE) as u64),
+        RegisterWrite::new(0x15309, u64::from(p.stencil_clear | STENCIL_CLEAR_BASE)),
         RegisterWrite::new(0x15329, p.depth.va),
         RegisterWrite::new(0x153c1, p.depth.compression_va),
         RegisterWrite::new(0x15339, p.stencil.va),
         RegisterWrite::new(0x153d1, p.stencil.compression_va),
         RegisterWrite::new(0x15319, w.partial_zls_control),
-        RegisterWrite::new(0x15349, ZLS_SWIZZLE as u64),
+        RegisterWrite::new(0x15349, u64::from(ZLS_SWIZZLE)),
     ]
 }
 
@@ -760,13 +760,13 @@ fn partial_load_registers(
         RegisterWrite::new(0x15369, w.partial_bg_rsrc_spec),
         RegisterWrite::new(0x15371, w.partial_bg_va),
         RegisterWrite::new(0x10039, w.tile_config & !TILE_CONFIG_PROCESS_EMPTY_TILES),
-        RegisterWrite::new(0x15309, (p.stencil_clear | STENCIL_CLEAR_BASE) as u64),
+        RegisterWrite::new(0x15309, u64::from(p.stencil_clear | STENCIL_CLEAR_BASE)),
         RegisterWrite::new(0x15329, p.depth.va),
         RegisterWrite::new(0x153c1, p.depth.compression_va),
         RegisterWrite::new(0x15339, p.stencil.va),
         RegisterWrite::new(0x153d1, p.stencil.compression_va),
         RegisterWrite::new(0x15319, w.partial_zls_control),
-        RegisterWrite::new(0x15349, ZLS_SWIZZLE as u64),
+        RegisterWrite::new(0x15349, u64::from(ZLS_SWIZZLE)),
     ]
 }
 
@@ -969,7 +969,7 @@ impl TaDescriptor {
         pass_seq: u8,
         fragment_busy: bool,
     ) {
-        self.fragment_busy = fragment_busy as u32;
+        self.fragment_busy = u32::from(fragment_busy);
         self.fragment_kick = fragment.get();
         self.pass_seq = [pass_seq; 2];
         self.completion = ta.completion_value(pass_seq);
@@ -1289,7 +1289,7 @@ impl FragmentSlot {
         desc.aux_stamp_va = args.fragment.aux_stamp_va;
         desc.stamp_value = args.stamp_value();
         desc.qid = args.fragment.qid.into();
-        desc.first_kick = (args.ordinal == 0) as u32;
+        desc.first_kick = u32::from(args.ordinal == 0);
         desc.current_id = resources.fragment_ids.current.into();
         desc.ordinal = args.ordinal as u32;
         desc.timestamp_start_va = resources.timestamp_va;

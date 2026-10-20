@@ -365,6 +365,10 @@ pub(super) struct Memory {
 }
 impl Memory {
     #[inline(never)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Render memory construction keeps each allocation and firmware input explicit."
+    )]
     pub(super) fn new(
         alloc: &Allocator<'_>,
         pool: &Arc<Pool>,

@@ -201,7 +201,7 @@ impl Packet {
     }
     pub(crate) fn set_early_result(&self, result: Result) {
         self.early.store(
-            result.map_or_else(|error| error.to_errno(), |_| 1),
+            result.map_or_else(|error| error.to_errno(), |()| 1),
             Ordering::Release,
         );
     }

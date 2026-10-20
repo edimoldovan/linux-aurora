@@ -25,13 +25,13 @@ struct Service<'a> {
 
 impl event::Transport for Service<'_> {
     fn trace(&mut self, role: Role) {
-        let firmware = &mut self.firmware;
+        let firmware = &mut *self.firmware;
         firmware
             .rings
             .drain_trace(&firmware.primary.state.shared.dev, &firmware.init, role);
     }
     fn statistics(&mut self, role: Role) {
-        let firmware = &mut self.firmware;
+        let firmware = &mut *self.firmware;
         firmware
             .rings
             .drain_statistics(&firmware.primary.state.shared.dev, &firmware.init, role);

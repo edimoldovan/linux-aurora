@@ -31,6 +31,10 @@ pub(crate) const FIELDS:[Field;COUNT]=[
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub(crate) enum Space {Firmware,ClientGpu}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "Spell out both caching and read/write permissions in firmware access profiles."
+)]
 pub(crate) enum Access {GpuFirmwareCachedRw,GpuFirmwareUncachedRw,FirmwareUncachedRw,GpuCachedRw,GpuUncachedRw}
 impl Access {
     /// Exact original PTE attributes, applied in the allocation's own space.

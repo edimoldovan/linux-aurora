@@ -350,7 +350,7 @@ impl AsahiPlatformDriver {
 
 impl Drop for AsahiPlatformDriverData<'_> {
     fn drop(&mut self) {
-        // SAFETY: `self.raw_dev` was set in `probe` from the platform
+        // `self.raw_dev` was set in `probe` from the platform
         // device's `as_raw()`, valid for the lifetime of the bound driver.
         if !self.raw_dev.is_null() {
             crate::sysfs_exports::unregister(self.raw_dev, self.raw_stats);

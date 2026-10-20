@@ -40,7 +40,7 @@ impl RenderState {
                 entry.published
                     && u32::from(entry.reservation.buffer.0) == request.buffer_slot
                     && entry.context.as_ref().is_some_and(|context| {
-                        request.vm_slot == -1 || request.vm_slot as u32 == u32::from(context.id())
+                        request.vm_slot == -1 || request.vm_slot as u32 == context.id()
                     })
             })
         })

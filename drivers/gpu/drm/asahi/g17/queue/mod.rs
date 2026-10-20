@@ -94,6 +94,8 @@ pub(crate) struct Queue<B: Backend> {
     _slot: admission::QueueSlot,
 }
 
+type ValidatedBatch = (KVec<(Validated, Order, Destinations)>, KVec<mmu::VmJobGuard>);
+
 impl<B: Backend> Queue<B> {
     pub(crate) fn new(
         dev: &AsahiDrmDevice,
@@ -156,6 +158,10 @@ impl<B: Backend> Queue<B> {
         });
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Enqueue keeps validated command, ordering, and destination owners explicit."
+    )]
     fn enqueue(
         &mut self,
         id: u64,
@@ -307,7 +313,7 @@ impl<B: Backend> Queue<B> {
         &mut self,
         bytes: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
-    ) -> Result<(KVec<(Validated, Order, Destinations)>, KVec<mmu::VmJobGuard>)> {
+    ) -> Result<ValidatedBatch> {
         let parse_guard = self.context.vm().retain_first_job()?;
         let mut parser = Parser::new(bytes);
         // All historical ordinals use the same entry counters; publication

@@ -251,6 +251,8 @@ pub(crate) struct VmShrinker {
 // SAFETY: shrinker core serializes registration lifetime; callback VM operations
 // use its residency/reservation locks. raw is never dereferenced after free.
 unsafe impl Send for VmShrinker {}
+// SAFETY: Shared callbacks use the VM's residency/reservation locks. The
+// registration remains live until shrinker_free has drained all callbacks.
 unsafe impl Sync for VmShrinker {}
 
 impl VmShrinker {
@@ -273,7 +275,7 @@ impl VmShrinker {
         unsafe {
             (*raw).count_objects = Some(Self::count);
             (*raw).scan_objects = Some(Self::scan);
-            (*raw).private_data = (&*owner as *const Self).cast_mut().cast();
+            (*raw).private_data = core::ptr::from_ref(&*owner).cast_mut().cast();
             (*raw).seeks = 2;
             (*raw).batch = 256;
             kernel::bindings::shrinker_register(raw);
@@ -281,23 +283,36 @@ impl VmShrinker {
         Ok(owner)
     }
 
+    /// Count reclaimable pages.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be this owner's live registered shrinker. The core must
+    /// retain its private data until the callback returns.
     unsafe extern "C" fn count(
         raw: *mut kernel::bindings::shrinker,
         _sc: *mut kernel::bindings::shrink_control,
     ) -> kernel::ffi::c_ulong {
         // SAFETY: The registration owns this stable allocation until callbacks drain.
         let owner = unsafe { &*((*raw).private_data as *const Self) };
-        owner.vm.idle_reclaim_count() as _
+        owner.vm.idle_reclaim_count()
     }
 
+    /// Reclaim idle pages.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be this owner's live registered shrinker, and `sc` must
+    /// point to the initialized control supplied by the shrinker core.
     unsafe extern "C" fn scan(
         raw: *mut kernel::bindings::shrinker,
         sc: *mut kernel::bindings::shrink_control,
     ) -> kernel::ffi::c_ulong {
         // SAFETY: Both pointers are supplied by the registered shrinker core.
         let owner = unsafe { &*((*raw).private_data as *const Self) };
-        let target = unsafe { (*sc).nr_to_scan } as usize;
-        owner.vm.reclaim_idle_pages(target) as _
+        // SAFETY: The shrinker core supplies a live initialized control.
+        let target = unsafe { (*sc).nr_to_scan };
+        owner.vm.reclaim_idle_pages(target)
     }
 }
 
@@ -348,7 +363,7 @@ impl Vm {
         if self
             .status
             .as_ref()
-            .map_or(true, |status| status.get() != 0)
+            .is_none_or(|status| status.get() != 0)
         {
             return 0;
         }
@@ -391,7 +406,7 @@ impl Vm {
         if self
             .status
             .as_ref()
-            .map_or(true, |status| status.get() != 0)
+            .is_none_or(|status| status.get() != 0)
         {
             return 0;
         }
@@ -476,7 +491,7 @@ impl Vm {
         if self
             .status
             .as_ref()
-            .map_or(true, |status| status.get() != 0)
+            .is_none_or(|status| status.get() != 0)
             || !self
                 .lifetime
                 .as_ref()

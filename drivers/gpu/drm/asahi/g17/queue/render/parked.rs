@@ -101,6 +101,10 @@ impl ParkedPair {
     }
 
     #[inline(never)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preparation forwards the render binding inputs without changing their ownership."
+    )]
     pub(crate) fn prepare(
         &self,
         alloc: &Allocator<'_>,

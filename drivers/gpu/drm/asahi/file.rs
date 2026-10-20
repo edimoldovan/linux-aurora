@@ -259,7 +259,7 @@ impl drm::file::DriverFile for File {
             let mem = memacct::Client::new()?;
 
             mod_dev_dbg!(device, "[File {}]: DRM device opened\n", id);
-            Ok(KBox::pin_init(File::new(id, user_range, mem), GFP_KERNEL)?)
+            KBox::pin_init(File::new(id, user_range, mem), GFP_KERNEL)
         })
     }
 
@@ -363,7 +363,7 @@ impl File {
                 let limits = gpu.queue_limits().ok_or(EINVAL)?;
                 let words = [limits.max_queues, limits.max_in_flight_per_queue, 0, 0];
                 UserSlice::new(
-                    UserPtr::from_addr(data.pointer as _),
+                    UserPtr::from_addr(data.pointer as usize),
                     core::mem::size_of_val(&words),
                 )
                 .writer()
@@ -400,11 +400,12 @@ impl File {
         gpu.get_params(&mut params)?;
 
         if gpu.supports_vm_status() {
-            params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS as u64
-                | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS_MIRROR as u64;
+            params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS)
+                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS_MIRROR);
         }
         if gpu.queue_limits().is_some() {
-            params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES as u64;
+            params.features |=
+                u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES);
         }
 
         if module_parameters::fault_control.value() == 0xb {
@@ -415,7 +416,7 @@ impl File {
 
         // SAFETY: We only write to this userptr once, so there are no TOCTOU issues.
         let mut params_writer =
-            UserSlice::new(UserPtr::from_addr(data.pointer as _), size).writer();
+            UserSlice::new(UserPtr::from_addr(data.pointer as usize), size).writer();
 
         // SAFETY: `size` is at most the sizeof of `params`
         params_writer.write_slice(unsafe {
@@ -431,7 +432,7 @@ impl File {
         if data.pad != 0 || data.size < size as u64 {
             return Err(EINVAL);
         }
-        let user = UserPtr::from_addr(data.pointer as _);
+        let user = UserPtr::from_addr(data.pointer as usize);
         let [vm_id, flags, _, pad] = UserSlice::new(user, size).reader().read::<[u32; 4]>()?;
         if flags != 0 || pad != 0 {
             return Err(EINVAL);
@@ -450,7 +451,7 @@ impl File {
             return Err(EINVAL);
         }
         let [vm_id, handle, offset, flags] =
-            UserSlice::new(UserPtr::from_addr(data.pointer as _), size)
+            UserSlice::new(UserPtr::from_addr(data.pointer as usize), size)
                 .reader()
                 .read::<[u32; 4]>()?;
         if flags != 0 || handle == 0 || offset % core::mem::align_of::<i32>() as u32 != 0 {
@@ -747,7 +748,7 @@ impl File {
         let size = usize::try_from(data.stride)?
             .checked_mul(usize::try_from(data.num_binds)?)
             .ok_or(EOVERFLOW)?;
-        let reader = UserSlice::new(UserPtr::from_addr(data.userptr as _), size).reader();
+        let reader = UserSlice::new(UserPtr::from_addr(data.userptr as usize), size).reader();
         reader.read_all(&mut vec, GFP_KERNEL)?;
         let mut reader = Reader::new(&vec);
 
@@ -765,7 +766,7 @@ impl File {
         let stride = usize::try_from(data.stride)?;
         let size = stride.checked_mul(count).ok_or(EOVERFLOW)?;
         let mut bytes = KVec::new();
-        UserSlice::new(UserPtr::from_addr(data.userptr as _), size)
+        UserSlice::new(UserPtr::from_addr(data.userptr as usize), size)
             .reader()
             .read_all(&mut bytes, GFP_KERNEL)?;
         let (vm, user_range, kernel_range) = {
@@ -1311,7 +1312,7 @@ impl File {
         let mut vec = KVec::new();
         let copy_commands = |bytes: &mut KVec<u8>| {
             UserSlice::new(
-                UserPtr::from_addr(data.cmdbuf as _),
+                UserPtr::from_addr(data.cmdbuf as usize),
                 data.cmdbuf_size as usize,
             )
             .reader()
@@ -1388,7 +1389,7 @@ impl File {
 
         // TODO: Do this on device-init for perf.
         let gpu = &reg_data.gpu;
-        let frequency_hz = gpu.base_clock_hz() as u64;
+        let frequency_hz = u64::from(gpu.base_clock_hz());
         let ts_gcd = gcd(frequency_hz, NSEC_PER_SEC as u64);
 
         let num = (NSEC_PER_SEC as u64) / ts_gcd;

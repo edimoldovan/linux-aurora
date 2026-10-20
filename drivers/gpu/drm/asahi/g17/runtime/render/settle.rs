@@ -33,7 +33,7 @@ impl Backend {
             kernel::bindings::dma_fence_wait_timeout(
                 fence.raw(),
                 false,
-                kernel::time::msecs_to_jiffies(2000) as _,
+                kernel::time::msecs_to_jiffies(2000) as isize,
             )
         };
         if completed > 0 {

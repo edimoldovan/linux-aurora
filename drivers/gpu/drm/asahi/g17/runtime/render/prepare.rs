@@ -44,6 +44,10 @@ impl BuildResources {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Keep preparation allocation-free; boxing adds a fallible allocation to submission."
+)]
 enum Build {
     Fresh(Reservation, u64, MetricsLease),
     Parked {
@@ -238,9 +242,9 @@ impl super::super::Backend {
         let built = (|| -> Result<KBox<Pair>> {
             let free_list =
                 self.context
-                    .render_pool(&alloc, &resources.ids, &resources.global)?;
+                    .render_pool(alloc, &resources.ids, &resources.global)?;
             Pair::new(
-                &alloc,
+                alloc,
                 &resources.objects,
                 reservation.ids,
                 slot,
@@ -277,7 +281,7 @@ impl super::super::Backend {
             built
                 .as_mut()
                 .ok_or(EIO)?
-                .finish_install(&alloc, firmware.init.pb_descriptor_table()?)?;
+                .finish_install(alloc, firmware.init.pb_descriptor_table()?)?;
             firmware.queues.install_render(reservation, &mut built)
         })();
         // Fresh backing disappears before its temporary PB reference returns.
@@ -316,9 +320,9 @@ impl super::super::Backend {
         let built = (|| -> Result<_> {
             let free_list =
                 self.context
-                    .render_pool(&alloc, &resources.ids, &resources.global)?;
+                    .render_pool(alloc, &resources.ids, &resources.global)?;
             let prepared = parked.prepare(
-                &alloc,
+                alloc,
                 &resources.objects,
                 self.owner,
                 self.context.clone(),
@@ -360,7 +364,7 @@ impl super::super::Backend {
                 firmware.queues.buffers.can_release(buffer.0)?;
                 prepared.as_mut().ok_or(EIO)?.finish_install(
                     &parked,
-                    &alloc,
+                    alloc,
                     firmware.init.pb_descriptor_table()?,
                 )?;
                 let pair = parked.commit(&mut prepared, storage)?;
@@ -429,9 +433,9 @@ impl super::super::Backend {
         let prepared = (|| {
             let free_list =
                 self.context
-                    .render_pool(&alloc, &resources.ids, &resources.global)?;
+                    .render_pool(alloc, &resources.ids, &resources.global)?;
             pair.prepare_bind(
-                &alloc,
+                alloc,
                 &resources.objects,
                 self.owner,
                 self.context.clone(),
@@ -475,7 +479,7 @@ impl super::super::Backend {
                 )?;
                 pair.bind_owner(
                     prepared.as_mut().ok_or(EIO)?,
-                    &alloc,
+                    alloc,
                     firmware.init.pb_descriptor_table()?,
                 )?;
                 if let Some((id, _)) = buffer {

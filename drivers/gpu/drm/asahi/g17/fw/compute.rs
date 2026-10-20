@@ -67,10 +67,10 @@ impl ScratchRequest {
     /// guard; the per-register words are the native formulas, so they are
     /// checked here against Apple's own values before they reach hardware.
     pub(crate) fn new(layout: u64) -> Result<Self> {
-        let depth = layout & u16::MAX as u64;
-        let cliques = (layout >> 24) & u8::MAX as u64;
-        let user = (layout >> 32) & u16::MAX as u64;
-        let driver = (layout >> 48) & u16::MAX as u64;
+        let depth = layout & u64::from(u16::MAX);
+        let cliques = (layout >> 24) & u64::from(u8::MAX);
+        let user = (layout >> 32) & u64::from(u16::MAX);
+        let driver = (layout >> 48) & u64::from(u16::MAX);
         if user == 0 && driver == 0 {
             return Ok(Self {
                 pages: 0,
@@ -347,7 +347,7 @@ fn compute_registers(args: &ComputeArgs) -> Result<[RegisterWrite; COMPUTE_REGIS
         RegisterWrite::new(0x0a351, ids),
         RegisterWrite::new(0x10201, key),
         RegisterWrite::new(0x10428, key),
-        RegisterWrite::new(0x14028, args.free_list_slot as u64),
+        RegisterWrite::new(0x14028, u64::from(args.free_list_slot)),
         RegisterWrite::new(0x14070, args.usage_va | 1),
         RegisterWrite::new(0x10229, offset_va(operand, OPERAND_STATE_10229)?),
         RegisterWrite::new(0x140a8, offset_va(operand, OPERAND_STATE_140A8)?),

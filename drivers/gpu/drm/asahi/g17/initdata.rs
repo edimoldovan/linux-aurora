@@ -121,7 +121,7 @@ impl WorkPublication<'_> {
         // fully initialized padding-free ABI value, and the device mutex owns publication.
         unsafe {
             core::ptr::copy_nonoverlapping(
-                self.record as *const _ as *const u8,
+                core::ptr::from_ref(self.record).cast::<u8>(),
                 self.destination,
                 core::mem::size_of_val(self.record),
             );
@@ -363,7 +363,7 @@ impl InitData {
             .initialize::<[u64; low::RENDER_RUN_LIST_SIZE / 8]>(0, |runs| {
                 for (index, run) in runs.iter_mut().take(COMPUTE_BLOCKS_POPULATED).enumerate() {
                     *run = (low::compute_block(index) & COMPUTE_RUN_ADDRESS_MASK)
-                        | ((abi::FREE_LIST_BLOCK_PAGES as u64) << 52);
+                        | (u64::from(abi::FREE_LIST_BLOCK_PAGES) << 52);
                 }
                 Ok(())
             })?;
@@ -939,12 +939,12 @@ impl InitData {
             low_va: 0,
             high_va: 0,
         }; 2];
-        for slot in 0..2 {
+        for (slot, completion_ring) in completion_rings.iter_mut().enumerate() {
             let offset = high::BUNDLE + abi::bundle::COMPLETION_RINGS[slot] as u64;
             let ring = self.add(env.fixed(offset, abi::COMPLETION_RING_SIZE, FP, WB)?)?;
             self.completion_rings[slot] = ring;
             self.alias(ring, env.lower, low::COMPLETION_RINGS[slot], GS)?;
-            completion_rings[slot] = abi::CompletionRing {
+            *completion_ring = abi::CompletionRing {
                 low_va: low::COMPLETION_RINGS[slot],
                 high_va: env.base + offset,
             };

@@ -114,6 +114,8 @@ pub(crate) struct Policy {
     lowered_count: u32,
 }
 
+type SampleResult = Result<(i32, i64, u32), Source>;
+
 impl Policy {
     /// A policy with the runtime cap at `safe`, never above `ceiling` (at least `safe`), and
     /// `hot` in millidegrees Celsius.
@@ -183,7 +185,7 @@ impl Policy {
         &mut self,
         now: i64,
         reading: Reading,
-    ) -> (Result<(i32, i64, u32), Source>, Option<Change>) {
+    ) -> (SampleResult, Option<Change>) {
         let usable = self.usable(now, reading);
         if !self.adjust {
             return (usable, None);

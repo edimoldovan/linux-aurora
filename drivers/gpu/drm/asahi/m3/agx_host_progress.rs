@@ -26,7 +26,7 @@ impl Progress {
         let old = self.activity_epoch.load(Ordering::Relaxed);
         if (old & 1 != 0) != pending {
             // Exhaustion remains permanently busy, never wraps back to idle.
-            self.activity_epoch.store(old.checked_add(1).unwrap_or(u64::MAX), Ordering::Release);
+            self.activity_epoch.store(old.saturating_add(1), Ordering::Release);
             if pending {
                 // Order the new marker before device queue publication. While
                 // already pending there is no new idle-to-busy state to order.

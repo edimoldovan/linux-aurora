@@ -116,7 +116,7 @@ impl<'a> Lane<'a> {
         if !self.config_present {
             return;
         }
-        let source = (&self.config as *const QueueConfig).cast::<u64>();
+        let source = core::ptr::from_ref(&self.config).cast::<u64>();
         for index in 0..size_of::<QueueConfig>() / 8 {
             // SAFETY: QueueConfig is packed integer storage with no padding;
             // every source qword is read unaligned. The destination is a

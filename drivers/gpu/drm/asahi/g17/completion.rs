@@ -190,6 +190,10 @@ pub(crate) struct Completion {
 }
 
 impl Completion {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Completion construction takes distinct queue, context, and lifetime owners."
+    )]
     pub(crate) fn new(
         dev: &AsahiDrmDevice,
         contexts: &FenceContexts,

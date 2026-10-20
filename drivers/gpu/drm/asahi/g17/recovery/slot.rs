@@ -31,7 +31,7 @@ pub(super) fn key(slot: usize) -> Result<u64> {
         bindings::memremap(
             physical - offset as u64,
             mmu::UAT_PGSZ,
-            bindings::MEMREMAP_WB as _,
+            bindings::MEMREMAP_WB as usize,
         )
     };
     let mapping = Mapping(NonNull::new(raw).ok_or(ENOMEM)?);

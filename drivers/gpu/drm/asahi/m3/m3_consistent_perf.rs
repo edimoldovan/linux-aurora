@@ -22,7 +22,11 @@ pub(crate) fn refresh_due(desired: u32, previous: u32, since_check_ns: Option<i6
 
 /// Write a packed word with byte accesses, clearing it before raising it so
 /// intermediate values never exceed either the old or new complete request.
-/// The caller owns the four-byte span and publishes after these stores.
+///
+/// # Safety
+///
+/// The caller must retain four writable bytes for these accesses, serialize
+/// host writes, and publish the request after these stores.
 pub(crate) unsafe fn store_packed(ptr: *mut u8, value: u32) {
     for i in (0..4).rev() {
         // SAFETY: caller supplies four writable bytes retained for this access.

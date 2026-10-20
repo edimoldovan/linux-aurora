@@ -91,6 +91,10 @@ pub(crate) fn note_stampless(qid: u8, kick: u64) {
 /// ownership still requires a separate retirement witness before mappings can be released.
 /// The command is complete when its stamp covers it, or when its exact completion record has
 /// been present for [`STAMP_GRACE_NS`] (`record_aged`); in both cases its items must be consumed.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Retirement validates the ticket against independent firmware observations."
+)]
 pub(crate) fn poll(
     ticket: &Ticket,
     observed: Option<Observation>,
@@ -208,7 +212,8 @@ impl Batch {
         if descriptor == 0 || record.read(7)? == 0 {
             return Ok(());
         }
-        let kick = (((control >> 8) & 0xffff_ffff_00) | ((control >> 48) & 0xff)) & 0xff_ffff_ffff;
+        let kick =
+            (((control >> 8) & 0x00ff_ffff_ff00) | ((control >> 48) & 0xff)) & 0xff_ffff_ffff;
         let requests = self.requests.get_mut(start..start + count).ok_or(EIO)?;
         let Some(request) = requests
             .iter_mut()

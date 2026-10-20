@@ -271,12 +271,12 @@ impl QueueRecord {
             job_list_va: args.job_list_va,
             unk_18: [0; 0xc],
             unk_24: u32::MAX,
-            priority: [args.policy.priority() as u32; 2],
+            priority: [u32::from(args.policy.priority()); 2],
             unk_30: [0; 6],
             unk_36: u16::MAX,
             unk_38: 0,
             unk_3c: 0,
-            policy: args.policy.policy() as u32,
+            policy: u32::from(args.policy.policy()),
             unk_44: u32::MAX,
             owner_pid: args.owner_pid,
             unk_4c: [0; 0x50],
@@ -307,12 +307,12 @@ impl QueueRecord {
     /// Replaces the priority and policy words of an idle queue's record when they differ
     /// from `policy`.
     pub(crate) fn set_policy(&mut self, policy: Policy) {
-        let priority = [policy.priority() as u32; 2];
+        let priority = [u32::from(policy.priority()); 2];
         if { self.priority } != priority {
             self.priority = priority;
         }
-        if { self.policy } != policy.policy() as u32 {
-            self.policy = policy.policy() as u32;
+        if { self.policy } != u32::from(policy.policy()) {
+            self.policy = u32::from(policy.policy());
         }
     }
 }
@@ -480,7 +480,7 @@ impl QueueConfig {
                     binding.pb_va,
                     binding.pb_token,
                     binding.pb_slot,
-                    binding.fragment_qid as u32,
+                    u32::from(binding.fragment_qid),
                 )
             }
             QueueConfigTarget::Fragment => (DataMaster::Fragment, 0, u64::MAX, u32::MAX, u32::MAX),
@@ -491,14 +491,14 @@ impl QueueConfig {
             unk_04: 0,
             kick_ring_va: args.kick_ring_va,
             kick_ring_fw_va: args.kick_ring_fw_va,
-            qid: args.qid as u16,
-            install: args.install as u16,
+            qid: u16::from(args.qid),
+            install: u16::from(args.install),
             unk_1c: 0,
-            priority: args.policy.priority() as u16,
+            priority: u16::from(args.policy.priority()),
             unk_20: 0,
             data_master: data_master as u16,
             unk_24: 0,
-            completion_seed_valid: args.completion_seed.is_some() as u32,
+            completion_seed_valid: u32::from(args.completion_seed.is_some()),
             completion_seed: args.completion_seed.unwrap_or(0),
             context_id: args.context_id,
             unk_34: 0,
@@ -506,13 +506,13 @@ impl QueueConfig {
             free_list_generation: args.free_list.generation,
             free_list_slot: args.free_list.slot,
             scheduler_va: args.scheduler_va,
-            qos_update: args.qos_update as u32,
-            qos_slot: args.qos_slot as u16,
+            qos_update: u32::from(args.qos_update),
+            qos_slot: u16::from(args.qos_slot),
             unk_58: 0,
             owner_pid: args.owner_pid,
             policy: args.policy.policy(),
             unk_60: 0,
-            context_update: args.context_update as u16,
+            context_update: u16::from(args.context_update),
             unk_64: 0,
             unk_66: Self::UNK_66,
             unk_68: [0; 6],
@@ -564,7 +564,7 @@ impl KickAnnounce {
         }
         Ok(Self {
             tag: CommandTag::KickAnnounce as u32,
-            qid: qid as u16,
+            qid: u16::from(qid),
             count: 1,
             priority,
             timestamp: timestamp.get(),
@@ -603,7 +603,7 @@ impl KickPredecessor {
         }
         Ok(Self {
             tag: CommandTag::KickPredecessor as u32,
-            qid: qid as u16,
+            qid: u16::from(qid),
             previous: previous.get(),
             unk_0e: Self::UNK_0E,
         })

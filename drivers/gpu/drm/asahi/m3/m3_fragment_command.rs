@@ -86,7 +86,7 @@ impl Command {
         let user=super::agx_render_state::compact(self.scene_user.get().checked_add(0x40).ok_or(Error::Address)?)
             .map_err(|_|Error::Address)? & !15;
         let width=(g.pixels&0xffff)+1;let height=(g.pixels>>16)+1;
-        let tx=(width+31)/32;let ty=(height+31)/32;
+        let tx=width.div_ceil(32);let ty=height.div_ceil(32);
         let native_tiles=221201|(u64::from(g.layers>1)<<32)|(u64::from(tx-1)<<44)
             |(u64::from(ty-1)<<53)|137438953472|((g.utile_config&61440)<<28);
         let values:[(u32,u64);REGISTER_COUNT]=[

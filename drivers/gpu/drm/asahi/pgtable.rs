@@ -481,10 +481,7 @@ impl UatPageTable {
         parent: Option<(PhysicalAddr, usize)>,
     ) -> Result {
         let owned = if let Some(tables) = self.driver_tables.as_ref() {
-            match tables.iter().position(|&table| table == phys) {
-                Some(_) => true,
-                None => false,
-            }
+            tables.contains(&phys)
         } else {
             true
         };
@@ -498,6 +495,9 @@ impl UatPageTable {
             // that may still be reachable.
             let page = unsafe { Page::borrow_phys(&parent_phys) }.ok_or(EIO)?;
             page.with_pointer_into_page(parent_index * PTE_SIZE, PTE_SIZE, |p| {
+                // SAFETY: The live page-table page contains aligned u64 PTEs.
+                // with_pointer_into_page bounds this access to one PTE, and
+                // the parent remains allocated throughout the traversal.
                 let pte = unsafe { &*(p as *const AtomicU64) };
                 let current = pte.load(Ordering::Acquire);
                 let expected = phys & self.oas_mask & (!UAT_PGMSK as u64);

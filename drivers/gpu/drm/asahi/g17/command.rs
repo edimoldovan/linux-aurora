@@ -121,7 +121,7 @@ impl<'a> Parser<'a> {
             let bytes = self.bytes.get(start..end).ok_or(EINVAL)?;
             self.bytes = &self.bytes[end..];
             let barriers = [header.vdm_barrier, header.cdm_barrier];
-            match header.cmd_type as u32 {
+            match u32::from(header.cmd_type) {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER
                 | uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => {
                     if barriers.iter().zip(self.counts).any(|(&barrier, count)| {
@@ -131,7 +131,7 @@ impl<'a> Parser<'a> {
                     {
                         return Err(EINVAL);
                     }
-                    let payload = if header.cmd_type as u32
+                    let payload = if u32::from(header.cmd_type)
                         == uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER
                     {
                         self.counts[0] += 1;
@@ -238,7 +238,7 @@ impl UscWindow {
         }
         require_range(
             space,
-            self.base + (tagged_offset & !7) as u64,
+            self.base + u64::from(tagged_offset & !7),
             4,
             Access::Read,
         )

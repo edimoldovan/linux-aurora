@@ -121,7 +121,7 @@ pub(crate) fn read_identity(
                 return Err(ENODEV);
             }
             // SAFETY: the property is exactly four bytes, checked above.
-            let bytes = unsafe { core::slice::from_raw_parts(value as *const u8, 4) };
+            let bytes = unsafe { core::slice::from_raw_parts(value.cast::<u8>(), 4) };
             Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
         }
     }

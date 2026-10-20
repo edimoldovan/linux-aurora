@@ -44,7 +44,7 @@ impl FirmwareVa {
 /// Insert a barrier ahead of the last unpublished command: overwrite that
 /// command's ring slot, move the command to the producer slot, then advance.
 pub(crate) fn insert_before_last(head:u16, capacity:u32)->Result<([u16;2],u16),Error> {
-    if capacity<2 || capacity>u16::MAX as u32 || u32::from(head)>=capacity {
+    if capacity<2 || capacity>u32::from(u16::MAX) || u32::from(head)>=capacity {
         return Err(Error::Index);
     }
     let previous=(u32::from(head)+capacity-1)%capacity;
