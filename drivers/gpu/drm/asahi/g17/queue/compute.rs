@@ -626,6 +626,19 @@ impl Queue {
         !self.quarantined && self.retire_pending
     }
 
+    /// A release has no completion event: keep observing the control consumer
+    /// until its witness lets the idle physical queue be re-armed.
+    pub(crate) fn pool_release_pending(&self) -> bool {
+        matches!(self.pool_phase, PoolPhase::ReleaseSent(_))
+    }
+
+    /// An exited owner's finished command waits only for its completion stamp,
+    /// which `retirement::STAMP_FALLBACK_NS` bounds. Polling retires it without
+    /// a new GPU event, after which the queue can be reused.
+    pub(crate) fn release_settling(&self) -> bool {
+        self.owner.is_none() && self.released && self.retirement_polling()
+    }
+
     fn selected(&self, masks: Option<[u64; 2]>) -> bool {
         self.retired_by_teardown
             || self.retire_pending
