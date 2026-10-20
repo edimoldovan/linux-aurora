@@ -290,7 +290,14 @@ impl<T: DriverObject> Object<T> {
             return Err(EINVAL);
         }
 
-        self.acquire_sgt_access()?;
+        // Release and purge set the reclaim bit only while they hold this object's reservation.
+        // Wait for that holder instead of failing a concurrent bind with a transient EBUSY.
+        while let Err(e) = self.acquire_sgt_access() {
+            if e != EBUSY {
+                return Err(e);
+            }
+            drop(DmaResvGuard::new(self));
+        }
         // Every failure after incrementing the count drops this lease.
         let lease = SGLease { obj: self.into() };
 
