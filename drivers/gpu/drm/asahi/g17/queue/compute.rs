@@ -453,6 +453,14 @@ pub(crate) enum PoolPhase {
     Vacant,
 }
 
+/// Builder ownership of one physical release transaction. The preparation
+/// lease pins this registry until abort/commit; owner close may remove lookups.
+#[derive(Clone, Copy)]
+pub(crate) struct Growth {
+    qid: u8,
+    phase: PoolPhase,
+}
+
 pub(crate) struct Queue {
     owner: Option<u64>,
     /// Scheduler/work pages of an exited last owner whose context was dropped;
@@ -1325,11 +1333,7 @@ impl Queue {
     /// Only a capacity increase waits for this queue's previously published work.
     /// Other queues and ordinary submissions keep their existing concurrency.
     pub(crate) fn begin_growth(&mut self, init: &crate::g17::initdata::InitData, blocks: usize) -> Result<bool> {
-        if self.growing {
-            if blocks < self.growth_blocks { return Err(EAGAIN); }
-            self.growth_blocks = blocks;
-            return Ok(false);
-        }
+        if self.growing { return Err(EAGAIN); }
         if self.quarantined || self.released || self.exit.is_some()
             || self.active.len != 0 || self.replays.len != 0 || self.previous.is_some()
             || (self.installed && !self.retirement_ready)
@@ -1355,16 +1359,34 @@ impl Queue {
                 return Err(EAGAIN);
             }
         }
+        if alias.is_none() { return Err(EINVAL); }
+        let fresh = pages.as_ref().ok_or(EINVAL)?;
         let binding = self.binding.as_mut().ok_or(EFAULT)?;
-        let old_alias = binding.pool_alias.take();
-        let old_pages = self.pool.take_pages();
-        self.pool.rearm(pages.take().ok_or(EINVAL)?)?;
-        init.initialize_compute_pool_blocks(self.pool.id(), self.pool.page_list_va()?, blocks)?;
-        binding.pool_alias = alias.take();
+        // No ownership moves before every fallible descriptor/header operation.
+        // The old release is consumed; no queue can use this row until commit.
+        init.initialize_compute_pool_blocks(self.pool.id(), fresh.page_list_va(), blocks)?;
+        self.pool.replace_pages(pages)?;
+        let old_alias = core::mem::replace(&mut binding.pool_alias, alias.take());
         self.pool_phase = PoolPhase::Populated;
         self.growing = false;
         self.growth_blocks = 0;
-        Ok(Vacated { _alias: old_alias, _pages: old_pages, _descriptors: None, _ring: None })
+        Ok(Vacated { _alias: old_alias, _pages: pages.take(), _descriptors: None, _ring: None })
+    }
+
+    pub(crate) fn growth_token(&self) -> Option<Growth> {
+        self.growing.then_some(Growth { qid: self.qid(), phase: self.pool_phase })
+    }
+
+    /// Transfer an abandoned builder's release back to the event worker. Do not
+    /// revoke the published release or free backing here: vacancy still requires
+    /// its exact control-consumer witness. A different transaction is untouched.
+    pub(crate) fn abort_growth(&mut self, token: Growth) -> Result<Option<bool>> {
+        if !self.growing || self.qid() != token.qid || self.pool_phase != token.phase {
+            return Ok(None);
+        }
+        self.growing = false;
+        self.growth_blocks = 0;
+        self.release_owner().map(Some)
     }
 
     /// Exact host identity remains valid even when several commands share an ioctl ID.

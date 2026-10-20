@@ -184,3 +184,22 @@ impl Drop for Lease {
         }
     }
 }
+
+#[kunit_tests(asahi_g17_growth_gate)]
+mod growth_gate_tests {
+    use super::*;
+    #[test]
+    fn recovery_can_join_between_growth_admissions() {
+        let gate = Gate::new().unwrap();
+        let outer = gate.try_enter().unwrap();
+        // The growth handoff must drop this lease before enter can wait.
+        drop(outer);
+        gate.close();
+        assert!(matches!(gate.try_enter(), Err(error) if error == EAGAIN));
+        gate.wait_drained();
+        assert!(gate.reopen());
+        let growth = gate.enter(false).unwrap();
+        assert!(growth.is_current());
+        drop(growth);
+    }
+}

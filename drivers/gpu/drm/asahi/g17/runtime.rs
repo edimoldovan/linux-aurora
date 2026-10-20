@@ -265,6 +265,7 @@ impl Registry {
             .flatten()
             .filter_map(|entry| entry.queue.as_deref_mut())
         {
+            if !deferred.vacated_room() { break; }
             if let Some(vacated) = queue.observe_vacancy(consumer, producer)? {
                 deferred.defer_vacated(vacated);
                 freed += 1;
@@ -583,7 +584,8 @@ impl Backend {
         let mut alias = Some(pages.as_ref().ok_or(EIO)?.map_client(self.context.vm())?);
         let mut deferred = DeferredBatch::publication()?;
         let started = now_ns();
-        loop {
+        let mut growth = None;
+        let result = (|| loop {
             let result = (|| {
                 let mut state = self.shared.state.lock();
                 let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
@@ -592,9 +594,15 @@ impl Backend {
                 firmware.scan_compute(None, &mut deferred)?;
                 let queue = firmware.queues.compute_mut(self.owner).ok_or(EIO)?;
                 if queue.pool_fits(required) { return Ok(None); }
-                if queue.begin_growth(&firmware.init, required)? {
-                    fence(Ordering::SeqCst);
-                    firmware.primary.notify(crate::g17::MSG_CONTROL_NOTIFY)?;
+                if growth.is_none() {
+                    let notify = queue.begin_growth(&firmware.init, required)?;
+                    // Capture physical identity before any following fallible
+                    // operation. Close can remove the owner-keyed lookup.
+                    growth = queue.growth_token();
+                    if notify {
+                        fence(Ordering::SeqCst);
+                        firmware.primary.notify(crate::g17::MSG_CONTROL_NOTIFY)?;
+                    }
                 }
                 queue.finish_growth(&firmware.init, &mut pages, &mut alias, required).map(Some)
             })();
@@ -608,7 +616,31 @@ impl Backend {
                     }
                 Err(error) => return Err(error),
             }
+        })();
+        if result.is_err() {
+            if let Some(token) = growth {
+                let mut retired = None;
+                let mut state = self.shared.state.lock();
+                if let Some(firmware) = state.as_deref_mut() {
+                    for index in 0..firmware.queues.compute.len() {
+                        let Some(entry) = firmware.queues.compute[index].as_mut() else { continue; };
+                        let Some(queue) = entry.queue.as_deref_mut() else { continue; };
+                        if queue.abort_growth(token)? == Some(true) {
+                            // Only an uninstalled graph can return true. Cancel
+                            // its unpublished QID, then destroy it off-lock.
+                            firmware.queues.qids.cancel_unpublished(entry.reservation.id)?;
+                            retired = entry.queue.take();
+                            firmware.queues.compute[index] = None;
+                            break;
+                        }
+                    }
+                }
+                drop(state);
+                drop(retired);
+                self.shared.queue_events();
+            }
         }
+        result
     }
 
     fn build_compute(&self, required: usize) -> Result {
@@ -638,7 +670,7 @@ impl Backend {
                 }
                 match firmware.queues.rebind_compute(self.owner, &self.context, required)? {
                     Rebind::Done => return Ok(()),
-                    Rebind::Grow => { drop(state); return self.grow_compute(required); }
+                    Rebind::Grow => { drop(state); drop(lease); return self.grow_compute(required); }
                     Rebind::Rearm(qid) => (firmware.uat.clone(), Err(qid)),
                     Rebind::Fresh => {
                         let reservation = match firmware.queues.reserve_compute(self.owner) {
@@ -821,6 +853,9 @@ impl DeferredBatch {
         if let Err(release) = self.tvb.push_within_capacity(release) {
             drop(release);
         }
+    }
+    pub(super) fn vacated_room(&self) -> bool {
+        self.vacated.len() < self.vacated.capacity()
     }
     pub(super) fn defer_vacated(&mut self, vacated: super::queue::compute::Vacated) {
         if let Err(vacated) = self.vacated.push_within_capacity(vacated) {

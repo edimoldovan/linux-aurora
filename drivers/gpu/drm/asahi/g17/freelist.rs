@@ -103,7 +103,7 @@ impl Pages {
     pub(crate) fn map_client(&self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
         self.backing.map_alias(vm, self.page_list_va(), mmu::PROT_GPU_SHARED_RW)
     }
-    fn page_list_va(&self) -> u64 {
+    pub(crate) fn page_list_va(&self) -> u64 {
         self.backing.gpu_va()
     }
     fn run_list_va(&self) -> u64 {
@@ -525,6 +525,18 @@ impl ComputePool {
         if self.pages.is_some() {
             return Err(EBUSY);
         }
+        self.write_pages(&pages)?;
+        self.pages = Some(pages);
+        Ok(())
+    }
+    /// Preserve both sets of pages on failure. The caller owns the consumed
+    /// release and returns old pages for destruction outside the device mutex.
+    pub(crate) fn replace_pages(&mut self, pages: &mut Option<Pages>) -> Result {
+        self.write_pages(pages.as_ref().ok_or(EINVAL)?)?;
+        core::mem::swap(&mut self.pages, pages);
+        Ok(())
+    }
+    fn write_pages(&self, pages: &Pages) -> Result {
         let completed = self.control.pointer(FreeListControl::COMPLETED, 8)?;
         let mut bytes = [0; 8];
         for (index, byte) in bytes.iter_mut().enumerate() {
@@ -543,9 +555,9 @@ impl ComputePool {
         header.unk_54[..8].copy_from_slice(&bytes);
         self.control.write(0, header)?;
         fence(Ordering::SeqCst);
-        self.pages = Some(pages);
         Ok(())
     }
+
     pub(crate) fn map_client(&mut self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
         let pages = self.pages.as_mut().ok_or(EAGAIN)?;
         let address = pages.page_list_va();
