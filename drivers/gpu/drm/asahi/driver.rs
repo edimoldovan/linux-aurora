@@ -49,6 +49,8 @@ pub(crate) struct AsahiPlatformDriverData<'bound> {
     _reg: drm::Registration<'bound, AsahiDrmDriver>,
     /// The G17 GPU, whose coprocessors must be stopped when the driver is unbound.
     g17: Option<Arc<g17::Gpu>>,
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    pub(crate) g16: Option<Arc<crate::g16::Gpu>>,
     /// Raw `struct device *` of the platform device. Stored once at probe
     /// time so the `Drop` impl can find the sysfs file on unregister.
     raw_dev: *mut bindings::device,
@@ -294,6 +296,8 @@ impl platform::Driver for AsahiPlatformDriver {
             _device: reg.device().into(),
             _reg: reg,
             g17: None,
+            #[cfg(CONFIG_DRM_ASAHI_G16)]
+            g16: None,
             raw_dev,
             raw_stats,
             stats,
@@ -341,6 +345,41 @@ impl AsahiPlatformDriver {
             _device: reg.device().into(),
             _reg: reg,
             g17: Some(gpu),
+            #[cfg(CONFIG_DRM_ASAHI_G16)]
+            g16: None,
+            raw_dev,
+            raw_stats,
+            stats: None,
+        })
+    }
+}
+
+#[cfg(CONFIG_DRM_ASAHI_G16)]
+impl AsahiPlatformDriver {
+    pub(crate) fn probe_g16<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+        cfg: &'static crate::g16::Config,
+    ) -> Result<AsahiPlatformDriverData<'bound>> {
+        // SAFETY: the qualified UAT output width constrains this device's DMA.
+        unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
+        let resources = regs::Resources::new(pdev)?;
+        let res = regs::G16Resources::new(pdev)?;
+        let drm = drm::UnregisteredDevice::<AsahiDrmDriver>::new(pdev, Ok(()))?;
+        let gpu = crate::g16::Gpu::new(pdev, &drm, cfg, res)?;
+        let data_gpu = gpu.clone() as Arc<dyn gpu::Gpu>;
+        let data = try_pin_init!(AsahiDrmRegistrationData {
+            gpu: data_gpu,
+            resources,
+        });
+        // SAFETY: registration is stored in bound platform data and never forgotten.
+        let reg = unsafe { drm::Registration::new(pdev.as_ref(), drm, data, 0)? };
+        let raw_dev = pdev.as_ref().as_raw();
+        let raw_stats = crate::sysfs_exports::register(raw_dev, core::ptr::null(), false)?;
+        Ok(AsahiPlatformDriverData {
+            _device: reg.device().into(),
+            _reg: reg,
+            g17: None,
+            g16: Some(gpu),
             raw_dev,
             raw_stats,
             stats: None,

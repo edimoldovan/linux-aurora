@@ -15,6 +15,8 @@ mod float;
 mod fw;
 mod gem;
 mod g17;
+#[cfg(CONFIG_DRM_ASAHI_G16)]
+mod g16;
 mod gpu;
 mod hw;
 mod initdata;
@@ -30,6 +32,7 @@ mod regs;
 mod slotalloc;
 mod stats;
 mod sysfs_exports;
+mod timestamp;
 mod util;
 #[cfg(CONFIG_DRM_ASAHI_MAPLE_TREE)]
 mod vm;
@@ -37,9 +40,30 @@ mod workqueue;
 
 use kernel::prelude::*;
 
+#[cfg(CONFIG_DRM_ASAHI_G16)]
+type G16Registration = kernel::driver::Registration<kernel::platform::Adapter<g16::Driver>>;
+#[cfg(not(CONFIG_DRM_ASAHI_G16))]
+type G16Registration = ();
+
+fn register_g16(module: &'static kernel::ThisModule) -> Result<Option<Pin<KBox<G16Registration>>>> {
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    {
+        Ok(Some(KBox::pin_init(
+            kernel::driver::Registration::new(g16::DRIVER_NAME, module),
+            GFP_KERNEL,
+        )?))
+    }
+    #[cfg(not(CONFIG_DRM_ASAHI_G16))]
+    {
+        let _ = module;
+        Ok(None)
+    }
+}
+
 #[pin_data]
 struct DriverModule {
     // Field drop order unregisters/joins driver producers before queue teardown.
+    _g16: Option<Pin<KBox<G16Registration>>>,
     #[pin]
     _driver: kernel::driver::Registration<kernel::platform::Adapter<driver::AsahiPlatformDriver>>,
     _cleanup: cleanup::QueueOwner,
@@ -54,6 +78,7 @@ impl kernel::InPlaceModule for DriverModule {
                 <Self as kernel::ModuleMetadata>::NAME,
                 module,
             ),
+            _g16: register_g16(module)?,
         })
     }
 }
@@ -104,6 +129,30 @@ module! {
         oom_attribution: u8 {
             default: 1,
             description: "Count held GPU memory in its creator's RSS for the OOM killer (1 = on)",
+        },
+        g16_deadline_ms: u32 {
+            default: 5000,
+            description: "G16: administrative completion-stamp deadline, ms (0 disables; long running work can exceed it)",
+        },
+        g16_compute_deadline_ms: u32 {
+            default: 5000,
+            description: "G16: compute completion-stamp deadline, ms (0 permits unbounded compute; firmware recovery stays active)",
+        },
+        g16_repoll_us: u32 {
+            default: 15,
+            description: "G16: repoll interval while publication waits for record consumption, us",
+        },
+        g16_resnap_us: u32 {
+            default: 100,
+            description: "G16: completion repoll interval, us",
+        },
+        g16_recovery: u32 {
+            default: 1,
+            description: "G16: answer qualified firmware recovery handshakes",
+        },
+        g16_stream_gate: u32 {
+            default: 1,
+            description: "G16: validate CDM/VDM stream records",
         },
     },
 }

@@ -1222,19 +1222,19 @@ impl gpu::Gpu for Gpu {
         &self,
         mut bo: gem::ObjectRef,
         range: Range<usize>,
-    ) -> Result<mmu::KernelMapping> {
+    ) -> Result<crate::timestamp::Buffer> {
         let state = self.shared.state.lock();
         let firmware = (*state).as_ref().ok_or(ENODEV)?;
         let mut addresses = firmware.uat.geometry().kernel_range();
         addresses.start += hw::t8140::dynamic::KERNEL_OFFSET;
-        bo.map_range_into_range(
+        crate::timestamp::Buffer::firmware(bo.map_range_into_range(
             firmware.uat.kernel_vm(),
             range,
             addresses,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
             false,
-        )
+        )?)
     }
 }
 

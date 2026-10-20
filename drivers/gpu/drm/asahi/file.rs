@@ -17,6 +17,7 @@ use crate::{
     },
     gem,
     memacct,
+    gpu,
     mmu,
     queue,
     util::{
@@ -44,6 +45,7 @@ use kernel::sync::{
     Mutex, //
 };
 use kernel::time::NSEC_PER_SEC;
+use kernel::types::ScopeGuard;
 use kernel::uaccess::{
     UserPtr,
     UserSlice, //
@@ -69,6 +71,7 @@ struct Vm {
     user_range: Range<u64>,
     kernel_range: Range<u64>,
     _dummy_mapping: mmu::KernelMapping,
+    gpu: Arc<dyn gpu::Gpu>,
 }
 
 impl Drop for Vm {
@@ -90,6 +93,7 @@ impl Drop for Vm {
                 pr_err!("Vm::Drop: deferred user unmap failed: {:?}\n", error);
             }
             self.vm.bo_deferred_cleanup();
+            self.gpu.vm_closed(&self.vm);
             return;
         }
         // When the user Vm is dropped, verify that no user mappings exists.
@@ -219,7 +223,7 @@ impl SyncItem {
 
 #[derive(Clone)]
 pub(crate) enum Object {
-    TimestampBuffer(Arc<mmu::KernelMapping>),
+    TimestampBuffer(Arc<crate::timestamp::Buffer>),
 }
 
 /// State associated with a client.
@@ -254,7 +258,7 @@ impl drm::file::DriverFile for File {
         device.registration_data_with(|reg_data| {
             let gpu = &reg_data.gpu;
             let id = gpu.ids().file.next();
-            let user_range = gpu.uat_geometry().user_usable_range();
+            let user_range = gpu.user_range();
             let mem = memacct::Client::new()?;
 
             mod_dev_dbg!(device, "[File {}]: DRM device opened\n", id);
@@ -410,7 +414,7 @@ impl File {
                 u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES);
         }
 
-        if gpu.supports_soft_faults() {
+        if gpu.soft_faults() && gpu.supports_soft_faults() {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
         }
 
@@ -440,9 +444,12 @@ impl File {
             return Err(EINVAL);
         }
         let status = Self::vm_status(file, vm_id)?;
-        UserSlice::new(user, size)
-            .writer()
-            .write(&[vm_id, 0, status.reported_error() as u32, 0])?;
+        UserSlice::new(user, size).writer().write(&[
+            vm_id,
+            0,
+            status.reported_error() as u32,
+            0,
+        ])?;
         Ok(0)
     }
 
@@ -517,7 +524,22 @@ impl File {
 
         let gpu = &reg_data.gpu;
         let file_id = file.inner().id;
-        let vm = gpu.new_vm(kernel_range.clone())?;
+        let vm = gpu.new_vm_for_file(kernel_range.clone(), file_id)?;
+        // G16 registers a retained backend owner before returning this VM. Any later
+        // allocation can fail before file::Vm exists to run its normal close path.
+        let failed_vm = ScopeGuard::new_with_data(
+            (vm.clone(), user_range.clone(), kernel_range.clone()),
+            |(vm, user_range, kernel_range)| {
+                if gpu.tracked_submission() && vm.status().is_some() && !vm.is_closed() {
+                    vm.close_idle_reclaim();
+                    if let Err(error) = vm.unmap_user_ranges(user_range, kernel_range) {
+                        pr_err!("VM create: closing unpublished VM failed: {:?}\n", error);
+                    }
+                    vm.bo_deferred_cleanup();
+                    gpu.vm_closed(&vm);
+                }
+            },
+        );
 
         let vm_xa = file.inner().vms();
         let resv = vm_xa.lock().reserve_limit(1..=u32::MAX, GFP_KERNEL)?;
@@ -593,10 +615,12 @@ impl File {
                 user_range,
                 kernel_range,
                 _dummy_mapping: dummy_mapping,
+                gpu: gpu.clone(),
             },
             GFP_KERNEL,
         )?)?;
 
+        drop(failed_vm.dismiss());
         data.vm_id = id;
 
         Ok(0)
@@ -620,7 +644,7 @@ impl File {
     /// IOCTL: gem_create: Create a new GEM object.
     pub(crate) fn gem_create(
         device: &AsahiDrmDevice,
-        _reg_data: &driver::AsahiDrmRegistrationData<'_>,
+        reg_data: &driver::AsahiDrmRegistrationData<'_>,
         data: &mut uapi::drm_asahi_gem_create,
         file: &DrmFile,
     ) -> Result<u32> {
@@ -668,11 +692,16 @@ impl File {
         // count. Userspace can evict its BO cache and retry after ENOMEM.
         let pages_no_reclaim = gem::user_pages_no_reclaim(
             size,
-            _reg_data.gpu.as_any().is::<crate::g17::Gpu>(),
+            reg_data.gpu.as_any().is::<crate::g17::Gpu>(),
         );
         let gem = gem::new_object(
             device, size, data.flags, resv_obj, reclaim_cpu, pages_no_reclaim, commit,
         )?;
+        if reg_data.gpu.prepare_new_objects() {
+            let registered = device.registration_guard().ok_or(ENODEV)?;
+            let parent: &kernel::platform::Device<kernel::device::Bound> = registered.as_ref();
+            gem::prepare_new_object(&gem, parent.as_ref())?;
+        }
 
         let handle = gem.create_handle(file)?;
         data.handle = handle;
@@ -749,7 +778,19 @@ impl File {
             return Err(EINVAL);
         }
 
-        if reg_data.gpu.as_any().is::<crate::g17::Gpu>() {
+        if let Some(limit) = reg_data.gpu.bind_batch_limit() {
+            if data.num_binds == 0
+                || data.num_binds > limit
+                || data.userptr == 0
+                || data.stride % 8 != 0
+                || data.stride as usize > kernel::page::PAGE_SIZE
+            {
+                cls_pr_debug!(Errors, "vm_bind: Batch outside the GPU's limits\n");
+                return Err(EINVAL);
+            }
+        }
+
+        if reg_data.gpu.as_any().is::<crate::g17::Gpu>() || reg_data.gpu.tracked_submission() {
             return Self::vm_bind_g17(data, file);
         }
 
@@ -1307,6 +1348,9 @@ impl File {
         }
 
         let gpu = &reg_data.gpu;
+        if data.cmdbuf_size as usize > gpu.max_cmdbuf_size() {
+            return Err(E2BIG);
+        }
         if let Some(manager) = gpu.manager() {
             manager.update_globals();
         }
@@ -1345,7 +1389,7 @@ impl File {
             .reader()
             .read_all(bytes, GFP_KERNEL)
         };
-        let guarded = gpu.as_any().is::<crate::g17::Gpu>();
+        let guarded = gpu.as_any().is::<crate::g17::Gpu>() || gpu.tracked_submission();
         // Once G17 output syncobjs are resolved, its queue must install a fence
         // on every failure. Take the fallible userspace snapshot before that point.
         if guarded {

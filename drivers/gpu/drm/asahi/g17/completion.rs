@@ -28,7 +28,7 @@ pub(crate) use publication::{Prepared as PreparedPublication, Publication};
 
 struct Destination {
     // Keep the existing GPU alias alive along with its prepared CPU view.
-    _mapping: Arc<mmu::KernelMapping>,
+    _mapping: Arc<crate::timestamp::Buffer>,
     cpu: mmu::TimestampMapping,
 }
 

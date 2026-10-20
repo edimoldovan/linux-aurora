@@ -21,8 +21,10 @@ use kernel::{
         }, //
     },
     error::Result,
+    new_mutex,
     prelude::*,
     sync::aref::ARef,
+    sync::Mutex,
     uapi, //
 };
 
@@ -63,6 +65,9 @@ pub(crate) struct AsahiObject {
     kernel_mappings: AtomicU64,
     /// Memory accounting and process attribution of the held backing.
     charge: memacct::Charge,
+    /// Serializes overlapping timestamp writes through every binding of this BO.
+    #[pin]
+    pub(crate) timestamp_lock: Mutex<()>,
 }
 
 /// Type alias for the shmem GEM object type for this driver.
@@ -122,9 +127,7 @@ pub(crate) fn held_sg_table<'a>(
 /// VM-private BOs share their assigned VM's reservation object. Validate this
 /// before acquiring mapping state; generic GPUVM accepts external shareable BOs.
 pub(crate) fn validate_vm_binding(gem: &Object, vm: &mmu::Vm) -> Result {
-    if gem.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0
-        && vm.is_extobj(gem)
-    {
+    if gem.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0 && vm.is_extobj(gem) {
         return Err(EINVAL);
     }
     Ok(())
@@ -238,12 +241,13 @@ pub(crate) fn new_kernel_object_wc(dev: &AsahiDrmDevice, size: usize) -> Result<
 /// backing than requested (or panic with overflow checks). Kernel callers use
 /// the same boundary so malformed calculated sizes cannot bypass this check.
 pub(crate) fn checked_object_size(size: usize) -> Result<usize> {
-    if size == 0 { return Err(EINVAL); }
+    if size == 0 {
+        return Err(EINVAL);
+    }
     size.checked_add(mmu::UAT_PGMSK)
         .map(|rounded| rounded & !mmu::UAT_PGMSK)
         .ok_or(EOVERFLOW)
 }
-
 
 fn new_kernel_object_mapped(dev: &AsahiDrmDevice, size: usize, map_wc: bool) -> Result<ObjectRef> {
     let size = checked_object_size(size)?;
@@ -327,6 +331,7 @@ impl DriverObject for AsahiObject {
             kernel: args.kernel,
             kernel_mappings: AtomicU64::new(0),
             charge: args.charge,
+            timestamp_lock <- new_mutex!((), "Asahi timestamp stores"),
         })
     }
 
@@ -395,9 +400,31 @@ impl Drop for KernelMappingPin {
 }
 
 impl AsahiObject {
+    /// Whether CPU mappings use the cacheable WRITEBACK policy.
+    pub(crate) fn is_writeback(&self) -> bool {
+        self.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_WRITEBACK != 0
+    }
+
     pub(crate) fn idle_reclaim_candidate(&self) -> bool {
         !self.kernel && !self.exportable && self.kernel_mappings.load(Ordering::Acquire) == 0
     }
+}
+
+/// Populates and pins a new user object through its DMA mapping, before any CPU view exists.
+///
+/// On a device that is not DMA-coherent, the DMA mapping cleans the cacheable kernel alias of the
+/// freshly zeroed pages to the point of coherency, so that no dirty line can later overwrite data
+/// written through a write-combined view. The pin keeps reclaim from creating a new cacheable
+/// alias. Only used when the GPU asks for it ([`crate::gpu::Gpu::prepare_new_objects`]).
+///
+pub(crate) fn prepare_new_object(
+    gem: &Object,
+    dev: &kernel::device::Device<kernel::device::Bound>,
+) -> Result {
+    // The native backend requires a non-coherent DMA device. Use its DMA mapping
+    // rather than interpreting DMA addresses as CPU physical addresses.
+    let _sgt = held_sg_table(gem, dev)?;
+    Ok(())
 }
 
 /// Purge advice for a VM-private, non-exportable object. Returns whether the
