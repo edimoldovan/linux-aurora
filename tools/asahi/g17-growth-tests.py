@@ -72,7 +72,7 @@ impl Pool {
  fn id(&self)->u16{1}
  fn release_record(&self,_:u64)->u64{0}
  fn take_pages(&mut self)->Option<Pages>{self.pages.take()}
- fn write_pages(&self,_:&Pages)->Result{if self.fail{Err(EIO)}else{Ok(())}}
+ fn write_pages(&mut self,_:&Pages)->Result{if self.fail{Err(EIO)}else{Ok(())}}
 ''' + replace + r'''
 }
 enum ControlRecord {FreeListRelease(u64)}

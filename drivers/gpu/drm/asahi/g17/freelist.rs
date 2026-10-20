@@ -536,7 +536,7 @@ impl ComputePool {
         core::mem::swap(&mut self.pages, pages);
         Ok(())
     }
-    fn write_pages(&self, pages: &Pages) -> Result {
+    fn write_pages(&mut self, pages: &Pages) -> Result {
         let completed = self.control.pointer(FreeListControl::COMPLETED, 8)?;
         let mut bytes = [0; 8];
         for (index, byte) in bytes.iter_mut().enumerate() {
