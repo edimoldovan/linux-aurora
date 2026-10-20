@@ -157,8 +157,8 @@ impl Ledger {
         let total = (info.totalram as u64).saturating_mul(u64::from(info.mem_unit));
         let limits = limits_for(
             total,
-            *module_parameters::mem_limit_pct.value(),
-            *module_parameters::client_mem_limit_pct.value(),
+            module_parameters::mem_limit_pct.value(),
+            module_parameters::client_mem_limit_pct.value(),
         );
         self.set_limits(limits);
         pr_info!(
@@ -292,7 +292,7 @@ impl Charge {
     /// A user object admitted by `commit`, attributed to `mm` if there is one.
     pub(crate) fn user(commit: Commit, mm: Option<ARef<Mm>>) -> Self {
         let bytes = commit.bytes;
-        let mm = if *module_parameters::oom_attribution.value() != 0 {
+        let mm = if module_parameters::oom_attribution.value() != 0 {
             mm
         } else {
             None
