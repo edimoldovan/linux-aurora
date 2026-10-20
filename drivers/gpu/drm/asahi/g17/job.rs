@@ -242,7 +242,8 @@ pub(crate) trait Backend: Send + Sync {
         None
     }
 
-    /// Lazily create or rebind this logical queue's physical compute graph.
+    /// Validate compute sizing without reserving a physical channel. Queued
+    /// commands may wait on a host signal submitted after this ioctl returns.
     fn ensure_compute(&self, scs_pages: u16) -> Result;
     fn render_scs_blocks(&self, pages: [u16; 2]) -> Result<usize> {
         if pages != [0; 2] { return Err(EINVAL); }

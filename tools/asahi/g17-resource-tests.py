@@ -24,6 +24,11 @@ def admission_tests(root, source):
     limits='\n'.join(re.search(r'const '+name+r': [^;]+;',mmu).group(0) for name in ['EXECUTION_CONTEXT_MASK','MAX_EXECUTION_CONTEXTS'])
     header='''#![allow(dead_code, unused_macros)]
     type Result<T=()> = std::result::Result<T,i32>;
+    mod g17 { pub mod capacity {
+        pub enum Site { RenderSlots, LogicalQueues, ComputeReserve, PhysicalQids }
+        pub fn refused(_: Site) -> i32 { -28 }
+    }}
+
     const ENOSPC:i32=-28; const EIO:i32=-5;
     macro_rules! resource_exhausted { ($s:literal)=>{ENOSPC}; }
     type KVec<T> = Vec<T>; struct InFlight;
@@ -31,6 +36,20 @@ def admission_tests(root, source):
     methods=['const fn new','fn exhausted','fn refusal','fn advance','fn take_idle','fn acquire','fn claim_sibling','fn reassign_unused_spare','fn warmable_sibling','fn borrow_warm_sibling','fn cancel_empty_slot','fn release']
     code=header+item('struct State')+'\nimpl State {\n'+re.search(r'    const MASK: u64 = .*;',s).group(0)+'\n'+'\n'.join(item(n) for n in methods)+'\n}\n'+'''
     fn main(){
+     if cfg::RENDER_PAIRS_PER_OWNER == 1 {
+      let mut state=State::new();
+      let mut slots=Vec::new();
+      for owner in 1..=u64::from(MAX_EXECUTION_CONTEXTS) {
+       let slot=state.acquire(owner).expect("every logical owner must fit");slots.push(slot);
+       assert_eq!(state.owners.iter().filter(|id|**id==owner).count(),1);
+      }
+      for slot in slots {state.release(slot);}
+      let mut state=State::new();let first=state.acquire(1).unwrap();
+      for _ in 1..cfg::RENDER_DEPTH {assert_eq!(state.acquire(1),Some(first));}
+      assert_eq!(state.acquire(1),None);state.release(first);assert_eq!(state.acquire(1),Some(first));
+      println!("shared render admission: all58 owners fit; depth16 waits for exact retirement without consuming a spare");
+      return;
+     }
      let mut state=State::new();
      for owner in 1..=32 {
       assert!(state.refusal(owner).is_ok());
@@ -118,6 +137,12 @@ def queue_tests(root, source):
     constants=re.search(r'const QID_MAX: [^;]+;',fw).group(0)+'\n'+'\n'.join(re.search(r'const '+name+r': [^;]+;',s).group(0) for name in ['QID_COUNT','COMPUTE_RENDER_RESERVE'])
     header='''#![allow(dead_code, unused_macros)]
     type Result<T=()> = std::result::Result<T,i32>;
+    mod g17 { pub mod capacity {
+        pub enum Site { RenderSlots, LogicalQueues, ComputeReserve, PhysicalQids }
+        pub fn refused(_: Site) -> i32 { -28 }
+    }}
+
+    mod mmu { pub const MAX_EXECUTION_CONTEXTS:u32=58; }
     const ENOSPC:i32=-28; const EINVAL:i32=-22; const EOVERFLOW:i32=-75;
     macro_rules! resource_exhausted { ($s:literal)=>{ENOSPC}; }
     #[derive(Clone,Copy,PartialEq,Eq,Debug)] enum DataMaster {Compute,Tiling,Fragment}
@@ -167,8 +192,8 @@ def queue_tests(root, source):
      assert_eq!(q.entries[0].unwrap().id,protected);
      // Replacement must not consume the protected render minimum.
      let mut q=fresh();q.reserve_initial_render().unwrap();
-     for owner in 3..17 {q.reserve(owner,DataMaster::Tiling,None).unwrap();}
-     for owner in 1000..1112 {q.reserve(owner,DataMaster::Compute,None).unwrap();}
+     for owner in 3..=COMPUTE_RENDER_RESERVE as u64 {q.reserve(owner,DataMaster::Tiling,None).unwrap();}
+     for owner in 1000..1000+(QID_COUNT-COMPUTE_RENDER_RESERVE) as u64 {q.reserve(owner,DataMaster::Compute,None).unwrap();}
      assert_eq!(q.leased,QID_COUNT);assert_eq!(q.reserve(2000,DataMaster::Compute,None),Err(ENOSPC));
      assert!(q.initial_render.iter().all(Option::is_some));
      // Ordinary free capacity leaves the initialization reservations untouched.
@@ -218,6 +243,7 @@ def shared_alias_tests(root, source):
 use std::{cell::RefCell,rc::Rc,ops::Range};
 type Result<T> = std::result::Result<T,i32>;type Error=i32;
 const EINVAL:i32=-22;const EOVERFLOW:i32=-75;const ENOSPC:i32=-28;const EIO:i32=-5;
+mod g17 {pub mod capacity {pub enum Site {LowerVa, AliasVa} pub fn refused(_: Site)->i32 {-28}}}
 mod hw {pub mod t8140 {pub mod dynamic {pub const LOWER:std::ops::Range<u64>=0..256;}}}
 mod mmu {pub const UAT_PGSZ:usize=16;pub type Prot=u8;pub type Vm=super::Vm;pub type KernelMapping=super::Mapping;}
 #[derive(Clone,Copy)] enum CpuMap {WriteCombined}

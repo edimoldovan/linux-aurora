@@ -2858,3 +2858,30 @@ impl Drop for Uat {
         mem::sync();
     }
 }
+
+impl Vm {
+    /// Diagnostic reservation occupancy (including guards), not a placement promise.
+    /// Removal can progress between queries; allocations are excluded by the VM lock.
+    pub(crate) fn capacity(&self, range: Range<u64>) -> Result<(u64, u64)> {
+        let inner = lock_vm(&self.gpuvm, None, false)?;
+        let mut next = range.start;
+        let mut used = 0;
+        let mut largest = 0;
+        while next < range.end {
+            let Some(node) = inner.mm.first_overlap(next..range.end)? else {
+                largest = largest.max(range.end - next);
+                break;
+            };
+            largest = largest.max(node.start.saturating_sub(next));
+            let end = node.end.min(range.end);
+            used += end - node.start.max(next);
+            next = end;
+        }
+        Ok((used, largest))
+    }
+}
+impl Uat {
+    pub(crate) fn execution_contexts_used(&self) -> u32 {
+        (self.inner.lock().execution_contexts & EXECUTION_CONTEXT_MASK).count_ones()
+    }
+}

@@ -78,7 +78,17 @@ impl KernelObject {
         let mut this = Self::backing(dev, size, cpu)?;
         let mapping = match placement {
             Placement::At(addr) => this.obj.map_at(vm, addr, prot, false)?,
-            Placement::In(range, align) => this.obj.map_into_range(vm, range, align, prot, true)?,
+            Placement::In(range, align) => {
+                let site = if range.start >= crate::hw::t8140::dynamic::LOWER.start
+                    && range.end <= crate::hw::t8140::dynamic::LOWER.end {
+                    super::capacity::Site::LowerVa
+                } else {
+                    super::capacity::Site::UpperVa
+                };
+                this.obj.map_into_range(vm, range, align, prot, true).map_err(|error| {
+                    if error == ENOSPC { super::capacity::refused(site) } else { error }
+                })?
+            }
         };
         this.mapping = Some(mapping);
         Ok(this)
@@ -113,6 +123,9 @@ impl KernelObject {
         prot: mmu::Prot,
     ) -> Result<mmu::KernelMapping> {
         gem::ObjectRef::new(self.obj.gem.clone()).map_at(vm, addr, prot, false)
+            .map_err(|error| if error == ENOSPC {
+                super::capacity::refused(super::capacity::Site::AliasVa)
+            } else { error })
     }
 
     /// Reuses only a complete alias of this exact retained backing. Permanent
@@ -159,6 +172,9 @@ impl KernelObject {
         prot: mmu::Prot,
     ) -> Result<mmu::KernelMapping> {
         gem::ObjectRef::new(self.obj.gem.clone()).map_into_range(vm, range, align, prot, false)
+            .map_err(|error| if error == ENOSPC {
+                super::capacity::refused(super::capacity::Site::AliasVa)
+            } else { error })
     }
 
     fn alias_in_lowest(
@@ -373,15 +389,17 @@ impl Allocator<'_> {
         loop {
             // Keep ordinary best-fit placement on the uncontended path. A
             // collision starts a lowest-address search over the whole arena.
-            let mapping = if searching {
+            let mapping = (if searching {
                 object.alias_in_lowest(
                     self.uat.kernel_lower_vm(), range.clone(), align, prot, mmu::UAT_PGSZ,
-                )?
+                )
             } else {
                 object.obj.map_into_range(
                     self.uat.kernel_lower_vm(), range.clone(), align, prot, true,
-                )?
-            };
+                )
+            }).map_err(|error| if error == ENOSPC {
+                crate::g17::capacity::refused(crate::g17::capacity::Site::LowerVa)
+            } else { error })?;
             let address = mapping.iova();
             let end = address.checked_add(size as u64).ok_or(EOVERFLOW)?;
             // Partial aliases are destroyed before releasing the canonical
@@ -409,7 +427,9 @@ impl Allocator<'_> {
                     // rather than remapping backing at every intervening page.
                     let candidate = object.alias_in_lowest(
                         aliases[index], start..range.end, align, prot, 0,
-                    )?;
+                    ).map_err(|error| if error == ENOSPC {
+                        crate::g17::capacity::refused(crate::g17::capacity::Site::AliasVa)
+                    } else { error })?;
                     range.start = candidate.iova();
                     drop(candidate);
                     searching = true;
@@ -652,5 +672,18 @@ impl Pool {
             // Mapping teardown must not run while the pool mutex is held.
             drop(entry);
         }
+    }
+}
+
+impl Pool {
+    pub(crate) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        let inner = self.inner.lock();
+        for family in 0..POOL_FAMILIES {
+            let entries = &inner.returned[family * POOL_SLOTS..(family + 1) * POOL_SLOTS];
+            writeln!(f, "cached_objects_{} used={} total={} returned={} poisoned={}", family,
+                     inner.reserved[family], POOL_SLOTS, entries.iter().flatten().count(),
+                     entries.iter().flatten().filter(|entry| entry.poisoned).count())?;
+        }
+        writeln!(f, "cached_object_bytes used={} total={}", inner.bytes, POOL_BYTES)
     }
 }

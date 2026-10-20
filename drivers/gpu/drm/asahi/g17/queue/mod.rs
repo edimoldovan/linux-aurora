@@ -130,7 +130,8 @@ impl<B: Backend> Queue<B> {
     }
 
     fn ensure_compute(&mut self, scs_pages: u16) -> Result {
-        // Admission is checked even when this queue already owns a scheduler.
+        // Validate every request, including an existing scheduler. Physical
+        // admission happens after its DRM dependencies, in backend publication.
         self.backend.ensure_compute(scs_pages)?;
         if self.compute.is_none() {
             self.compute = Some(Scheduler::new(

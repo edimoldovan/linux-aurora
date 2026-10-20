@@ -59,7 +59,7 @@ impl RenderId {
                 }
             }
         }
-        Err(ENOSPC)
+        Err(super::capacity::refused(super::capacity::Site::RenderPoolIds))
     }
 }
 impl Drop for RenderId {
@@ -756,4 +756,31 @@ pub(crate) fn control_consumed(consumer: u32, producer: u32, cursor: u32) -> Res
     let pending = producer.wrapping_sub(consumer) & (slots - 1);
     let ahead = cursor.wrapping_sub(consumer) & (slots - 1);
     Ok(ahead == 0 || ahead > pending)
+}
+
+impl RenderIds {
+    pub(crate) fn used(&self) -> u32 {
+        self.used[0].load(Ordering::Acquire).count_ones()
+            + (self.used[1].load(Ordering::Acquire) & !(1u64 << 63)).count_ones()
+    }
+}
+
+#[kunit_tests(asahi_g17_render_id_capacity)]
+mod capacity_tests {
+    use super::*;
+
+    #[test]
+    fn rejected_pool_construction_returns_all_render_ids() {
+        let ids = Arc::new(RenderIds::new(), GFP_KERNEL).unwrap();
+        for _ in 0..8 {
+            let mut pools = KVec::with_capacity(127, GFP_KERNEL).unwrap();
+            for _ in 0..127 {
+                pools.push(RenderId::new(&ids).unwrap(), GFP_KERNEL).unwrap();
+            }
+            assert_eq!(ids.used(), 127);
+            assert!(matches!(RenderId::new(&ids), Err(ENOSPC)));
+            drop(pools);
+            assert_eq!(ids.used(), 0);
+        }
+    }
 }

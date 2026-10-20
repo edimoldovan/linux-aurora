@@ -311,7 +311,7 @@ impl Registry {
             .any(|(slot, entry)| entry.is_some() && self.admission.owns_slot(owner, slot))
     }
 
-    fn ensure_render_ids(&mut self, slot: u8, owner: u64) -> Result {
+    pub(super) fn ensure_render_ids(&mut self, slot: u8, owner: u64) -> Result {
         if owner == 0 || slot == 0 || usize::from(slot) >= RENDER_SLOTS {
             return Err(EINVAL);
         }
@@ -924,5 +924,58 @@ impl Registry {
         packet.completion.defer_timeout(error);
         entry.pending_timeout = true;
         true
+    }
+}
+
+impl RenderState {
+    pub(super) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        writeln!(f, "retired_render_bindings used={} total={}", self.retired.len(), self.retired.capacity())?;
+        self.pools.write_capacity(f)?;
+        for (slot, entry) in self.entries.iter().enumerate() {
+            if let Some(context) = entry.as_ref().and_then(|entry| entry.context.as_ref()) {
+                context.write_capacity(f, "render", slot)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Registry {
+    /// Give idle private backing to another ready client under capacity pressure.
+    /// Keep graph/QID/context ownership; the next use rearms the same pool after
+    /// its consumed release, exactly as eviction-driven reclaim does.
+    pub(super) fn reclaim_idle_render_pools(
+        &mut self, init: &crate::g17::initdata::InitData, deferred: &mut DeferredBatch,
+    ) -> Result {
+        let render = &mut self.render;
+        render.pools.observe(init)?;
+        for entry in render.entries.iter().flatten() {
+            if !deferred.render_backing_room() { break; }
+            let Some(pool) = entry.pool.as_ref() else { continue; };
+            // None means this pool never acquired a firmware registration;
+            // otherwise require its exact final release to have been consumed.
+            if pool.vacant() || !render.pools.released(u32::from(pool.id()), pool.control_va())
+                || self.admission.owner_active(entry.reservation.owner) { continue; }
+            // A sibling or replacement may be building off-lock before it has
+            // installed its pool reference. Its logical owner also excludes us.
+            let mut idle = true;
+            for other in render.entries.iter().flatten().filter(|other| {
+                other.reservation.owner == entry.reservation.owner
+                    || other.pool.as_ref().is_some_and(|bound| Arc::ptr_eq(bound, pool))
+            }) {
+                if other.constructing || other.growing || other.preparing.is_some()
+                    || other.pending_error.is_some() || other.pending_timeout {
+                    idle = false;
+                    break;
+                }
+                if let Some(pair) = other.pair.as_ref() {
+                    if !pair.idle_for_context(pair.context())? { idle = false; break; }
+                }
+            }
+            if idle {
+                if let Some(backing) = pool.vacate() { deferred.defer_render_backing(backing); }
+            }
+        }
+        Ok(())
     }
 }

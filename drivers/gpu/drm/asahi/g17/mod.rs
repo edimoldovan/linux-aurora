@@ -33,6 +33,7 @@ mod ids;
 pub(crate) mod hazard;
 mod initdata;
 mod job;
+mod capacity;
 mod kick;
 mod object;
 mod power;
@@ -740,12 +741,20 @@ impl Shared {
     }
 
     fn drain_reclaims(self: &Arc<Self>) {
+        let mut reclaimed = false;
         loop {
             let next = self.reclaim.lock().take_one();
             let Some(next) = next else {
                 break;
             };
             next.finish();
+            reclaimed = true;
+        }
+        if reclaimed {
+            // Context release returns its execution root off-lock. The next
+            // device pass can now detach idle compute aliases and their QoS
+            // leases, without depending on a new client's submission/event.
+            self.queue_events();
         }
     }
 
@@ -824,6 +833,7 @@ pub(crate) struct Gpu {
     geometry: mmu::UatGeometry,
     ids: gpu::SequenceIDs,
     shared: Arc<Shared>,
+    _capacity: Pin<KBox<kernel::debugfs::File<capacity::View>>>,
 }
 
 impl Gpu {
@@ -882,6 +892,11 @@ impl Gpu {
             GFP_KERNEL,
         )?;
 
+        let directory = kernel::debugfs::Dir::new(c"asahi-g17");
+        let capacity = KBox::pin_init(
+            directory.read_only_file(c"capacity", capacity::View(shared.clone())),
+            GFP_KERNEL,
+        )?;
         let gpu = Arc::new(
             Gpu {
                 cfg,
@@ -890,6 +905,7 @@ impl Gpu {
                 geometry,
                 ids: Default::default(),
                 shared,
+                _capacity: capacity,
             },
             GFP_KERNEL,
         )?;
@@ -1157,9 +1173,19 @@ impl gpu::Gpu for Gpu {
         let frontend =
             queue::Frontend::new(priority, usc_exec_base, self.geometry.user_usable_range())?;
         let policy = scheduling_policy(priority)?;
+        let admission_started = now_ns();
         let (backend, slot) = loop {
             match runtime::Backend::new(&self.shared, &vm, owner, policy) {
                 Err(error) if error == EAGAIN => continue,
+                Err(error) if error == ENOSPC => {
+                    // Closed logical queues can still own execution/QoS IDs
+                    // until the scheduler release is consumed and reclaimed.
+                    // Backend construction has rolled back all temporary leases.
+                    if now_ns().saturating_sub(admission_started)
+                        >= job::TIMEOUT_MS as u64 * 1_000_000 { return Err(EBUSY); }
+                    self.shared.queue_events();
+                    kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+                }
                 result => break result?,
             }
         };

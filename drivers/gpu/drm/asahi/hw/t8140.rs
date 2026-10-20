@@ -393,7 +393,9 @@ pub(crate) mod scheduling {
 /// Physical workqueue capacity and logical-owner admission limits.
 pub(crate) mod queues {
     pub(crate) const RENDER_SLOTS: usize = 64;
-    pub(crate) const RENDER_PAIRS_PER_OWNER: usize = 2;
+    // One physical pair per logical owner leaves room for every execution
+    // context in the shared 128-QID namespace. Commands queue at RENDER_DEPTH.
+    pub(crate) const RENDER_PAIRS_PER_OWNER: usize = 1;
     pub(crate) const RENDER_DEPTH: u8 = 16;
     pub(crate) const COMPUTE_DEPTH: usize = 16;
 }

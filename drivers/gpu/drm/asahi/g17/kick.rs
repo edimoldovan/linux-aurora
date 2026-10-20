@@ -18,7 +18,15 @@ use crate::{hw::t8140, mem, mmu};
 pub(super) const QID_COUNT: usize = QID_MAX as usize + 1;
 
 /// Minimum render-channel capacity protected from compute-only allocation.
-const COMPUTE_RENDER_RESERVE: usize = 16;
+// Protect one tiling/fragment pair for each logical execution context, plus
+// the two unpublished bootstrap reservations. The remaining ten compute
+// channels are shared after exact retirement, rather than pinned per client.
+const COMPUTE_RENDER_RESERVE: usize = 2 * crate::mmu::MAX_EXECUTION_CONTEXTS as usize + 2;
+pub(super) const COMPUTE_CHANNELS: usize = QID_COUNT - COMPUTE_RENDER_RESERVE;
+const _: () = {
+    assert!(COMPUTE_CHANNELS >= 4);
+    assert!(crate::hw::t8140::queues::RENDER_PAIRS_PER_OWNER == 1);
+};
 
 /// Stable physical-channel identity. The owner must not be reused within a
 /// device lifetime, including after an unpublished allocation is cancelled.
@@ -133,7 +141,7 @@ impl QueueIds {
             if QID_COUNT - self.leased + replacement
                 <= COMPUTE_RENDER_RESERVE.saturating_sub(render - replacement)
             {
-                return Err(ENOSPC);
+                return Err(crate::g17::capacity::refused(crate::g17::capacity::Site::ComputeReserve));
             }
         }
         let index = preferred
@@ -141,7 +149,7 @@ impl QueueIds {
             .filter(|index| self.entries.get(*index).is_some_and(Option::is_none))
             .or_else(|| self.entries.iter().position(Option::is_none))
             .or_else(|| initial.map(|(_, id)| usize::from(id.qid)))
-            .ok_or(ENOSPC)?;
+            .ok_or_else(|| crate::g17::capacity::refused(crate::g17::capacity::Site::PhysicalQids))?;
         let id = Id {
             qid: index as u8,
             owner,
@@ -197,6 +205,82 @@ impl QueueIds {
             }
             _ => Err(EINVAL),
         }
+    }
+}
+
+#[kunit_tests(asahi_g17_qid_accounting)]
+mod accounting_tests {
+    use super::*;
+
+    fn table() -> KBox<QueueIds> {
+        KBox::init(QueueIds::new(), GFP_KERNEL).unwrap()
+    }
+
+    #[test]
+    fn render_identities_satisfy_the_compute_reserve() {
+        let mut ids = table();
+        for owner in 1..=COMPUTE_RENDER_RESERVE as u64 {
+            ids.reserve(owner, DataMaster::Tiling, None).unwrap();
+        }
+        for owner in COMPUTE_RENDER_RESERVE as u64 + 1..=QID_COUNT as u64 {
+            ids.reserve(owner, DataMaster::Compute, None).unwrap();
+        }
+        assert_eq!(ids.leased, QID_COUNT);
+        assert_eq!(ids.reserve(1000, DataMaster::Compute, None), Err(ENOSPC));
+        assert_eq!(ids.leased, QID_COUNT);
+    }
+
+    #[test]
+    fn compute_cannot_consume_the_render_minimum() {
+        let mut ids = table();
+        for owner in 1..=(QID_COUNT - COMPUTE_RENDER_RESERVE) as u64 {
+            ids.reserve(owner, DataMaster::Compute, None).unwrap();
+        }
+        assert_eq!(ids.reserve(1000, DataMaster::Compute, None), Err(ENOSPC));
+        let tiling = ids.reserve(1001, DataMaster::Tiling, None).unwrap();
+        assert_eq!(ids.reserve(1000, DataMaster::Compute, None), Err(ENOSPC));
+        ids.cancel_unpublished(tiling).unwrap();
+        assert_eq!(ids.leased, QID_COUNT - COMPUTE_RENDER_RESERVE);
+    }
+
+    #[test]
+    fn initial_reservations_yield_but_published_ids_do_not() {
+        let mut ids = table();
+        ids.reserve_initial_render().unwrap();
+        for owner in 3..=QID_COUNT as u64 {
+            ids.reserve(owner, DataMaster::Tiling, None).unwrap();
+        }
+        let first = ids.reserve(1000, DataMaster::Compute, None).unwrap();
+        let second = ids.reserve(1001, DataMaster::Compute, None).unwrap();
+        assert_ne!(first.qid(), second.qid());
+        assert!(ids.initial_render.iter().all(Option::is_none));
+        assert_eq!(ids.leased, QID_COUNT);
+        ids.publish(first).unwrap();
+        assert_eq!(ids.cancel_unpublished(first), Err(EINVAL));
+        assert_eq!(ids.leased, QID_COUNT);
+        ids.cancel_unpublished(second).unwrap();
+        assert_eq!(ids.leased, QID_COUNT - 1);
+        assert_eq!(ids.cancel_unpublished(second), Err(EINVAL));
+        assert_eq!(ids.leased, QID_COUNT - 1);
+    }
+
+    #[test]
+    fn failed_second_render_id_returns_only_the_unpublished_first() {
+        let mut ids = table();
+        for owner in 1..QID_COUNT as u64 {
+            let id = ids.reserve(owner, DataMaster::Tiling, None).unwrap();
+            ids.publish(id).unwrap();
+        }
+        let first = ids.reserve(1000, DataMaster::Tiling, None).unwrap();
+        assert_eq!(ids.reserve(1001, DataMaster::Fragment, None), Err(ENOSPC));
+        ids.cancel_unpublished(first).unwrap();
+        assert_eq!(ids.leased, QID_COUNT - 1);
+        let replacement = ids.reserve(1002, DataMaster::Compute, None).unwrap();
+        assert_eq!(replacement.qid(), first.qid());
+        assert_ne!(replacement, first);
+        assert_eq!(ids.reserve(1002, DataMaster::Compute, None), Ok(replacement));
+        assert_eq!(ids.leased, QID_COUNT);
+        assert_eq!(ids.reserve(1002, DataMaster::Fragment, None), Err(EINVAL));
     }
 }
 
@@ -411,5 +495,22 @@ impl Queue {
             entry,
             destination,
         })
+    }
+}
+
+impl QueueIds {
+    pub(crate) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        let mut engines = [0usize; 3];
+        let mut published = 0;
+        for entry in self.entries.iter().flatten() {
+            engines[match entry.id.engine {
+                DataMaster::Tiling => 0,
+                DataMaster::Fragment => 1,
+                DataMaster::Compute => 2,
+            }] += 1;
+            published += usize::from(entry.published);
+        }
+        writeln!(f, "physical_qids used={} total={} published={} tiling={} fragment={} compute={}",
+                 self.leased, QID_COUNT, published, engines[0], engines[1], engines[2])
     }
 }

@@ -22,6 +22,36 @@ impl Backend {
         self.shared.stop_queues();
     }
 
+    fn rollback_unpublished_compute(&self) -> Result {
+        // No outer preparation lease survives compute_packet's return. Hold a
+        // fresh epoch through alias destruction so recovery can join this work.
+        loop {
+        let lease = self.shared.preparations.enter(false)?;
+        let mut retired = None;
+        let mut state = self.shared.state.lock();
+        let firmware = state.as_deref_mut().ok_or(ENODEV)?;
+        if !lease.is_current() { drop(state); drop(lease); continue; }
+        let mut binding = None;
+        if let Some(index) = firmware.queues.compute.iter().position(|entry| {
+            entry.as_ref().and_then(|entry| entry.queue.as_deref())
+                .is_some_and(|queue| queue.owner() == Some(self.owner))
+        }) {
+            let entry = firmware.queues.compute[index].as_mut().ok_or(EIO)?;
+            let (cancel, replaced) = entry.queue.as_deref_mut().ok_or(EIO)?
+                .rollback_unpublished(self.owner, &self.context)?;
+            binding = replaced;
+            if cancel {
+                retired = entry.queue.take().map(|queue| (entry.reservation, queue));
+            }
+        }
+        drop(state);
+        drop(binding);
+        self.finish_uninstalled_compute(retired)?;
+        self.shared.queue_events();
+        return Ok(());
+        }
+    }
+
     /// Complete all failure fanout before signalling this packet's unpublished
     /// error. Visible failures keep the engine's retained owner through a witness.
     pub(super) fn finish_publication(
@@ -36,6 +66,11 @@ impl Backend {
             }
             deferred.finish();
             if !packet.is_published() {
+                if packet.engine() == Engine::Compute {
+                    if self.rollback_unpublished_compute().is_err() {
+                        self.stop_after_error();
+                    }
+                }
                 packet.completion.fail_unpublished(error);
             }
             Err(error)
@@ -46,6 +81,9 @@ impl Backend {
     }
 
     fn release_queue(&self) -> Result {
+        // A builder may own only an off-lock reservation when close arrives.
+        // Record intent before scanning queues; every later install/rearm checks it.
+        self.closed.store(true, Ordering::Release);
         let mut state = self.shared.state.lock();
         let Some(firmware) = (*state).as_deref_mut() else {
             return Ok(());
@@ -75,7 +113,11 @@ impl job::Backend for Backend {
     }
 
     fn ensure_compute(&self, scs_pages: u16) -> Result {
-        Backend::ensure_compute(self, scs_pages)
+        // A reverse timeline chain must be submitted before the host signal.
+        // Validate here, but do not consume physical capacity behind unsignalled
+        // DRM dependencies. compute_packet admits it when the job can run.
+        crate::g17::fw::compute_pool::required_blocks(self.shared.active_cores, scs_pages)
+            .map(|_| ())
     }
 
     fn fail_vm(&self, error: Error) {

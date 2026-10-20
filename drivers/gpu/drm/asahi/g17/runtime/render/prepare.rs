@@ -470,7 +470,7 @@ impl super::super::Backend {
                 if firmware.queues.render.retired.len()
                     == firmware.queues.render.retired.capacity()
                 {
-                    return Err(ENOSPC);
+                    return Err(crate::g17::capacity::refused(crate::g17::capacity::Site::RetiredRenderBindings));
                 }
                 firmware.queues.teardown.displace(
                     pair.context(),

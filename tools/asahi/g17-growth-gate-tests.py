@@ -42,10 +42,10 @@ impl Gate {
 struct Backend {gate:Arc<Gate>,ready:mpsc::Sender<()>,proceed:StdMutex<mpsc::Receiver<()>>}
 impl Backend {
  fn handoff(&self,required:usize)->Result{
-  let lease=self.gate.try_enter()?;let state=();
+  let lease=self.gate.try_enter()?;let state=();let admission=&();
 ''' + handoff + r'''
  }
- fn grow_compute(&self,_:usize)->Result {
+ fn grow_compute(&self,_:usize,_:&())->Result {
   self.ready.send(()).unwrap();self.proceed.lock().unwrap().recv().unwrap();
   let _growth=self.gate.enter(false)?;
   Ok(())

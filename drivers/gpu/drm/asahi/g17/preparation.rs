@@ -20,6 +20,34 @@ const REMOVED: u64 = CLOSED << 1;
 const FAILED: u64 = CLOSED << 2;
 const EPOCH: u64 = CLOSED << 3;
 
+/// One ready packet's monotonic compute-admission budget. The callback checks
+/// packet cancellation, logical close, VM status and device loss even when no
+/// capacity/recovery event arrives. Wakes and nested constructors never renew it.
+pub(super) struct Admission<'a> {
+    deadline: u64,
+    check: &'a dyn Fn() -> Result,
+}
+
+impl<'a> Admission<'a> {
+    pub(super) fn new(deadline: u64, check: &'a dyn Fn() -> Result) -> Self {
+        Self { deadline, check }
+    }
+
+    pub(super) fn check(&self) -> Result {
+        (self.check)()?;
+        if super::now_ns() >= self.deadline { return Err(EBUSY); }
+        Ok(())
+    }
+
+    /// Ignore condvar remaining-time reports: only the monotonic deadline counts.
+    pub(super) fn slice_ms(&self) -> Result<u32> {
+        self.check()?;
+        let remaining = self.deadline.saturating_sub(super::now_ns());
+        if remaining == 0 { return Err(EBUSY); }
+        Ok(remaining.div_ceil(1_000_000).min(10) as u32)
+    }
+}
+
 #[pin_data]
 pub(super) struct Gate {
     state: AtomicU64,
@@ -89,6 +117,27 @@ impl Gate {
             } else {
                 self.changed.wait(&mut wait);
             }
+        }
+    }
+
+    /// Packet admission may wait for recovery only within its original budget.
+    /// Called with no device mutex or existing preparation lease.
+    pub(super) fn enter_until(self: &Arc<Self>, admission: &Admission<'_>) -> Result<Lease> {
+        admission.check()?;
+        match self.try_enter() {
+            Err(error) if error == EAGAIN => {}
+            result => return result,
+        }
+        let mut wait = self.wait.lock();
+        loop {
+            admission.check()?;
+            match self.try_enter() {
+                Err(error) if error == EAGAIN => {}
+                result => return result,
+            }
+            let _ = self.changed.wait_timeout(
+                &mut wait, kernel::time::msecs_to_jiffies(admission.slice_ms()?)
+            );
         }
     }
 
@@ -201,5 +250,79 @@ mod growth_gate_tests {
         let growth = gate.enter(false).unwrap();
         assert!(growth.is_current());
         drop(growth);
+    }
+}
+
+#[kunit_tests(asahi_g17_compute_deadline)]
+mod compute_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn spent_budget_refuses_even_an_open_gate() {
+        let gate = Gate::new().unwrap();
+        let check = || Ok(());
+        let admission = Admission::new(super::super::now_ns(), &check);
+        assert!(matches!(gate.enter_until(&admission), Err(error) if error == EBUSY));
+        assert_eq!(gate.state.load(Ordering::Acquire) & COUNT_MASK, 0);
+    }
+
+    #[test]
+    fn closed_gate_expires_without_any_recovery_wake() {
+        let gate = Gate::new().unwrap();
+        gate.close();
+        let start = super::super::now_ns();
+        let check = || Ok(());
+        let admission = Admission::new(start + 20_000_000, &check);
+        assert!(matches!(gate.enter_until(&admission), Err(error) if error == EBUSY));
+        assert!(super::super::now_ns() - start < 500_000_000);
+        gate.wait_drained();
+        assert!(gate.reopen());
+    }
+
+    #[test]
+    fn cancellation_without_capacity_or_recovery_events() {
+        let gate = Gate::new().unwrap();
+        gate.close();
+        let start = super::super::now_ns();
+        let check = || {
+            if super::super::now_ns() - start >= 10_000_000 { Err(ECANCELED) } else { Ok(()) }
+        };
+        let admission = Admission::new(start + 2_000_000_000, &check);
+        assert!(matches!(gate.enter_until(&admission), Err(error) if error == ECANCELED));
+        assert!(super::super::now_ns() - start < 500_000_000);
+        assert_eq!(gate.state.load(Ordering::Acquire) & COUNT_MASK, 0);
+    }
+
+    #[test]
+    fn recovery_and_binding_retry_churn_cannot_renew_budget() {
+        let gate = Gate::new().unwrap();
+        let start = super::super::now_ns();
+        let check = || Ok(());
+        let admission = Admission::new(start + 20_000_000, &check);
+        loop {
+            // Re-entry models a channel taken between admission/publication.
+            // Recovery joins each dropped lease, then wakes the same budget.
+            gate.close();
+            gate.changed.notify_all();
+            gate.wait_drained();
+            assert!(gate.reopen());
+            match gate.enter_until(&admission) {
+                Ok(lease) => drop(lease),
+                Err(error) => { assert_eq!(error, EBUSY); break; }
+            }
+        }
+        assert!(super::super::now_ns() - start < 500_000_000);
+        assert_eq!(gate.state.load(Ordering::Acquire) & COUNT_MASK, 0);
+    }
+
+    #[test]
+    fn packet_status_and_cancel_precede_available_capacity() {
+        let gate = Gate::new().unwrap();
+        for error in [ECANCELED, EIO] {
+            let check = || Err(error);
+            let admission = Admission::new(u64::MAX, &check);
+            assert!(matches!(gate.enter_until(&admission), Err(got) if got == error));
+        }
+        assert_eq!(gate.state.load(Ordering::Acquire) & COUNT_MASK, 0);
     }
 }
