@@ -29,7 +29,6 @@ use core::sync::atomic::{
 
 use kernel::{
     addr::{
-        DmaAddr,
         PhysicalAddr, //
     },
     c_str,
@@ -367,7 +366,20 @@ struct VmBinding {
 #[pin_data]
 struct VmBoData {
     #[pin]
-    segments: Mutex<Option<KVVec<(DmaAddress, ResourceSize)>>>,
+    segments: Mutex<Option<SgSegments>>,
+}
+
+/// Copied DMA addresses and the lease covering every alias of this VM/BO association.
+/// The lease is dropped only after all aliases have been unmapped and invalidated.
+struct SgSegments {
+    segments: KVVec<(DmaAddress, ResourceSize)>,
+    _lease: kernel::drm::gem::shmem::SGLease<gem::AsahiObject>,
+}
+
+impl SgSegments {
+    fn iter(&self) -> core::slice::Iter<'_, (DmaAddress, ResourceSize)> {
+        self.segments.iter()
+    }
 }
 
 /// Preallocated resources needed to execute a VM operation.
@@ -476,22 +488,16 @@ impl gpuvm::DriverGpuVm for VmInner {
 
         let one_page = op.flags().contains(gpuvm::GpuVaFlag::REPEAT);
 
-        let Some(dev) = ctx.dev else {
-            dev_err!(self.dev.as_ref(), "StepContext missed Bound device!");
+        if ctx.dev.is_none() {
             return Err(ENODEV);
-        };
-
-        let sgt = op.obj().sg_table(dev).inspect_err(|e| {
-            dev_err!(
-                self.dev.as_ref(),
-                "sm_step_map() Failed to get SG table: {:?}",
-                e
-            );
-        })?;
-        for sgt_entry in sgt.iter() {
-            // TODO: proper DMA address/length handling
-            let mut addr = sgt_entry.dma_address() as usize;
-            let mut len: usize = sgt_entry.dma_len() as usize;
+        }
+        // Bind preparation retained the table's backing before taking the VM reservation.
+        // Never acquire the object reservation from inside the GPUVM map callback.
+        let segments = op.vm_bo().data().segments.lock();
+        let sgt = segments.as_ref().ok_or(EFAULT)?;
+        for &(dma_address, dma_len) in sgt.iter() {
+            let mut addr = dma_address as usize;
+            let mut len = dma_len as usize;
 
             if left == 0 {
                 break;
@@ -538,6 +544,7 @@ impl gpuvm::DriverGpuVm for VmInner {
             iova += len as u64;
         }
 
+        drop(segments);
         let gpuva = match ctx.preallocated_gpuva() {
             Ok(gpuva) => gpuva,
             Err(error) => {
@@ -1624,16 +1631,36 @@ impl HandoffFlush {
 fn prefetch_sgt_segments(
     dev: &device::Device<Bound>,
     gem: &gem::Object,
-) -> Result<KVVec<(DmaAddr, ResourceSize)>> {
+) -> Result<SgSegments> {
     let sgt = crate::gem::held_sg_table(gem, dev)?;
 
-    // self.segments.
     let mut segments = KVVec::with_capacity(sgt.iter().size_hint().0, GFP_KERNEL)?;
     for sgt_entry in sgt.iter() {
         segments.push((sgt_entry.dma_address(), sgt_entry.dma_len()), GFP_KERNEL)?;
     }
 
-    Ok(segments)
+    Ok(SgSegments { segments, _lease: sgt.into_lease() })
+}
+
+/// Reuse cached segments without allocating another copy for each bind. The bind lease was
+/// acquired before BO locking: its getter synchronized with any earlier reclaim under resv,
+/// and its extra count excludes new eviction until preparation/commit finishes.
+fn prepare_sgt_segments(
+    dev: &device::Device<Bound>,
+    gem: &gem::Object,
+    bo: &gpuvm::GpuVmBo<VmInner>,
+    _bind_lease: &kernel::drm::gem::shmem::SGLease<gem::AsahiObject>,
+) -> Result {
+    let needs_segments = bo.data().segments.lock().is_none();
+    if needs_segments {
+        // Never enter the object reservation while holding the BO mutex.
+        let prefetched = prefetch_sgt_segments(dev, gem)?;
+        let mut segments = bo.data().segments.lock();
+        if segments.is_none() {
+            segments.replace(prefetched);
+        }
+    }
+    Ok(())
 }
 
 impl Vm {
@@ -1873,28 +1900,19 @@ impl Vm {
         }
         let reserved_size = size.checked_add(guard_size).ok_or(EOVERFLOW)?;
         let _residency = self.enter_residency()?;
-        // TODO: hack, populate the GEM object sg table first
-        {
-            let dev = unsafe { self.dev.as_bound() };
-            let _sgt = crate::gem::held_sg_table(gem, dev)?;
-        }
+        // Pin and copy backing before taking BO or DMA reservation locks.
+        let dev = unsafe { self.dev.as_bound() };
+        let _bind_lease = crate::gem::held_sg_table(gem, dev)?.into_lease();
         let vm_bo = self
             .gpuvm
             .obtain(gem, pin_init!(VmBoData { segments <- new_mutex!(None) }))?;
+        prepare_sgt_segments(dev, gem, &vm_bo, &_bind_lease)?;
 
         let size = object_range.range();
         let mut vm_exec = unsafe {
             self.gpuvm.exec_lock(/*Some(gem)*/ None, false)?
         };
         let inner = vm_exec.unique_gpuvm.data();
-
-        let mut vm_bo_guard = vm_bo.data().segments.lock();
-        if vm_bo_guard.is_none() {
-            let dev = unsafe { self.dev.as_bound() };
-            let segments = prefetch_sgt_segments(dev, gem)?;
-            vm_bo_guard.replace(segments);
-        }
-        core::mem::drop(vm_bo_guard);
 
         let mut vm_bo = Some(MappingBo::new(vm_bo, self.gpuvm.clone()));
         let uat_inner = inner.uat_inner.clone();
@@ -1954,14 +1972,13 @@ impl Vm {
             .checked_add(if guard { UAT_PGSZ } else { 0 })
             .ok_or(EOVERFLOW)?;
         let _residency = self.enter_residency()?;
-        // TODO: hack, populate the GEM object sg table first
-        {
-            let dev = unsafe { self.dev.as_bound() };
-            let _sgt = crate::gem::held_sg_table(gem, dev)?;
-        }
+        // Pin and copy backing before taking BO or DMA reservation locks.
+        let dev = unsafe { self.dev.as_bound() };
+        let _bind_lease = crate::gem::held_sg_table(gem, dev)?.into_lease();
         let vm_bo = self
             .gpuvm
             .obtain(&gem, pin_init!(VmBoData { segments <-new_mutex!(None) }))?;
+        prepare_sgt_segments(dev, gem, &vm_bo, &_bind_lease)?;
 
         // SAFETY: no other UniqRefGpuVm exists so `GpuVm::exec_lock()` is safe
         let mut vm_exec = unsafe {
@@ -1972,14 +1989,6 @@ impl Vm {
                 })?
         };
         let inner = vm_exec.unique_gpuvm.data();
-
-        let mut vm_bo_guard = vm_bo.data().segments.lock();
-        if vm_bo_guard.is_none() {
-            let dev = unsafe { self.dev.as_bound() };
-            let segments = prefetch_sgt_segments(dev, gem)?;
-            vm_bo_guard.replace(segments);
-        }
-        core::mem::drop(vm_bo_guard);
 
         let mut vm_bo = Some(MappingBo::new(vm_bo, self.gpuvm.clone()));
         let uat_inner = inner.uat_inner.clone();
@@ -2035,14 +2044,13 @@ impl Vm {
         let _residency = self.enter_residency_metadata()?;
         gem::validate_vm_binding(gem, self)?;
         self.wait_for_user_map_admission()?;
-        // TODO: hack, populate the GEM object sg table first
-        {
-            let dev = unsafe { self.dev.as_bound() };
-            let _sgt = crate::gem::held_sg_table(gem, dev)?;
-        }
+        // Pin and copy backing before taking BO or DMA reservation locks.
+        let dev = unsafe { self.dev.as_bound() };
+        let _bind_lease = crate::gem::held_sg_table(gem, dev)?.into_lease();
         let vm_bo = self
             .gpuvm
             .obtain(gem, pin_init!(VmBoData { segments <- new_mutex!(None) }))?;
+        prepare_sgt_segments(dev, gem, &vm_bo, &_bind_lease)?;
 
         let mut resources = VmOpResources {
             preallocated_gpuvas: [
@@ -2059,14 +2067,6 @@ impl Vm {
             self.gpuvm.exec_lock(/*Some(&gem)*/ None, false)?
         };
         let inner = vm_exec.unique_gpuvm.data();
-
-        let mut vm_bo_guard = vm_bo.data().segments.lock();
-        if vm_bo_guard.is_none() {
-            let dev = unsafe { self.dev.as_bound() };
-            let segments = prefetch_sgt_segments(dev, gem)?;
-            vm_bo_guard.replace(segments);
-        }
-        core::mem::drop(vm_bo_guard);
 
         // Preallocate the page tables, to fail early if we ENOMEM
         inner.page_table.alloc_pages(addr..(addr + size))?;

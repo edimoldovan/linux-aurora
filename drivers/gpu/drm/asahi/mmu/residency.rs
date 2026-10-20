@@ -361,11 +361,17 @@ impl Vm {
         // this reservation; linked aliases retain their borrowed BO and GEM.
         let _ = unsafe { inner.for_each_private_bo(|_, bo| {
             let object = bo.obj();
-            // Purgeable objects count on busy VMs too; idle backing only on idle ones.
-            if object.idle_reclaim_candidate()
-                && (object.madv_locked() > 0 || idle)
-                && object.sole_sg_lease_releasable_locked()
-            {
+            // Count retained backing on idle VMs, and purgeable contents even if idle
+            // reclaim already released the table. Never wait on the BO mutex under resv.
+            let Some(segments) = bo.data().segments.try_lock() else { return Ok(true); };
+            let advised = object.madv_locked() > 0;
+            let releasable = if segments.is_some() {
+                object.sole_sg_lease_releasable_locked()
+            } else {
+                (advised || object.has_sg_table_locked())
+                    && object.unleased_pages_releasable_locked()
+            };
+            if object.idle_reclaim_candidate() && (advised || idle) && releasable {
                 pages = pages.saturating_add(object.size() / kernel::page::PAGE_SIZE);
             }
             Ok(true)
@@ -408,9 +414,12 @@ impl Vm {
             }
             {
                 let Some(segments) = bo.data().segments.try_lock() else { return Ok(true); };
-                if segments.is_some() && !object.sole_sg_lease_releasable_locked() {
-                    return Ok(true);
-                }
+                let releasable = if segments.is_some() {
+                    object.sole_sg_lease_releasable_locked()
+                } else {
+                    object.unleased_pages_releasable_locked()
+                };
+                if !releasable { return Ok(true); }
             }
             // Any mutation that does not end in a completed purge leaves
             // INVALIDATED aliases with cleared PTEs while madv stays >= 0, so
@@ -494,9 +503,14 @@ impl Vm {
             {
                 // Avoid inversion against preparation (VmBoInner -> resv).
                 let Some(segments) = bo.data().segments.try_lock() else { return Ok(true); };
-                if segments.is_none() || !object.sole_sg_lease_releasable_locked() {
-                    return Ok(true);
-                }
+                let releasable = if segments.is_some() {
+                    object.sole_sg_lease_releasable_locked()
+                } else {
+                    // A competing lease may have made the previous release fail after we
+                    // dropped our segments. Retry that table, but do not count empty backing.
+                    object.has_sg_table_locked() && object.unleased_pages_releasable_locked()
+                };
+                if !releasable { return Ok(true); }
             }
             // The association retains SG backing until *all* aliases have
             // been invalidated and their device translations flushed. A

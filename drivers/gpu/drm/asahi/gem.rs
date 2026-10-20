@@ -106,7 +106,7 @@ pub(crate) fn set_mapping_held(gem: &Object, held: bool) {
 pub(crate) fn held_sg_table<'a>(
     gem: &'a Object,
     dev: &'a kernel::device::Device<kernel::device::Bound>,
-) -> Result<&'a kernel::scatterlist::SGTable> {
+) -> Result<shmem::SGTable<'a, AsahiObject>> {
     let sgt = gem.sg_table(dev)?;
     set_mapping_held(gem, true);
     Ok(sgt)

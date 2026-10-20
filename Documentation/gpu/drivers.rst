@@ -7,6 +7,7 @@ GPU Driver Documentation
 
    amdgpu/index
    apple-dcp-backlight
+   asahi-reclaim
    i915
    imagination/index
    intel-display/index

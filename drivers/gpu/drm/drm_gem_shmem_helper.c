@@ -612,10 +612,10 @@ bool drm_gem_shmem_idle_pages_releasable_locked(struct drm_gem_shmem_object *shm
 	struct drm_gem_object *obj = &shmem->base;
 
 	dma_resv_assert_held(obj->resv);
-	return shmem->sgt && !drm_gem_is_imported(obj) && !obj->dma_buf &&
+	return !drm_gem_is_imported(obj) && !obj->dma_buf &&
 		shmem->madv >= 0 && !refcount_read(&shmem->pages_pin_count) &&
 		!refcount_read(&shmem->vmap_use_count) &&
-		refcount_read(&shmem->pages_use_count) == 1 &&
+		refcount_read(&shmem->pages_use_count) == !!shmem->sgt &&
 		dma_resv_test_signaled(obj->resv, DMA_RESV_USAGE_BOOKKEEP);
 }
 EXPORT_SYMBOL_GPL(drm_gem_shmem_idle_pages_releasable_locked);
@@ -1079,6 +1079,10 @@ static struct sg_table *drm_gem_shmem_get_pages_sgt_locked(struct drm_gem_shmem_
 
 	if (shmem->sgt)
 		return shmem->sgt;
+
+	/* Purged contents cannot be restored by rebuilding an empty table. */
+	if (shmem->madv < 0)
+		return ERR_PTR(-EINVAL);
 
 	drm_WARN_ON(obj->dev, drm_gem_is_imported(obj));
 
