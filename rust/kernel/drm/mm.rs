@@ -173,6 +173,7 @@ impl<A: AllocInner<T>, T> Allocator<A, T> {
         // The DRM interval query requires both endpoints to lie inside its
         // allocator. head_node is the end sentinel; its wrapping size is the
         // negated allocator span.
+        // SAFETY: `self` retains the initialized allocator and its mutex is held.
         let head = unsafe { &(*guard.0.get()).head_node };
         let allocator_start = head.start.wrapping_add(head.size);
         if range.start < allocator_start || range.end > head.start {

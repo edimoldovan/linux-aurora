@@ -344,7 +344,7 @@ impl<T: DriverGpuVm> GpuVm<T> {
                 extra: match (is_ext, obj) {
                     (true, Some(obj)) => bindings::drm_gpuvm_exec__bindgen_ty_1 {
                         fn_: Some(exec_lock_gem_object),
-                        priv_: obj.as_raw() as *mut _,
+                        priv_: obj.as_raw().cast(),
                     },
                     _ => Default::default(),
                 },
@@ -587,6 +587,7 @@ impl<T: DriverGpuVm> PrivateGpuVmGuard<'_, T> {
         // SAFETY: `bo` and the VM are live while borrowed.
         if unsafe { (*raw_bo).vm } != vm
             || self.gpuvm.is_extobj(bo.obj())
+            // SAFETY: The VM remains live while `self` is borrowed.
             || unsafe { (*vm).flags } & bindings::drm_gpuvm_flags_DRM_GPUVM_IMMEDIATE_MODE == 0
         {
             return Err(EINVAL);

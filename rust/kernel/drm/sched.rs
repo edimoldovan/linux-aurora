@@ -126,9 +126,11 @@ unsafe extern "C" fn timedout_job_cb<T: JobImpl>(
     // SAFETY: All of our jobs are Job<T>.
     let p = unsafe { crate::container_of!(sched_job, Job<T>, job) as *mut Job<T> };
 
-    // The C timeout worker owns this job outside pending_list until return.
+    // SAFETY: The C timeout worker owns this job outside pending_list until return.
     // Free work cannot release it even if its parent signals concurrently.
     let finished = unsafe { addr_of_mut!((*(*sched_job).s_fence).finished) };
+    // SAFETY: The job retains its initialized finished fence throughout the callback;
+    // dma_fence_get_status supports concurrent signaling.
     let is_finished = || unsafe { bindings::dma_fence_get_status(finished) != 0 };
     if T::MANAGED_TIMEOUT_RECOVERY {
         if is_finished() {
@@ -160,16 +162,18 @@ unsafe extern "C" fn free_job_cb<T: JobImpl>(sched_job: *mut bindings::drm_sched
 
     // Fault-only ownership witness: this callback is where the core returns
     // ownership of an errored job. A signalled fence alone is not that proof.
-    // SAFETY: A job reaching free_job has a live scheduler fence; its error
-    // was fixed before signal and the core's completion callback has finished.
     if T::MANAGED_TIMEOUT_RECOVERY
+        // SAFETY: The job retains its scheduler fence until free_job returns.
+        // Its error was fixed before signal and the completion callback has finished.
         && unsafe { (*(*sched_job).s_fence).finished.error } == ETIMEDOUT.to_errno()
     {
         // Use numeric identity: the fmt adapter borrows arguments, and
         // Pointer formatting of that reference can print a stack address.
         pr_info!("DRM Rust scheduler: released timed-out job={:#x} context={} seqno={}\n",
             sched_job as usize,
+            // SAFETY: The job retains its fence; context is immutable after initialization.
             unsafe { (*(*sched_job).s_fence).finished.context },
+            // SAFETY: The job retains its fence; seqno is immutable after initialization.
             unsafe { (*(*sched_job).s_fence).finished.seqno });
     }
     // Convert the job back to a Box and drop it
@@ -181,11 +185,13 @@ unsafe extern "C" fn cancel_job_cb<T: JobImpl>(sched_job: *mut bindings::drm_sch
     // SAFETY: All of our jobs are Job<T>.
     let p = unsafe { crate::container_of!(sched_job, Job<T>, job) as *mut Job<T> };
 
-    // fini has stopped/synchronized submission and timeout workers. A parent
+    // SAFETY: fini has stopped/synchronized submission and timeout workers. A parent
     // callback can still run on the device completion thread. The scheduler
     // fence retains the parent reference while we remove its callback under
     // the parent's lock; that also waits for an already-running callback.
     let s_fence = unsafe { (*sched_job).s_fence };
+    // SAFETY: The job retains its scheduler fence and submit work can no longer
+    // change its parent pointer. The scheduler fence retains the parent reference.
     let parent = unsafe { (*s_fence).parent };
     let removed_parent_callback = if !parent.is_null() {
         // SAFETY: run_job installed (or attempted to install on an already
@@ -193,6 +199,8 @@ unsafe extern "C" fn cancel_job_cb<T: JobImpl>(sched_job: *mut bindings::drm_sch
         unsafe { bindings::dma_fence_remove_callback(parent, addr_of_mut!((*sched_job).cb)) }
     } else { false };
     let finish_here = removed_parent_callback || (parent.is_null()
+        // SAFETY: The job retains its initialized finished fence; querying its
+        // status supports concurrent signaling.
         && unsafe { bindings::dma_fence_get_status(addr_of_mut!((*s_fence).finished)) == 0 });
     // Null/error run_job calls job_done before submit work returns, so its
     // finished fence is already signaled. NULL+unfinished can instead survive
@@ -208,7 +216,10 @@ unsafe extern "C" fn cancel_job_cb<T: JobImpl>(sched_job: *mut bindings::drm_sch
         // Match drm_sched_job_done's accounting exactly once, only when its
         // callback did not do it. Submission/free work is stopped, so fini
         // itself unlinks and frees this job; no workqueue rearm is appropriate.
+        // SAFETY: The job remains live and retains its scheduler allocation.
         let sched = unsafe { (*sched_job).sched };
+        // SAFETY: The live job retains its scheduler and score. Submission/free
+        // work is stopped and the parent callback cannot account this job again.
         unsafe {
             if removed_parent_callback {
                 bindings::atomic_sub((*sched_job).credits as i32,
@@ -216,9 +227,11 @@ unsafe extern "C" fn cancel_job_cb<T: JobImpl>(sched_job: *mut bindings::drm_sch
             }
             bindings::atomic_sub(1, (*sched).score);
         }
+        // SAFETY: The job retains its initialized finished fence while get_raw
+        // takes a new reference.
         let fence = unsafe { Fence::get_raw(addr_of_mut!((*s_fence).finished)) };
         fence.set_error(ECANCELED);
-        let _ = fence.signal();
+        fence.signal();
     }
     // Do not clear/put parent here: s_fence still owns that reference and its
     // normal release path drops it. A completed callback's result is retained.
@@ -387,7 +400,7 @@ impl<T: JobImpl> Entity<T> {
         let mut entity: KBox<MaybeUninit<EntityInner<T>>> =
             KBox::new_uninit(GFP_KERNEL | __GFP_ZERO)?;
 
-        let mut sched_ptr = &sched.0.allocation.sched as *const _ as *mut _;
+        let mut sched_ptr = (&raw const sched.0.allocation.sched).cast_mut();
 
         // SAFETY: The Box is allocated above and valid.
         unsafe {
