@@ -1180,6 +1180,7 @@ int drm_sched_init(struct drm_gpu_scheduler *sched, const struct drm_sched_init_
 	atomic_set(&sched->_score, 0);
 	atomic64_set(&sched->job_id_count, 0);
 	sched->pause_submit = false;
+	sched->free_guilty = false;
 	ewma_drm_sched_avgtime_init(&sched->avg_job_us);
 
 	sched->ready = true;
