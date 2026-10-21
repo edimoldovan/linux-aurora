@@ -348,6 +348,12 @@ enum drm_asahi_feature {
 	 * accept render_scs_layout.
 	 */
 	DRM_ASAHI_FEATURE_RENDER_RAY_QUERY = (1UL) << 15,
+
+	/**
+	 * @DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD: Compute commands accept
+	 * DRM_ASAHI_COMPUTE_AS_BUILD for a bounded long execution allowance.
+	 */
+	DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD = (1UL) << 16,
 };
 
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
@@ -1614,6 +1620,17 @@ enum drm_asahi_compute_flags {
 	DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF = (1L << 0),
 
 	DRM_ASAHI_COMPUTE_WIDE_VISIBILITY = (1L << 1),
+
+	/**
+	 * @DRM_ASAHI_COMPUTE_AS_BUILD: Acceleration-structure build work,
+	 * including compute-based transfers. Requires BOUNDED_AS_BUILD.
+	 * This is an execution hint, not proof of progress or permission to
+	 * access additional memory. The kernel validates the command normally
+	 * and caps its execution allowance at ten seconds (four extra 2s polls).
+	 * Other commands in the same submission receive the same allowance so
+	 * ordered helpers cannot time out while waiting for the build.
+	 */
+	DRM_ASAHI_COMPUTE_AS_BUILD = (1L << 2),
 };
 
 /**

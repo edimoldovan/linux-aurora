@@ -12,6 +12,8 @@ use crate::util::{AnyBitPattern, Reader};
 use core::ops::Range;
 use kernel::{prelude::*, uapi};
 
+const _: () = assert!(uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_AS_BUILD == 1 << 2);
+
 const MAX_ATTACHMENTS: usize = crate::microseq::MAX_ATTACHMENTS;
 const USC_WINDOW_SIZE: u64 = 1 << 32;
 const MAX_SAMPLERS: u32 = 1024;
@@ -306,12 +308,14 @@ fn surface(
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Validated {
     Render {
+        long_job: bool,
         pass: RenderPass,
         ray_query: [RayQueryStage; 2],
         attachments: [Attachments; 2],
         timestamps: [uapi::drm_asahi_timestamps; 2],
     },
     Compute {
+        long_job: bool,
         intersection: IntersectionTables,
         scratch: ScratchRequest,
         usc_base: u64,
@@ -321,6 +325,19 @@ pub(crate) enum Validated {
         sampler_count: u32,
         timestamps: uapi::drm_asahi_timestamps,
     },
+}
+
+impl Validated {
+    pub(crate) fn long_job(&self) -> bool {
+        match self {
+            Self::Render { long_job, .. } | Self::Compute { long_job, .. } => *long_job,
+        }
+    }
+    pub(crate) fn allow_long_job(&mut self) {
+        match self {
+            Self::Render { long_job, .. } | Self::Compute { long_job, .. } => *long_job = true,
+        }
+    }
 }
 
 impl Payload {
@@ -447,6 +464,8 @@ impl Payload {
                     }
                 }
                 Ok(Validated::Render {
+                    long_job: super::timeout::select(false,
+                        ray_query.map(|stage| stage.intersection.enabled()), false),
                     pass,
                     ray_query: *ray_query,
                     attachments: *attachments,
@@ -454,8 +473,8 @@ impl Payload {
                 })
             }
             Self::Compute(cmd, attachments, intersection) => {
-                if cmd.flags != 0
-                    || cmd.cdm_ctrl_stream_base & 3 != 0
+                let as_build = super::timeout::as_build(cmd.flags).ok_or(EINVAL)?;
+                if cmd.cdm_ctrl_stream_base & 3 != 0
                     || cmd.cdm_ctrl_stream_end & 3 != 0
                     || cmd.cdm_ctrl_stream_end <= cmd.cdm_ctrl_stream_base
                     || !helper_is_empty(&cmd.helper)
@@ -476,6 +495,7 @@ impl Payload {
                     if code != 0 { require_range(space, code, 64, Access::Read)?; }
                 }
                 Ok(Validated::Compute {
+                    long_job: super::timeout::select(intersection.enabled(), [false; 2], as_build),
                     intersection: *intersection,
                     scratch: ScratchRequest::new(cmd.scs_layout)?,
                     usc_base: window.base,

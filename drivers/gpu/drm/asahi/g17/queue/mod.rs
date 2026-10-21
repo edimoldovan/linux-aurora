@@ -391,7 +391,10 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             if self.context.status().get() != 0 {
                 return Err(EIO);
             }
-            let (pending, guards) = self.prepare_submission(bytes, objects)?;
+            let (mut pending, guards) = self.prepare_submission(bytes, objects)?;
+            if super::timeout::select_submission(pending.iter().map(|(cmd, _, _)| cmd.long_job())) {
+                for (command, _, _) in pending.iter_mut() { command.allow_long_job(); }
+            }
             let mut guards = guards.into_iter();
             let aggregate = outputs.publish(self.context.clone())?;
             for (command, order, destinations) in pending {
