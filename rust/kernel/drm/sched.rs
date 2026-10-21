@@ -519,18 +519,40 @@ impl<T: JobImpl> Scheduler<T> {
         timeout_ms: time::Msecs,
         name: &'static CStr,
     ) -> Result<Scheduler<T>> {
-        let mut sched: UniqueArc<MaybeUninit<SchedulerInner<T>>> =
-            UniqueArc::new_uninit(GFP_KERNEL)?;
+        Self::init(
+            UniqueArc::new_uninit(GFP_KERNEL)?,
+            device,
+            num_rqs,
+            credit_limit,
+            hang_limit,
+            timeout_ms,
+            name,
+        )
+    }
+
+    /// Initializes a scheduler in `sched`, whatever that storage held before.
+    fn init(
+        mut sched: UniqueArc<MaybeUninit<SchedulerInner<T>>>,
+        device: &device::Device,
+        num_rqs: u32,
+        credit_limit: u32,
+        hang_limit: u32,
+        timeout_ms: time::Msecs,
+        name: &'static CStr,
+    ) -> Result<Scheduler<T>> {
         // Allocate the owner before starting C workers: no fallible allocation
         // may abandon an initialized scheduler without running drm_sched_fini.
-        let owner: UniqueArc<MaybeUninit<SchedulerOwner<T>>> =
-            UniqueArc::new_uninit(GFP_KERNEL)?;
+        let owner: UniqueArc<MaybeUninit<SchedulerOwner<T>>> = UniqueArc::new_uninit(GFP_KERNEL)?;
 
-        // SAFETY: zero sched->sched_rq as drm_sched_init() uses it to exit early withoput initialisation
-        // TODO: allocate sched zzeroed instead
-        unsafe {
-            (*sched.as_mut_ptr()).sched.sched_rq = core::ptr::null_mut();
-        };
+        // drm_sched_init() expects zeroed storage, like the kzalloc'd structs C
+        // drivers embed it in. It treats a non-NULL sched_rq as already
+        // initialized and never writes free_guilty. A stale free_guilty makes
+        // the timeout worker free a still-running job and leave its parent
+        // callback behind for the late hardware completion to call.
+        //
+        // SAFETY: `sched` is uniquely owned, writable storage for one
+        // drm_gpu_scheduler, and all-zero bytes are a valid value for it.
+        unsafe { core::ptr::write_bytes(addr_of_mut!((*sched.as_mut_ptr()).sched), 0, 1) };
 
         let init_ops = bindings::drm_sched_init_args {
             ops: &Self::OPS,
@@ -558,5 +580,296 @@ impl<T: JobImpl> Scheduler<T> {
         // No fallible operation follows successful initialization.
         let allocation = unsafe { sched.assume_init() }.into();
         Ok(Scheduler(owner.write(SchedulerOwner { allocation }).into()))
+    }
+}
+
+#[kunit_tests(rust_drm_sched)]
+mod tests {
+    use super::*;
+    use crate::{
+        dma_fence::{FenceContexts, FenceObject, FenceOps, UserFence},
+        faux,
+        sync::LockClassKey,
+        time::{delay::fsleep, Delta},
+    };
+    use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
+
+    static FENCE_KEY: Pin<&LockClassKey> = crate::static_lock_class!();
+
+    /// Every poll of a still-running job runs the timeout worker again, as the
+    /// G17 execution allowance and repeated-timeout recovery do.
+    const TIMEOUT_MS: time::Msecs = 5;
+    const WAIT_MS: u32 = 2000;
+
+    struct HwFence;
+
+    #[vtable]
+    impl FenceOps for HwFence {
+        fn get_driver_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
+            c"kunit"
+        }
+
+        fn get_timeline_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
+            c"rust-drm-sched"
+        }
+    }
+
+    #[derive(Default)]
+    struct Counters {
+        runs: AtomicU32,
+        timeouts: AtomicU32,
+        cancels: AtomicU32,
+        freed: AtomicU32,
+    }
+
+    struct TestJob {
+        hw: Fence,
+        counters: Arc<Counters>,
+    }
+
+    struct TestTimeout {
+        counters: Arc<Counters>,
+    }
+
+    impl Drop for TestJob {
+        fn drop(&mut self) {
+            self.counters.freed.fetch_add(1, SeqCst);
+        }
+    }
+
+    impl JobImpl for TestJob {
+        type TimeoutData = TestTimeout;
+
+        fn timeout_data(&self) -> TestTimeout {
+            TestTimeout {
+                counters: self.counters.clone(),
+            }
+        }
+
+        fn run(job: &mut Self) -> Result<Option<Fence>> {
+            job.counters.runs.fetch_add(1, SeqCst);
+            Ok(Some(job.hw.clone()))
+        }
+
+        fn timed_out(data: &mut TestTimeout, _finished: bool) -> Status {
+            // Like G17, keep the job and its parent callback. The hardware
+            // result still arrives later through the parent fence.
+            data.counters.timeouts.fetch_add(1, SeqCst);
+            Status::NoHang
+        }
+
+        fn cancel(job: &mut Self) {
+            job.counters.cancels.fetch_add(1, SeqCst);
+        }
+    }
+
+    /// Scheduler storage left dirty, as a recycled kmalloc object can be. A
+    /// byte of 1 is the common stale value (refcounts, flags, credits) and the
+    /// only one clang's `bool` test of free_guilty treats as true.
+    fn dirty_scheduler(dev: &device::Device, credits: u32) -> Result<Scheduler<TestJob>> {
+        let mut storage = UniqueArc::<SchedulerInner<TestJob>>::new_uninit(GFP_KERNEL)?;
+        // SAFETY: The storage is uniquely owned and still uninitialized.
+        unsafe {
+            core::ptr::write_bytes(
+                storage.as_mut_ptr().cast::<u8>(),
+                1,
+                core::mem::size_of::<SchedulerInner<TestJob>>(),
+            )
+        };
+        Scheduler::init(
+            storage,
+            dev,
+            1,
+            credits,
+            0,
+            TIMEOUT_MS,
+            c"rust-drm-sched-kunit",
+        )
+    }
+
+    fn wait_for(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..WAIT_MS {
+            if done() {
+                return true;
+            }
+            fsleep(Delta::from_millis(1));
+        }
+        done()
+    }
+
+    struct Pending {
+        hw: UserFence<HwFence>,
+        counters: Arc<Counters>,
+    }
+
+    impl Pending {
+        fn new(entity: &mut Entity<TestJob>, contexts: &FenceContexts) -> Result<Self> {
+            let hw: UserFence<HwFence> = contexts.new_fence(0, HwFence)?.into();
+            let counters = Arc::new(Counters::default(), GFP_KERNEL)?;
+            let job = entity.new_job(
+                1,
+                TestJob {
+                    hw: Fence::from_fence(&hw),
+                    counters: counters.clone(),
+                },
+            )?;
+            job.arm().push();
+            Ok(Self { hw, counters })
+        }
+
+        /// Deliver the late hardware result. A job freed before this point
+        /// still has its callback on the parent, and signalling the parent
+        /// would run drm_sched_job_done() on freed memory. Leak the fence
+        /// unsignalled in that case and report the failure instead.
+        fn complete(self) -> bool {
+            if self.counters.freed.load(SeqCst) != 0 {
+                core::mem::forget(self.hw);
+                return false;
+            }
+            self.hw.signal();
+            true
+        }
+    }
+
+    #[test]
+    fn dirty_storage_starts_clean() -> Result {
+        let reg = faux::Registration::new(c"rust-drm-sched-kunit-0", None)?;
+        let dev: &device::Device<device::Bound> = reg.as_ref().as_ref();
+        let sched = dirty_scheduler(dev, 1)?;
+        let raw = &sched.0.allocation.sched;
+        // Read the reset flags as bytes: stale storage need not hold a valid bool.
+        // SAFETY: Both fields are initialized bytes of the live scheduler.
+        let (free_guilty, pause_submit) = unsafe {
+            (
+                core::ptr::read_volatile(addr_of!(raw.free_guilty).cast::<u8>()),
+                core::ptr::read_volatile(addr_of!(raw.pause_submit).cast::<u8>()),
+            )
+        };
+        drop(sched);
+        drop(reg);
+        assert_eq!(free_guilty, 0);
+        assert_eq!(pause_submit, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn late_completion_after_timeouts() -> Result {
+        let reg = faux::Registration::new(c"rust-drm-sched-kunit-1", None)?;
+        let dev: &device::Device<device::Bound> = reg.as_ref().as_ref();
+        let contexts = FenceContexts::new(1, c"rust_drm_sched_kunit", FENCE_KEY)?;
+        let sched = dirty_scheduler(dev, 1)?;
+        let mut entity = Entity::new(&sched, Priority::Kernel)?;
+        let pending = Pending::new(&mut entity, &contexts)?;
+        let counters = pending.counters.clone();
+        let late = pending.hw.clone();
+
+        // Repeated watchdog expirations of one running job.
+        let timed_out = wait_for(|| counters.timeouts.load(SeqCst) >= 4);
+        let freed_early = counters.freed.load(SeqCst);
+        // The hardware result arrives after those timeouts.
+        let completed = pending.complete();
+        let freed_once = completed && wait_for(|| counters.freed.load(SeqCst) == 1);
+        if completed {
+            // A duplicate late completion is a no-op.
+            late.signal();
+        } else {
+            core::mem::forget(late);
+        }
+        drop(entity);
+        drop(sched);
+
+        // The timeout worker must not release a job that is still running.
+        assert_eq!(freed_early, 0);
+        assert!(timed_out);
+        assert!(completed);
+        assert!(freed_once);
+        assert_eq!(counters.runs.load(SeqCst), 1);
+        assert_eq!(counters.cancels.load(SeqCst), 0);
+        assert_eq!(counters.freed.load(SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_timeouts_with_completions_in_flight() -> Result {
+        const JOBS: usize = 8;
+        // Completion order. The two jobs left over are cancelled by teardown.
+        const ORDER: [usize; JOBS - 2] = [3, 0, 5, 1, 4, 2];
+
+        let reg = faux::Registration::new(c"rust-drm-sched-kunit-2", None)?;
+        let dev: &device::Device<device::Bound> = reg.as_ref().as_ref();
+        let contexts = FenceContexts::new(1, c"rust_drm_sched_kunit", FENCE_KEY)?;
+        let sched = dirty_scheduler(dev, JOBS as u32)?;
+        let mut entity = Entity::new(&sched, Priority::Kernel)?;
+        let mut jobs = KVec::with_capacity(JOBS, GFP_KERNEL)?;
+        let mut counters = KVec::with_capacity(JOBS, GFP_KERNEL)?;
+        for _ in 0..JOBS {
+            let pending = Pending::new(&mut entity, &contexts)?;
+            counters.push(pending.counters.clone(), GFP_KERNEL)?;
+            jobs.push(Some(pending), GFP_KERNEL)?;
+        }
+        let sum = |f: fn(&Counters) -> &AtomicU32| {
+            counters.iter().map(|c| f(c).load(SeqCst)).sum::<u32>()
+        };
+        let timeouts = || sum(|c| &c.timeouts);
+        let freed = || sum(|c| &c.freed);
+
+        let mut ok = wait_for(|| sum(|c| &c.runs) == JOBS as u32);
+        ok &= wait_for(|| timeouts() >= 4);
+        ok &= freed() == 0;
+
+        // Complete jobs out of order while the watchdog keeps expiring on the
+        // oldest one. The scheduler still frees them in submission order, and
+        // never frees a job whose own hardware fence has not signalled.
+        let mut completed = [false; JOBS];
+        let early_free = |completed: &[bool; JOBS]| {
+            counters
+                .iter()
+                .zip(completed.iter())
+                .any(|(c, &done)| !done && c.freed.load(SeqCst) != 0)
+        };
+        for &index in ORDER.iter() {
+            let before = timeouts();
+            ok &= wait_for(|| timeouts() > before);
+            ok &= !early_free(&completed);
+            let Some(pending) = jobs[index].take() else {
+                ok = false;
+                continue;
+            };
+            ok &= pending.complete();
+            completed[index] = true;
+        }
+        // Submission-order release reaches every completed job once the
+        // oldest outstanding ones have completed.
+        ok &= wait_for(|| freed() == ORDER.len() as u32);
+        ok &= !early_free(&completed);
+        let freed_before_teardown = freed();
+
+        // Teardown cancels the jobs still in flight, then their late results arrive.
+        let mut late = KVec::with_capacity(JOBS, GFP_KERNEL)?;
+        for pending in jobs.iter_mut().filter_map(Option::take) {
+            if pending.counters.freed.load(SeqCst) != 0 {
+                core::mem::forget(pending.hw);
+                ok = false;
+                continue;
+            }
+            late.push(pending.hw, GFP_KERNEL)?;
+        }
+        drop(entity);
+        drop(sched);
+        let leftover = late.len();
+        for hw in late.iter() {
+            hw.signal();
+        }
+        drop(late);
+
+        assert!(ok);
+        assert_eq!(freed_before_teardown, ORDER.len() as u32);
+        assert_eq!(leftover, JOBS - ORDER.len());
+        assert_eq!(sum(|c| &c.cancels), (JOBS - ORDER.len()) as u32);
+        assert_eq!(freed(), JOBS as u32);
+        assert!(counters
+            .iter()
+            .all(|c| c.freed.load(SeqCst) == 1 && c.runs.load(SeqCst) == 1));
+        Ok(())
     }
 }
