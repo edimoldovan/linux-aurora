@@ -18,6 +18,12 @@ pub(crate) fn transaction_grace(renewals: u8) -> bool { renewals < MAX_RENEWALS 
 pub(crate) const POLL_MS: u32 = 2000;
 const EXECUTION_RENEWALS: u8 = 4;
 
+/// A background control/replay poll has no scheduler fence to expire it.
+/// Its timestamp belongs to the exact transaction and is never renewed by work.
+pub(crate) fn background_stalled(since: Option<u64>, now: u64) -> bool {
+    since.is_some_and(|since| now.saturating_sub(since) >= 10_000_000_000)
+}
+
 /// Input comes only from fully validated commands. Render metadata covers the
 /// VDM half (vertex/tessellation/geometry) and the fragment half independently.
 /// AS builders do not traverse rays and need an explicit, bounded UAPI hint.
@@ -113,6 +119,17 @@ mod tests {
         for count in 0..=u8::MAX {
             assert_eq!(transaction_grace(count), count < MAX_RENEWALS);
         }
+    }
+    #[test]
+    fn background_control_and_replay_polls_have_an_absolute_deadline() {
+        let since = 42;
+        assert!(!background_stalled(None, u64::MAX));
+        assert!(!background_stalled(Some(since), since - 1));
+        assert!(!background_stalled(Some(since), since + 9_999_999_999));
+        for _ in 0..1024 {
+            assert!(background_stalled(Some(since), since + 10_000_000_000));
+        }
+        assert!(background_stalled(Some(since), u64::MAX));
     }
     fn head(vm: usize, published: u64, finished: bool) -> Head {
         Head { vm, published, finished }

@@ -228,6 +228,7 @@ impl ParkedPair {
             previous: self.previous.take(),
             displaced: None,
             replay: None,
+            replay_since: None,
             context_update: true,
         }))
     }

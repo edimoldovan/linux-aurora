@@ -34,6 +34,12 @@ reproduction is claimed here.
   the watchdog without incrementing a render deferral counter. Both engines
   now charge deferrals, and render transaction grace ends after eight polls.
   Existing three replay credits remain finite and are never reset here.
+* Idle compute-pool releases have no scheduler job once their client is lost.
+  Record a timestamp on each exact release publication; a missing consumer
+  witness after 10 s stops the runtime while retaining the backing. Parked
+  render replays similarly expire after 10 s rather than polling forever when
+  admission or publication cannot proceed. Wakes/new clients do not refresh
+  either transaction timestamp; exact completion clears it.
 * A per-device burst limit stops the runtime on the eighth actual scheduler
   timeout in a 30 s window or the eighth restart handshake in a 30 s window.
   VM changes, new publications, recovery generations and replay do not reset

@@ -477,6 +477,7 @@ pub(crate) struct Queue {
     /// the installed queue record still names them until the next owner binds.
     retained_owner: Option<crate::g17::context::FirmwarePages>,
     pool_phase: PoolPhase,
+    release_sent_ns: Option<u64>,
     growing: bool,
     growth_blocks: usize,
     /// A killed queue was recycled: its pool/ring must be vacated and re-armed
@@ -540,6 +541,7 @@ impl Queue {
             owner: Some(owner),
             retained_owner: None,
             pool_phase: PoolPhase::Populated,
+            release_sent_ns: None,
             growing: false,
             growth_blocks: 0,
             needs_fresh_backing: false,
@@ -651,6 +653,10 @@ impl Queue {
     /// until its witness lets the idle physical queue be re-armed.
     pub(crate) fn pool_release_pending(&self) -> bool {
         matches!(self.pool_phase, PoolPhase::ReleaseSent(_))
+    }
+
+    pub(crate) fn pool_release_stalled(&self, now: u64) -> bool {
+        self.pool_release_pending() && crate::g17::timeout::background_stalled(self.release_sent_ns, now)
     }
 
     /// A closed owner can still retain its last commands or their completion
@@ -1357,6 +1363,7 @@ impl Queue {
         );
         let cursor = Rings::publish_control(init, &record)?;
         self.pool_phase = PoolPhase::ReleaseSent(cursor);
+        self.release_sent_ns = Some(crate::g17::now_ns());
         fence(Ordering::SeqCst);
         Ok(())
     }
@@ -1381,7 +1388,7 @@ impl Queue {
         let pages = self.pool.take_pages();
         let descriptors = self.binding.as_mut().and_then(|binding| binding.descriptors.take());
         let ring = self.graph.vacate_ring();
-        self.pool_phase = PoolPhase::Vacant;
+        self.pool_phase = PoolPhase::Vacant; self.release_sent_ns = None;
         Ok(Some(Vacated {
             _alias: alias,
             _pages: pages,
@@ -1400,6 +1407,7 @@ impl Queue {
         self.graph.rearm_ring(ring)?;
         self.pool.rearm(pages)?;
         self.pool_phase = PoolPhase::Populated;
+        self.release_sent_ns = None;
         self.needs_fresh_backing = false;
         Ok((self.pool.id(), self.pool.page_list_va()?))
     }
@@ -1419,7 +1427,8 @@ impl Queue {
             let record = ControlRecord::FreeListRelease(self.pool.release_record(self.free_list_generation));
             let cursor = Rings::publish_control(init, &record)?;
             self.pool_phase = PoolPhase::ReleaseSent(cursor);
-        } else { self.pool_phase = PoolPhase::Vacant; }
+        self.release_sent_ns = Some(crate::g17::now_ns());
+        } else { self.pool_phase = PoolPhase::Vacant; self.release_sent_ns = None; }
         self.growing = true;
         self.growth_blocks = blocks;
         Ok(self.installed)
@@ -1445,6 +1454,7 @@ impl Queue {
         self.pool.replace_pages(pages)?;
         let old_alias = core::mem::replace(&mut binding.pool_alias, alias.take());
         self.pool_phase = PoolPhase::Populated;
+        self.release_sent_ns = None;
         self.growing = false;
         self.growth_blocks = 0;
         Ok(Vacated { _alias: old_alias, _pages: pages.take(), _descriptors: None, _ring: None })

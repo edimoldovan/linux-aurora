@@ -1471,6 +1471,10 @@ impl super::Firmware {
             }
         }
         self.queues.observe_pool_releases(&self.init, deferred)?;
+        if self.queues.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref())
+            .any(|queue| queue.pool_release_stalled(now)) {
+            return Err(ETIMEDOUT);
+        }
         if self.render_control_backpressured() {
             return Ok(None);
         }

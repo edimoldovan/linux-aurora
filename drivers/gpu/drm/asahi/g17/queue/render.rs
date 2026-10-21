@@ -171,6 +171,7 @@ pub(crate) struct Pair {
     context_update: bool,
     /// A retired, never-executed group awaiting republication on this pair.
     replay: Option<Arc<Packet>>,
+    replay_since: Option<u64>,
 }
 impl Pair {
     #[inline(never)]
@@ -258,6 +259,7 @@ impl Pair {
             previous: None,
             displaced: None,
             replay: None,
+            replay_since: None,
             context_update: true,
         }))
     }
@@ -292,6 +294,9 @@ impl Pair {
     pub(crate) fn replay_polling(&self) -> bool {
         self.replay.is_some() || self.active.iter().any(|a| a.abandoned_since.is_some())
     }
+    pub(crate) fn replay_stalled(&self, now: u64) -> bool {
+        self.replay.is_some() && crate::g17::timeout::background_stalled(self.replay_since, now)
+    }
     pub(crate) fn replay_front(&self) -> Option<Arc<Packet>> {
         self.replay.clone()
     }
@@ -300,6 +305,7 @@ impl Pair {
             return Err(EIO);
         }
         self.replay = None;
+        self.replay_since = None;
         Ok(())
     }
     pub(crate) fn published_in_flight(&self) -> bool {
@@ -1233,6 +1239,7 @@ impl Pair {
         self.active.pop().ok_or(EIO)?;
         packet.reset_publication_for_replay();
         self.replay = Some(packet);
+        self.replay_since = Some(now);
         Ok(true)
     }
 
@@ -1247,6 +1254,7 @@ impl Pair {
         let Some(packet) = self.replay.take() else {
             return Ok(());
         };
+        self.replay_since = None;
         defer(Deferred::Retired(packet.completion.clone(), Err(error)))
     }
 
@@ -1434,6 +1442,7 @@ impl Pair {
             self.active.pop().ok_or(EIO)?;
         }
         if let Some(packet) = self.replay.take() {
+            self.replay_since = None;
             defer(Deferred::Drained(packet.completion.clone(), Err(EIO)))?;
         }
         if let Some(previous) = self.previous.as_mut() {

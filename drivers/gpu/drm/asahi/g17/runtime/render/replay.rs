@@ -27,7 +27,7 @@ impl Firmware {
             return Ok(());
         }
         for slot in 0..self.queues.render.entries.len() {
-            let Some((packet, owner, qids, closed, busy)) =
+            let Some((packet, owner, qids, closed, busy, stalled)) =
                 self.queues.render.entries[slot].as_ref().and_then(|entry| {
                     let pair = entry.pair.as_ref()?;
                     let packet = pair.replay_front()?;
@@ -40,11 +40,13 @@ impl Firmware {
                             || entry.growing
                             || entry.pending_timeout
                             || entry.pending_error.is_some(),
+                        pair.replay_stalled(crate::g17::now_ns()),
                     ))
                 })
             else {
                 continue;
             };
+            if stalled { return Err(ETIMEDOUT); }
             if busy {
                 continue;
             }

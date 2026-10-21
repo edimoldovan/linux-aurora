@@ -33,12 +33,12 @@ struct Graph;
 impl Graph {fn set_owner(&mut self,_:&Context)->Result{Ok(())}}
 struct Queue {
  owner:Option<u64>,installed:bool,growing:bool,growth_blocks:usize,free_list_generation:u64,
- pool_phase:PoolPhase,pool:Pool,binding:Option<Binding>,previous:Option<Previous>,graph:Graph,
+ pool_phase:PoolPhase,release_sent_ns:Option<u64>,pool:Pool,binding:Option<Binding>,previous:Option<Previous>,graph:Graph,
  active:Fifo,replays:Fifo,quarantined:bool,released:bool,retirement_ready:bool,
  retired_by_teardown:bool,released_at:u64,exit:Option<()>,needs_fresh_backing:bool,
 }
 fn idle(live:&Arc<AtomicUsize>)->Queue{Queue{owner:Some(1),installed:true,growing:false,growth_blocks:0,
- free_list_generation:0,pool_phase:PoolPhase::Populated,pool:Pool{pages:Some(Pages(10)),fail:false},
+ free_list_generation:0,pool_phase:PoolPhase::Populated,release_sent_ns:None,pool:Pool{pages:Some(Pages(10)),fail:false},
  binding:Some(Binding{context:Context::new(live),pool_alias:Some(1),descriptors:Some(2)}),previous:None,graph:Graph,
  active:Fifo{len:0},replays:Fifo{len:0},quarantined:false,released:false,retirement_ready:true,
  retired_by_teardown:false,released_at:0,exit:None,needs_fresh_backing:false}}
@@ -55,6 +55,7 @@ struct Pages(u64);
 impl Pages {fn page_list_va(&self)->u64{self.0}}
 mod mmu {pub type KernelMapping=u64;}
 mod g17 {
+ pub fn now_ns()->u64{crate::now_ns()}
  pub mod freelist {pub(crate) use crate::Pages; pub fn control_consumed(c:u32,_:u32,t:u32)->crate::Result<bool>{Ok(c==t)}}
  pub mod initdata {
   pub struct InitData {pub fail:bool}
@@ -101,6 +102,7 @@ fn main(){
   let mut q=idle(&live);q.retirement_ready=true;
   assert!(q.begin_growth(&init,40).unwrap());let token=q.growth_token().unwrap();
   assert!(q.growing);assert!(q.pool_phase==PoolPhase::ReleaseSent(3));
+  assert_eq!(q.release_sent_ns,Some(now_ns()),"exact publication starts the release deadline");
   assert_eq!(q.abort_growth(Growth{qid:8,phase:token.phase}).unwrap(),None,"wrong physical queue");
   assert_eq!(q.abort_growth(Growth{qid:token.qid,phase:PoolPhase::ReleaseSent(4)}).unwrap(),None,"stale release transaction");
   assert!(q.growing);
@@ -113,6 +115,7 @@ fn main(){
   assert!(!q.growing);assert!(q.owner.is_none());assert_eq!(q.growth_blocks,0);
   assert_eq!(q.abort_growth(token).unwrap(),None);
   assert!(q.pool.pages.is_some(),"abort must retain backing");
+  assert_eq!(q.release_sent_ns,Some(now_ns()),"abort must not refresh or discard an owned deadline");
   assert!(!q.reusable(),"published release still owns backing");
   let mut registry=Registry{compute:vec![Some(Entry{queue:Some(Box::new(q))})]};
   let mut deferred=DeferredBatch{vacated:vec![],capacity:0};
@@ -124,6 +127,7 @@ fn main(){
   if !consumed_first {assert_eq!(registry.observe_pool_releases(&init,&mut deferred).unwrap(),1);}
   let q=registry.compute[0].as_ref().unwrap().queue.as_ref().unwrap();
   assert!(q.pool_phase==PoolPhase::Vacant);assert!(q.reusable());
+  assert_eq!(q.release_sent_ns,None,"only the consumed release clears its deadline");
   assert_eq!(deferred.vacated[0]._pages.as_ref().unwrap().0,10);
   drop(registry);drop(deferred);assert_eq!(live.load(Ordering::SeqCst),0);
  }}
@@ -141,6 +145,7 @@ fn main(){
  let mut q=idle(&live);q.retirement_ready=true;q.begin_growth(&init,40).unwrap();
  let token=q.growth_token().unwrap();let mut pages=Some(Pages(20));let mut alias=Some(30);
  let old=q.finish_growth(&init,&mut pages,&mut alias,40).unwrap();
+ assert_eq!(q.release_sent_ns,None,"committed replacement clears the witnessed release deadline");
  assert_eq!(old._pages.unwrap().0,10);assert_eq!(old._alias,Some(1));assert!(pages.is_none());assert!(alias.is_none());
  assert_eq!(q.pool.pages.as_ref().unwrap().0,20);assert_eq!(q.abort_growth(token).unwrap(),None,"committed growth cannot be aborted");
  println!("PASS production growth: abort before/after consumption and close; stale witness/collector preserve backing; failed row/header rearm preserves both owners; commit invalidates abort token");
