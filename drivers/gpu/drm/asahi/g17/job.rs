@@ -13,7 +13,7 @@ use kernel::{
     sync::Arc,
 };
 
-pub(super) const TIMEOUT_MS: kernel::time::Msecs = 2000;
+pub(super) const TIMEOUT_MS: kernel::time::Msecs = super::timeout::POLL_MS;
 const RENDER_CREDITS: u32 = 32;
 const COMPUTE_CREDITS: u32 = 16;
 
@@ -272,6 +272,7 @@ struct Job<B: Backend> {
 struct Timeout<B: Backend> {
     backend: Arc<B>,
     victim_renewals: u8,
+    ray_query_renewals: u8,
     packet: Arc<Packet>,
 }
 
@@ -295,12 +296,24 @@ impl<B: Backend> sched::JobImpl for Job<B> {
         Timeout {
             backend: self.backend.clone(),
             victim_renewals: 0,
+            ray_query_renewals: 0,
             packet: self.packet.clone(),
         }
     }
 
     fn false_timeout(job: &mut Timeout<B>, finished: bool) -> bool {
         if finished || job.packet.completion.take_replay_timeout() {
+            return true;
+        }
+        let ray_query = match &job.packet.command {
+            Validated::Compute { intersection, .. } => intersection.enabled(),
+            Validated::Render { ray_query, .. } => {
+                ray_query.iter().any(|stage| stage.intersection.enabled())
+            }
+        };
+        if super::timeout::renew_ray_query(
+            job.packet.is_published(), ray_query, &mut job.ray_query_renewals,
+        ) {
             return true;
         }
         let deferred = job.backend.defer_timeout(&job.packet, job.victim_renewals);
