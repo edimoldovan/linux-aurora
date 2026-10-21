@@ -152,7 +152,7 @@ impl crate::g17::Shared {
                 drop(state);
                 drop(epoch);
                 self.lose_device_quietly();
-                self.stop_queues();
+                self.stop_runtime();
                 if let Some(mut pair) = pair {
                     pair.stopped(&mut |event| {
                         event.finish();

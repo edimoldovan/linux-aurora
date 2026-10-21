@@ -1379,6 +1379,38 @@ impl super::Firmware {
 }
 
 impl super::Shared {
+    /// Charge only real watchdog expirations, after the per-job allowance. A
+    /// changing client or recovery generation cannot mint a fresh storm budget.
+    pub(super) fn watchdog_timeout(self: &Arc<Self>) -> bool {
+        if self.crashed.load(Ordering::Acquire) { return true; }
+        let stop = {
+            let mut state = self.state.lock();
+            state.as_deref_mut().is_none_or(|firmware| firmware.recovery.timeout_limit(now_ns()))
+        };
+        if stop { self.lose_device_quietly(); }
+        stop
+    }
+
+    /// Workload-triggered stop: halt producers first, then join only for a
+    /// bounded interval. A stalled borrower leaves stopped firmware and all its
+    /// mappings owned in state. Only a later joined stop may detach/free them.
+    pub(super) fn stop_runtime(&self) {
+        let Some(_stopping) = self.stop.try_lock() else { return; };
+        {
+            let mut state = self.state.lock();
+            if let Some(firmware) = state.as_deref_mut() {
+                firmware.secondary.stop();
+                firmware.primary.stop();
+            }
+        }
+        if self.preparations.wait_drained_until(now_ns().saturating_add(WORK_RING_WAIT_NS)).is_err() {
+            dev_warn!(self.dev.as_ref(), "Stopped GPU retains outstanding preparation owners\n");
+            return;
+        }
+        let firmware = self.state.lock().take();
+        if let Some(mut firmware) = firmware { firmware.finish_stopped_queues(); }
+    }
+
     /// Joins construction and complete host teardown, including RTKit drops.
     /// The stop-only mutex outlives detached firmware destruction, so unbind
     /// cannot return while another stop caller still owns mailbox clients.

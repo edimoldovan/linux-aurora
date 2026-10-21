@@ -263,6 +263,7 @@ impl Firmware {
 
     /// Preparation admission is already closed and all builders have joined.
     pub(super) fn service_runtime_recovery(&mut self, deferred: &mut DeferredBatch) -> Result {
+        if self.recovery.restart_limit(super::now_ns()) { return Err(ETIMEDOUT); }
         let shared = self.primary.state.shared.clone();
         let mut service = Service {
             firmware: self,
@@ -300,7 +301,7 @@ impl crate::g17::Shared {
     /// boundary; the collector itself still owns every deferred completion.
     pub(in crate::g17) fn run_runtime_events(self: &Arc<Self>) {
         if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
-            self.stop_queues();
+            self.stop_runtime();
             return;
         }
         let mut deferred = {
@@ -324,7 +325,7 @@ impl crate::g17::Shared {
         if let Err(error) = result {
             dev_err!(self.dev.as_ref(), "GPU event service failed: {:?}\n", error);
             self.lose_device_quietly();
-            self.stop_queues();
+            self.stop_runtime();
         }
     }
 
@@ -345,7 +346,7 @@ impl crate::g17::Shared {
         };
         deferred.finish();
         if recover {
-            self.preparations.wait_drained();
+            self.preparations.wait_drained_until(super::now_ns().saturating_add(super::WORK_RING_WAIT_NS))?;
         }
         let mut state = self.state.lock();
         let Some(firmware) = (*state).as_deref_mut() else {

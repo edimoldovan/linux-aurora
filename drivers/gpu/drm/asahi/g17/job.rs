@@ -143,23 +143,40 @@ impl Packet {
         }
     }
 
+    /// Replay holds the device mutex. Its original inputs were satisfied before
+    /// first publication; never sleep on a fence that needs event service here.
+    pub(crate) fn check_replay_dependencies(&self) -> Result {
+        for fence in &self.inputs {
+            super::dependency::replay_status(fence_status(fence))?;
+        }
+        for fence in &self.firmware { check_status(fence)?; }
+        Ok(())
+    }
+
     /// Scheduler dependency readiness includes failed fences. Consume the actual
     /// status before publication, and retain the references through that check.
     pub(crate) fn check_dependencies(&self) -> Result {
+        let polls = if self.command.long_job() { 5 } else { 1 };
+        let deadline = super::now_ns().saturating_add(u64::from(TIMEOUT_MS) * polls * 1_000_000);
         for fence in &self.inputs {
-            // SAFETY: The retained fence owns the pointer throughout the wait and read.
-            let waited = unsafe {
-                bindings::dma_fence_wait_timeout(
-                    fence.raw(),
-                    true,
-                    kernel::task::MAX_SCHEDULE_TIMEOUT,
-                )
-            };
-            if waited < 0 {
-                return Err(super::dependency::inherited_error(Error::from_errno(waited as i32)));
-            }
-            if waited == 0 {
-                return Err(ECANCELED);
+            loop {
+                if self.cancel_requested() || self.completion.status().get() != 0 {
+                    return Err(ECANCELED);
+                }
+                if fence_status(fence) != 0 { break; }
+                if super::now_ns() >= deadline { return Err(ECANCELED); }
+                // SAFETY: The retained fence owns the pointer throughout the bounded wait.
+                let waited = unsafe {
+                    bindings::dma_fence_wait_timeout(
+                        fence.raw(),
+                        true,
+                        kernel::time::msecs_to_jiffies(10) as isize,
+                    )
+                };
+                if waited < 0 {
+                    return Err(super::dependency::inherited_error(Error::from_errno(waited as i32)));
+                }
+                if waited > 0 { break; }
             }
             check_status(fence)?;
         }
@@ -311,7 +328,7 @@ impl<B: Backend> sched::JobImpl for Job<B> {
             return true;
         }
         let deferred = job.backend.defer_timeout(&job.packet, job.victim_renewals);
-        if deferred && job.packet.engine() == Engine::Compute {
+        if deferred {
             job.victim_renewals += 1;
         }
         deferred

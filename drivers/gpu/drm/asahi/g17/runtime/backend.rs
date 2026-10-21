@@ -18,8 +18,9 @@ impl Backend {
     }
 
     fn stop_after_error(&self) {
+        // Scheduler/fence callbacks never synchronously join builders or RTKit
+        // receive work. The event worker performs the bounded runtime stop.
         self.shared.lose_device_quietly();
-        self.shared.stop_queues();
     }
 
     fn rollback_unpublished_compute(&self) -> Result {
@@ -190,6 +191,7 @@ impl job::Backend for Backend {
 
     fn timed_out(&self, packet: Arc<Packet>) -> sched::Status {
         self.release_backlog(&packet);
+        if self.shared.watchdog_timeout() { return sched::Status::NoHang; }
         let result = match packet.engine() {
             Engine::Compute => self.timeout_compute(&packet),
             Engine::Render => self.timeout_render(&packet),
@@ -219,6 +221,7 @@ impl job::Backend for Backend {
         if packet.engine() == Engine::Compute {
             return self.defer_compute_timeout(packet, renewals);
         }
+        if !crate::g17::timeout::transaction_grace(renewals) { return false; }
         let mut state = self.shared.state.lock();
         (*state)
             .as_deref_mut()

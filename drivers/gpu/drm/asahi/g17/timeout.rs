@@ -6,6 +6,10 @@
 
 pub(crate) const MAX_RENEWALS: u8 = 8;
 
+/// A borrowed render graph or queued off-lock retirement is not evidence of
+/// progress. Share the finite deferral bound with cross-VM attribution.
+pub(crate) fn transaction_grace(renewals: u8) -> bool { renewals < MAX_RENEWALS }
+
 /// Keep the scheduler poll, control-ring waits and ordinary jobs at two seconds.
 /// Native ray traversal and AS builds can exceed one poll (CTS stress). Four
 /// extra polls give it ten seconds, still one tenth of the legacy scheduler's
@@ -103,6 +107,12 @@ mod tests {
             assert_eq!(as_build((1 << bit) | (1 << 2)), None);
         }
         assert_eq!(as_build(u32::MAX), None);
+    }
+    #[test]
+    fn borrowed_render_and_queued_retirement_cannot_defer_forever() {
+        for count in 0..=u8::MAX {
+            assert_eq!(transaction_grace(count), count < MAX_RENEWALS);
+        }
     }
     fn head(vm: usize, published: u64, finished: bool) -> Head {
         Head { vm, published, finished }

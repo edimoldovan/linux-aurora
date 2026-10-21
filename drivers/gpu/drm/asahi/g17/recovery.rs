@@ -9,6 +9,7 @@
 
 mod attribution;
 mod slot;
+mod safety;
 pub(crate) use attribution::Sources;
 use attribution::Attribution;
 
@@ -99,6 +100,8 @@ struct Request {
 pub(super) struct State {
     accepted: u64,
     pending: Option<Request>,
+    timeouts: safety::Storm,
+    restarts: safety::Storm,
 }
 
 /// Non-fatal post-recovery failures. The firmware handshake has already closed successfully.
@@ -112,8 +115,12 @@ impl State {
         Self {
             accepted: 0,
             pending: None,
+            timeouts: safety::Storm::new(),
+            restarts: safety::Storm::new(),
         }
     }
+    pub(super) fn timeout_limit(&mut self, now: u64) -> bool { self.timeouts.note(now) }
+    pub(super) fn restart_limit(&mut self, now: u64) -> bool { self.restarts.note(now) }
     pub(super) fn generation(&self) -> u64 {
         self.accepted
     }

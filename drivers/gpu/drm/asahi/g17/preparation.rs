@@ -178,6 +178,17 @@ impl Gate {
         self.changed.notify_all();
     }
 
+    /// Runtime failure/recovery must not join an indefinitely stalled builder.
+    /// Timeout retains every graph and reservation; it never authorizes freeing.
+    pub(super) fn wait_drained_until(&self, deadline: u64) -> Result {
+        let mut wait = self.wait.lock();
+        while self.state.load(Ordering::Acquire) & COUNT_MASK != 0 {
+            if super::now_ns() >= deadline { return Err(ETIMEDOUT); }
+            let _ = self.changed.wait_timeout(&mut wait, kernel::time::msecs_to_jiffies(10));
+        }
+        Ok(())
+    }
+
     /// Join builders with no device, queue or mapping lock held.
     pub(super) fn wait_drained(&self) {
         let mut wait = self.wait.lock();
