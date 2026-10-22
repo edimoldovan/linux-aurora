@@ -24,9 +24,10 @@ pub(super) enum Site {
     LowerVa,
     UpperVa,
     AliasVa,
+    ExecutionContexts,
 }
 
-const SITE_COUNT: usize = Site::AliasVa as usize + 1;
+const SITE_COUNT: usize = Site::ExecutionContexts as usize + 1;
 static REFUSALS: [AtomicU64; SITE_COUNT] = [const { AtomicU64::new(0) }; SITE_COUNT];
 
 /// First and power-of-two refusals per site keep a pressure storm bounded in
@@ -78,7 +79,7 @@ impl kernel::debugfs::Writer for View {
             Site::ComputeReserve, Site::PhysicalQids, Site::RenderSlots, Site::LogicalQueues,
             Site::ComputeSlots, Site::QosIds, Site::ComputeItems, Site::RetiredRenderBindings,
             Site::RenderPoolIds, Site::RenderWorkSlots, Site::ParameterBuffers, Site::MetricsIds,
-            Site::LowerVa, Site::UpperVa, Site::AliasVa,
+            Site::LowerVa, Site::UpperVa, Site::AliasVa, Site::ExecutionContexts,
         ].iter().zip(REFUSALS.iter()) {
             writeln!(f, "refusals site={:?} count={}", site, count.load(Ordering::Relaxed))?;
         }

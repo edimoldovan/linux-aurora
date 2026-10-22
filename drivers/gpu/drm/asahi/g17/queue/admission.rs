@@ -372,6 +372,10 @@ impl Pool {
             GFP_KERNEL,
         )
     }
+    /// Logical queues currently counted, including one being created.
+    pub(crate) fn queues(&self) -> u32 {
+        self.queues.load(Ordering::Acquire)
+    }
     pub(crate) fn reserve_queue(self: &Arc<Self>) -> Result<QueueSlot> {
         let mut count = self.queues.load(Ordering::Acquire);
         loop {
