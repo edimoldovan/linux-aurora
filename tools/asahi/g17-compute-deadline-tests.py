@@ -52,8 +52,8 @@ fn now_ns()->u64{NOW.load(Ordering::SeqCst)}
 fn advance(ns:u64){NOW.fetch_add(ns,Ordering::SeqCst);}
 mod kernel{pub mod time{
  pub fn msecs_to_jiffies(ms:u32)->u32{ms}
- pub struct Delta(pub u64);impl Delta{pub fn from_millis(ms:u64)->Self{Self(ms)}}
- pub mod delay{pub fn fsleep(d:super::Delta){crate::advance(d.0*1_000_000);}}
+ pub struct Delta(pub u64);impl Delta{pub fn from_millis(ms:u64)->Self{Self(ms*1_000_000)}pub fn from_micros(us:i64)->Self{Self(us as u64*1_000)}}
+ pub mod delay{pub fn fsleep(d:super::Delta){crate::advance(d.0);}}
 }}
 ''' + admission + r'''
 struct Wait;
@@ -70,7 +70,7 @@ impl Gate{
 struct Scratch;impl Scratch{fn pages(&self)->u16{0}}
 enum Validated{Compute{scratch:Scratch}}
 struct Status;impl Status{fn get(&self)->i32{if now_ns()>=STATUS.load(Ordering::SeqCst){-5}else{0}}}
-struct Work;impl Work{fn acquire(&self)->Result{Ok(())}}
+struct Work;impl Work{fn acquire(&self)->Result{if MODE.load(Ordering::SeqCst)==4{Err(EBUSY)}else{Ok(())}}}
 struct Completion;impl Completion{fn status(&self)->Status{Status}fn work_state(&self)->Result<Work>{Ok(Work)}}
 struct Packet{command:Validated,completion:Completion}
 impl Packet{fn check_dependencies(&self)->Result{Ok(())}fn cancel_requested(&self)->bool{now_ns()>=CANCEL.load(Ordering::SeqCst)}fn is_published(&self)->bool{false}}
@@ -109,6 +109,13 @@ fn main(){
   if mode==0{assert_eq!(CALLS.load(Ordering::SeqCst),4);assert_eq!(now_ns(),WORK_RING_WAIT_NS);}
   println!("PASS mode={} result={:?} calls={} elapsed_ms={}",mode,r,CALLS.load(Ordering::SeqCst),now_ns()/1_000_000);
  }
+ // A context without a free work state waits for one under the admission
+ // deadline instead of failing the packet at once.
+ MODE.store(4,Ordering::SeqCst);NOW.store(0,Ordering::SeqCst);CALLS.store(0,Ordering::SeqCst);
+ let r=b.compute_packet(&p,&mut DeferredBatch);
+ assert_eq!(r,Err(EBUSY),"a busy work state ends at the admission deadline");
+ assert!(now_ns()>=WORK_RING_WAIT_NS&&now_ns()<=WORK_RING_WAIT_NS+10_000_000,"a busy work state waits for the admission deadline");
+ println!("PASS busy work state waits elapsed_ms={}",now_ns()/1_000_000);
  for status in [false,true] {
   MODE.store(2,Ordering::SeqCst);NOW.store(0,Ordering::SeqCst);CALLS.store(0,Ordering::SeqCst);
   if status{STATUS.store(10_000_000,Ordering::SeqCst);}else{CANCEL.store(10_000_000,Ordering::SeqCst);}

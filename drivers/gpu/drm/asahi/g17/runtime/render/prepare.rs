@@ -78,8 +78,14 @@ struct BuildContext<'a> {
 }
 
 impl super::super::Backend {
-    fn build_render_pair(&self, slot: u8, first: &Arc<Packet>, optional: bool) -> Result {
-        let lease = self.shared.preparations.enter(false)?;
+    fn build_render_pair(
+        &self,
+        slot: u8,
+        first: &Arc<Packet>,
+        optional: bool,
+        sleep: bool,
+    ) -> Result {
+        let lease = self.enter_preparation(sleep)?;
         let dev = self.shared.drm()?;
         let (resources, build) = {
             let mut state = self.shared.state.lock();
@@ -577,8 +583,8 @@ impl super::super::Backend {
         firmware.queues.render.pools.warm(&firmware.init, &pool)
     }
 
-    pub(super) fn ensure_render(&self, packet: &Arc<Packet>, slot: u8) -> Result {
-        self.build_render_pair(slot, packet, false)?;
+    pub(super) fn ensure_render(&self, packet: &Arc<Packet>, slot: u8, sleep: bool) -> Result {
+        self.build_render_pair(slot, packet, false, sleep)?;
         let sibling = {
             let state = self.shared.state.lock();
             (*state)
@@ -593,8 +599,8 @@ impl super::super::Backend {
             // construction and its final device-locked install have finished.
             // An optional sibling may be borrowed or waiting for recovery.
             // The selected pair is revalidated by prepare_render before publication.
-            match self.build_render_pair(sibling.slot(), packet, true) {
-                Err(error) if error == EBUSY || error == EAGAIN => {}
+            match self.build_render_pair(sibling.slot(), packet, true, sleep) {
+                Err(error) if error == EBUSY || error == EAGAIN || error == super::submit::FALLBACK => {}
                 result => result?,
             }
         }
@@ -606,8 +612,9 @@ impl super::super::Backend {
         slot: u8,
         packet: &Arc<Packet>,
         deferred: &mut super::super::DeferredBatch,
+        sleep: bool,
     ) -> Result {
-        let lease = self.shared.preparations.enter(false)?;
+        let lease = self.enter_preparation(sleep)?;
         let dev = self.shared.drm()?;
         let (uat, mut pair, addresses, growth_target) = {
             let mut state = self.shared.state.lock();

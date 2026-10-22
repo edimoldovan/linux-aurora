@@ -1312,6 +1312,7 @@ impl Backend {
         packet.check_dependencies()?;
         let super::command::Validated::Compute { scratch, .. } = &packet.command else { return Err(EINVAL); };
         let mut recovery_polls = 0;
+        let mut state_delay = 20i64;
         let deadline = now_ns().saturating_add(WORK_RING_WAIT_NS);
         let check = || {
             if packet.cancel_requested() { return Err(ECANCELED); }
@@ -1328,7 +1329,22 @@ impl Backend {
             Backend::ensure_compute(self, scratch.pages(), &admission)?;
             admission.check()?;
             let lease = self.shared.preparations.enter_until(&admission)?;
-            packet.completion.work_state()?.acquire()?;
+            // Work states free as this context's earlier commands retire.
+            // Wait for one under the packet's admission deadline, as render
+            // publication does, instead of failing the packet.
+            match packet.completion.work_state()?.acquire() {
+                Err(error) if error == EBUSY => {
+                    drop(lease);
+                    admission.check()?;
+                    self.shared.queue_events();
+                    kernel::time::delay::fsleep(kernel::time::Delta::from_micros(state_delay));
+                    state_delay = (state_delay * 2).min(1000);
+                    continue;
+                }
+                result => {
+                    result?;
+                }
+            }
             let mut state = self.shared.state.lock();
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
             if !lease.is_current() {

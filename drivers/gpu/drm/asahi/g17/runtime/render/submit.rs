@@ -14,7 +14,29 @@ use kernel::{
     time::{delay::fsleep, Delta},
 };
 
+/// Internal result of a publication attempted from the submitting ioctl that
+/// met contention before anything became visible: the scheduler publishes the
+/// command instead. Never returned to userspace.
+pub(super) const FALLBACK: Error = EINPROGRESS;
+
 impl Backend {
+    /// The submitting ioctl holds the logical queue's mutex and never sleeps
+    /// for contention or a closed preparation gate: it returns FALLBACK, and
+    /// the scheduler's worker publishes the command and owns the waits.
+    pub(super) fn enter_preparation(&self, sleep: bool) -> Result<crate::g17::preparation::Lease> {
+        if sleep {
+            return self.shared.preparations.enter(false);
+        }
+        // A closed gate (recovery) is the only case enter() would sleep for.
+        self.shared.preparations.try_enter().map_err(|error| {
+            if error == EAGAIN {
+                FALLBACK
+            } else {
+                error
+            }
+        })
+    }
+
     pub(in crate::g17) fn render_packet(
         &self,
         packet: &Arc<Packet>,
@@ -30,6 +52,7 @@ impl Backend {
         &self,
         packet: &Arc<Packet>,
         mut next: Option<RenderLease>,
+        sleep: bool,
     ) -> Result<RenderLease> {
         let pool = {
             let state = self.shared.state.lock();
@@ -49,6 +72,10 @@ impl Backend {
             let lease = if let Some(lease) = next.take() {
                 lease
             } else {
+                // Admission sleeps for a pick; the ioctl leaves that to the scheduler.
+                if !sleep {
+                    return Err(FALLBACK);
+                }
                 match pool.acquire_render(self.owner, Request::of(packet), deadline_ns, || {
                     // Atomics only: the callback runs under the pool mutex.
                     if packet.cancel_requested() || self.closed.load(Ordering::Acquire) {
@@ -70,7 +97,7 @@ impl Backend {
                                 .reclaim_unused_render_spare(Some(self.owner), false)?
                         };
                         if reclaimed.is_none() {
-                            self.wait_render_capacity(started)?;
+                            self.wait_render_capacity(started, sleep)?;
                         }
                         drop(reclaimed);
                         continue;
@@ -104,7 +131,7 @@ impl Backend {
                     let ready = firmware.queues.has_render_ids(self.owner);
                     drop(state);
                     if reclaimed.is_none() && !ready {
-                        self.wait_render_capacity(started)?;
+                        self.wait_render_capacity(started, sleep)?;
                     }
                     drop(reclaimed);
                 }
@@ -117,7 +144,10 @@ impl Backend {
     /// scheduler it last ran for to be consumed and the pair parked. The event
     /// worker observes both, so kick it on every poll; time out only after the
     /// same bound as a capacity wait.
-    fn wait_render_busy(&self, since: &mut Option<u64>) -> Result {
+    fn wait_render_busy(&self, since: &mut Option<u64>, sleep: bool) -> Result {
+        if !sleep {
+            return Err(FALLBACK);
+        }
         let now = super::super::now_ns();
         if now.saturating_sub(*since.get_or_insert(now)) >= super::super::WORK_RING_WAIT_NS {
             return Err(ETIMEDOUT);
@@ -130,7 +160,10 @@ impl Backend {
     /// A closing owner may still hold its pair until exact retirement. Wait
     /// outside both the device mutex and preparation gate so the event worker
     /// and recovery can return capacity. No packet is firmware-visible here.
-    fn wait_render_capacity(&self, started: u64) -> Result {
+    fn wait_render_capacity(&self, started: u64, sleep: bool) -> Result {
+        if !sleep {
+            return Err(FALLBACK);
+        }
         self.wait_capacity(started)
     }
 
@@ -149,7 +182,10 @@ impl Backend {
             return Err(EIO);
         }
         let interruptible = early.is_none();
-        let admission = self.acquire_render_with_ids(packet, early)?;
+        // A publication from the submitting ioctl (an early lease) never
+        // sleeps for contention; it falls back to the scheduler instead.
+        let sleep = early.is_none();
+        let admission = self.acquire_render_with_ids(packet, early, sleep)?;
         let slot = admission.slot();
         packet.completion.attach_render_lease(admission)?;
         let mut state_polls = 0;
@@ -169,7 +205,11 @@ impl Backend {
                 return Err(EFAULT);
             }
             let work_state = {
-                let preparation = self.shared.preparations.enter(interruptible)?;
+                let preparation = if sleep {
+                    self.shared.preparations.enter(interruptible)?
+                } else {
+                    self.enter_preparation(false)?
+                };
                 let result = packet.completion.work_state().and_then(|state| state.acquire());
                 if preparation.is_current() {
                     result
@@ -180,6 +220,9 @@ impl Backend {
             match work_state {
                 Err(error) if error == EAGAIN => continue,
                 Err(error) if error == EBUSY => {
+                    if !sleep {
+                        return Err(FALLBACK);
+                    }
                     if state_polls == 1000 {
                         return Err(ETIMEDOUT);
                     }
@@ -192,21 +235,21 @@ impl Backend {
                     result?;
                 }
             }
-            match self.ensure_render(packet, slot) {
+            match self.ensure_render(packet, slot, sleep) {
                 Err(error) if error == ENOSPC => {
-                    self.wait_capacity(capacity_started)?;
+                    self.wait_render_capacity(capacity_started, sleep)?;
                     continue;
                 }
                 Err(error) if error == EAGAIN => continue,
                 Err(error) if error == EBUSY => {
-                    self.wait_render_busy(&mut busy_since)?;
+                    self.wait_render_busy(&mut busy_since, sleep)?;
                     continue;
                 }
                 result => result?,
             }
-            match self.prepare_render(slot, packet, deferred) {
+            match self.prepare_render(slot, packet, deferred, sleep) {
                 Err(error) if !packet.is_published() && error == ENOSPC => {
-                    self.wait_capacity(capacity_started)?;
+                    self.wait_render_capacity(capacity_started, sleep)?;
                     continue;
                 }
                 Err(error) if !packet.is_published() && [EAGAIN, EBUSY].contains(&error) => {
@@ -217,6 +260,9 @@ impl Backend {
                             || crate::g17::recovery::Memory::recovery_state(&firmware.init)? != 0
                     };
                     if recovering {
+                        if !sleep {
+                            return Err(FALLBACK);
+                        }
                         if recovery_polls == super::super::RECOVERY_SETTLE_POLLS {
                             return Err(ETIMEDOUT);
                         }
@@ -224,7 +270,9 @@ impl Backend {
                         self.shared.queue_events();
                         fsleep(Delta::from_millis(1));
                     } else if error == EBUSY {
-                        self.wait_render_busy(&mut busy_since)?;
+                        self.wait_render_busy(&mut busy_since, sleep)?;
+                    } else if !sleep {
+                        return Err(FALLBACK);
                     }
                 }
                 result => return result,
@@ -267,6 +315,16 @@ impl Backend {
             }
         };
         let result = self.render_with_lease(packet, Some(admission), &mut deferred);
+        if matches!(result, Err(error) if error == FALLBACK) && !packet.is_published() {
+            // Contention before anything became visible: the ioctl does not
+            // sleep. Return the lease and the claim; the scheduler publishes
+            // the command, and later ones wait behind it in the backlog.
+            let lease = packet.completion.detach_render_lease();
+            deferred.finish();
+            drop(lease);
+            packet.abandon_publication();
+            return false;
+        }
         let result = self
             .finish_publication(packet, result, &mut deferred)
             .map(|_| ());
