@@ -190,6 +190,15 @@ impl job::Backend for Backend {
     }
 
     fn timed_out(&self, packet: Arc<Packet>) -> sched::Status {
+        // A packet still in publication, for example waiting for capacity or
+        // for its render pair's graph, has nothing visible to firmware and may
+        // not even have an installed pair. Its publisher owns its bounded wait
+        // and result, and it keeps its place in the backlog so that a later
+        // dependency-free command is not published from its ioctl ahead of it.
+        // It is not a hang and does not count towards the timeout storm limit.
+        if !packet.is_published() {
+            return sched::Status::NoHang;
+        }
         self.release_backlog(&packet);
         if self.shared.watchdog_timeout() { return sched::Status::NoHang; }
         let result = match packet.engine() {
