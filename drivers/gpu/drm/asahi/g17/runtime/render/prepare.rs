@@ -419,6 +419,9 @@ impl super::super::Backend {
             entry.preparing = None;
             entry.pending_owner = None;
             entry.pending_owner_closed = false;
+            if firmware.queues.render.take_missed_event(slot) {
+                self.shared.queue_events();
+            }
             firmware.render_grow_ready()
         };
         self.shared.changed.notify_all();
@@ -526,6 +529,9 @@ impl super::super::Backend {
             entry.pair = Some(pair);
             entry.borrowed_dependencies = None;
             entry.borrowed_switch = None;
+            if firmware.queues.render.take_missed_event(slot) {
+                self.shared.queue_events();
+            }
             (result, firmware.render_grow_ready())
         };
         drop(prepared);
@@ -690,6 +696,9 @@ impl super::super::Backend {
         let mut state = self.shared.state.lock();
         let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
         firmware.queues.render.return_pair(slot, &mut returned)?;
+        if firmware.queues.render.take_missed_event(slot) {
+            self.shared.queue_events();
+        }
         if firmware.queues.render.entry(slot)?.closed {
             firmware
                 .queues
