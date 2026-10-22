@@ -382,8 +382,11 @@ impl File {
             return Err(ENODEV);
         }
 
+        let memory_limits = memacct::LEDGER.limits();
         let mut params = uapi::drm_asahi_params_global {
             features: 0,
+            memory_limit: memory_limits.device,
+            client_memory_limit: memory_limits.client,
 
             vm_start: file.inner().user_range.start,
             vm_end: file.inner().user_range.end,

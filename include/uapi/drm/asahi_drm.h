@@ -212,6 +212,20 @@ struct drm_asahi_params_global {
 	 * DRM_ASAHI_GPU_HAL_200.
 	 */
 	__u32 gpu_hal_generation;
+
+	/**
+	 * @memory_limit: Device-wide limit on user committed plus kernel
+	 * resident bytes. Zero means no driver limit. This is a capacity,
+	 * not current free memory; other clients share it.
+	 */
+	__u64 memory_limit;
+
+	/**
+	 * @client_memory_limit: Per-DRM-file limit on user committed bytes.
+	 * Zero means no driver limit. Userspace must zero-initialize the reply
+	 * buffer: older kernels leave these optional tail fields untouched.
+	 */
+	__u64 client_memory_limit;
 };
 
 /**

@@ -168,6 +168,14 @@ impl Ledger {
         );
     }
 
+    /// Admission capacities exported in the optional GET_PARAMS tail.
+    pub(crate) fn limits(&self) -> Limits {
+        Limits {
+            device: self.limit.load(Ordering::Relaxed),
+            client: self.client_limit.load(Ordering::Relaxed),
+        }
+    }
+
     pub(crate) fn set_limits(&self, limits: Limits) {
         self.limit.store(limits.device, Ordering::Relaxed);
         self.client_limit.store(limits.client, Ordering::Relaxed);
@@ -521,5 +529,21 @@ mod tests {
         // checks that every RSS counter is back to zero.
         unsafe { kernel::bindings::mmput(raw) };
         Ok(())
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_gem_memory_limits)]
+mod exported_limits_tests {
+    use super::*;
+
+    #[test]
+    fn exported_capacities_match_admission() {
+        let ledger = Ledger::new();
+        assert_eq!(ledger.limits(), Limits { device: 0, client: 0 });
+        let limits = limits_for(8 << 30, 67, 50);
+        ledger.set_limits(limits);
+        assert_eq!(ledger.limits(), limits);
+        assert!(limits.client < limits.device);
+        assert_eq!(limits.client, 4 << 30);
     }
 }
