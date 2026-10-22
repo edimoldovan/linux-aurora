@@ -113,6 +113,20 @@ impl Backend {
         }
     }
 
+    /// A pair is borrowed, still settling, or waiting for the release of the
+    /// scheduler it last ran for to be consumed and the pair parked. The event
+    /// worker observes both, so kick it on every poll; time out only after the
+    /// same bound as a capacity wait.
+    fn wait_render_busy(&self, since: &mut Option<u64>) -> Result {
+        let now = super::super::now_ns();
+        if now.saturating_sub(*since.get_or_insert(now)) >= super::super::WORK_RING_WAIT_NS {
+            return Err(ETIMEDOUT);
+        }
+        self.shared.queue_events();
+        fsleep(Delta::from_micros(200));
+        Ok(())
+    }
+
     /// A closing owner may still hold its pair until exact retirement. Wait
     /// outside both the device mutex and preparation gate so the event worker
     /// and recovery can return capacity. No packet is firmware-visible here.
@@ -140,7 +154,7 @@ impl Backend {
         packet.completion.attach_render_lease(admission)?;
         let mut state_polls = 0;
         let mut state_delay = 20i64;
-        let mut takeover_polls = 0;
+        let mut busy_since = None;
         let mut recovery_polls = 0;
         let capacity_started = super::super::now_ns();
         loop {
@@ -185,11 +199,7 @@ impl Backend {
                 }
                 Err(error) if error == EAGAIN => continue,
                 Err(error) if error == EBUSY => {
-                    if takeover_polls == 5000 {
-                        return Err(ETIMEDOUT);
-                    }
-                    takeover_polls += 1;
-                    fsleep(Delta::from_micros(200));
+                    self.wait_render_busy(&mut busy_since)?;
                     continue;
                 }
                 result => result?,
@@ -214,11 +224,7 @@ impl Backend {
                         self.shared.queue_events();
                         fsleep(Delta::from_millis(1));
                     } else if error == EBUSY {
-                        if takeover_polls == 5000 {
-                            return Err(ETIMEDOUT);
-                        }
-                        takeover_polls += 1;
-                        fsleep(Delta::from_micros(200));
+                        self.wait_render_busy(&mut busy_since)?;
                     }
                 }
                 result => return result,
@@ -394,6 +400,14 @@ impl crate::g17::Firmware {
         }
         let dependencies = self.queues.render_dependencies(owner, packet, state)?;
         let pair = self.queues.render.entry(slot)?.pair.as_ref().ok_or(EIO)?;
+        // An owner change taken from a live owner which closed meanwhile: its
+        // first command waits until that scheduler's release has been consumed.
+        if pair
+            .owner_switch_from(&packet.context)
+            .is_some_and(|scheduler| self.queues.teardown.releasing_scheduler(scheduler))
+        {
+            return Err(EBUSY);
+        }
         let pool = pair.pool().clone();
         let buffer_id = pair.buffer_id();
         let (buffer_id, buffer_token) = self.queues.buffers.acquire_owner(buffer_id)?;

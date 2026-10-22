@@ -136,6 +136,7 @@ impl Registry {
             queue.share_idle()?;
         }
         let mut vacant = None;
+        let teardown = &self.teardown;
         for queue in self
             .compute
             .iter_mut()
@@ -144,6 +145,12 @@ impl Registry {
             .filter(|queue| queue.reusable())
         {
             admission.check()?;
+            // The release of the scheduler these records were bound to is armed
+            // or not yet consumed: the firmware may process it against this
+            // queue, which therefore must not change owner until it has.
+            if queue.context().is_some_and(|bound| teardown.releasing(bound)) {
+                continue;
+            }
             if queue.pool_vacant() {
                 vacant.get_or_insert(queue.qid());
                 continue;
@@ -174,6 +181,7 @@ impl Registry {
     }
 
     pub(super) fn bind_rearmed(&mut self, qid: u8, owner: u64, context: &Arc<Context>) -> Result {
+        let teardown = &self.teardown;
         let queue = self
             .compute
             .iter_mut()
@@ -181,6 +189,10 @@ impl Registry {
             .filter_map(|entry| entry.queue.as_deref_mut())
             .find(|queue| queue.qid() == qid && queue.reusable())
             .ok_or(EAGAIN)?;
+        // Its last owner may have closed while the backing was rebuilt.
+        if queue.context().is_some_and(|bound| teardown.releasing(bound)) {
+            return Err(EAGAIN);
+        }
         queue.bind_owner(owner, context.clone())
     }
 
@@ -1082,6 +1094,15 @@ impl super::Firmware {
             .filter_map(|entry| entry.queue.as_deref_mut())
             .find(|queue| queue.owner() == Some(owner))
             .ok_or(EIO)?;
+        // The first command after an owner change waits while the scheduler
+        // the queue was bound to is being released: a live previous owner may
+        // have closed after giving up the queue.
+        if queue
+            .pending_switch_from()
+            .is_some_and(|previous| queues.teardown.releasing(previous))
+        {
+            return Err(EAGAIN);
+        }
         let mut host = ComputeHost {
             init: &self.init,
             primary: &mut self.primary,

@@ -172,6 +172,12 @@ pub(crate) struct Pair {
     /// A retired, never-executed group awaiting republication on this pair.
     replay: Option<Arc<Packet>>,
     replay_since: Option<u64>,
+    /// Scheduler page of the context of the last published command: the
+    /// scheduler the firmware last ran these queues for. Zero for a fresh graph.
+    executed: u64,
+    /// An owner change in flight: the previous scheduler page and the ordinal of
+    /// the new owner's first command, until that command leaves the pair.
+    switch: Option<(u64, u64)>,
 }
 impl Pair {
     #[inline(never)]
@@ -261,6 +267,8 @@ impl Pair {
             replay: None,
             replay_since: None,
             context_update: true,
+            executed: 0,
+            switch: None,
         }))
     }
     pub(crate) fn qids(&self) -> [u8; 2] {
@@ -798,6 +806,11 @@ impl Pair {
         if let Some(previous) = self.previous.as_mut().filter(|p| p.publication.is_none()) {
             previous.publication = Some(ordinal);
         }
+        let scheduler = packet.context.scheduler_va();
+        if self.executed != 0 && self.executed != scheduler {
+            self.switch = Some((self.executed, ordinal));
+        }
+        self.executed = scheduler;
         packet.context.mark_published();
         self.announce_publication(
             host,
@@ -1595,6 +1608,18 @@ impl Pair {
                 previous.ready = true;
             }
         }
+    }
+    /// The scheduler page these queues last ran a command for, when the next
+    /// publication for `context` changes the queues' owner.
+    pub(crate) fn owner_switch_from(&self, context: &Context) -> Option<u64> {
+        (self.executed != 0 && self.executed != context.scheduler_va()).then_some(self.executed)
+    }
+    /// The previous scheduler page of an owner change whose first command has
+    /// not left the pair yet.
+    pub(crate) fn switch_in_flight(&self) -> Option<u64> {
+        let (from, first) = self.switch?;
+        (self.replay.is_some() || self.active.iter().any(|active| active.ticket.ordinal == first))
+            .then_some(from)
     }
     pub(crate) fn take_retired_binding(&mut self) -> Option<RetiredBinding> {
         if self.displaced.is_some() {
