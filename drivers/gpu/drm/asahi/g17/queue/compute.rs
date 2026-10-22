@@ -597,9 +597,6 @@ impl Queue {
     pub(crate) fn in_flight(&self) -> bool {
         self.active.len != 0 && !self.quarantined
     }
-    pub(crate) fn room(&self) -> bool {
-        !self.quarantined && !self.released && self.replays.len == 0 && self.active.len < IN_FLIGHT
-    }
     /// Quarantines without a pending witness no longer describe live pipe order.
     pub(crate) fn timeout_head(&self) -> Option<crate::g17::timeout::Head> {
         if self.quarantined && !self.awaiting_witness {
@@ -1078,6 +1075,21 @@ fn item_capacity(cursors: Cursors, entry_signal: bool) -> Result {
         let _ = crate::g17::capacity::refused(crate::g17::capacity::Site::ComputeItems);
         return Err(EAGAIN);
     }
+   Ok(())
+}
+
+/// Retained commands are capacity, not a failed VM. Nothing has been written
+/// when this check runs, so the outer publisher can wait for retirement under
+/// its original admission deadline, just as it does for a full firmware ring.
+fn retained_capacity(
+    quarantined: bool, released: bool, active: usize, replays: usize, replay_front: bool,
+) -> Result {
+    if quarantined || released {
+        return Err(EBUSY);
+    }
+    if active >= IN_FLIGHT || (replays != 0 && !replay_front) {
+        return Err(EAGAIN);
+    }
     Ok(())
 }
 
@@ -1090,6 +1102,30 @@ fn release_pending(released: bool, quarantined: bool, active: usize, retiring: b
 #[kunit_tests(asahi_g17_compute_admission)]
 mod admission_tests {
     use super::*;
+
+    #[test]
+    fn retained_ring_pressure_waits_without_discarding_work() {
+        let mut active = Fifo::new();
+        for sequence in 0..IN_FLIGHT {
+            active.push(sequence).unwrap();
+        }
+        assert_eq!(retained_capacity(false, false, active.len, 0, false), Err(EAGAIN));
+        assert_eq!(active.front(), Some(&0));
+        assert_eq!(active.len, IN_FLIGHT);
+        assert_eq!(active.pop(), Some(0));
+        assert_eq!(retained_capacity(false, false, active.len, 0, false), Ok(()));
+        assert_eq!(active.front(), Some(&1));
+    }
+
+    #[test]
+    fn replay_front_and_terminal_ownership_remain_distinct() {
+        assert_eq!(retained_capacity(false, false, 0, 1, false), Err(EAGAIN));
+        assert_eq!(retained_capacity(false, false, 0, 1, true), Ok(()));
+        assert_eq!(retained_capacity(false, false, IN_FLIGHT, 1, true), Err(EAGAIN));
+        for (quarantined, released) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(retained_capacity(quarantined, released, 0, 1, true), Err(EBUSY));
+        }
+    }
 
     #[test]
     fn item_refusal_is_retryable_and_preserves_the_empty_slot() {
@@ -2011,11 +2047,8 @@ impl Queue {
             .replays
             .front()
             .is_some_and(|front| Arc::ptr_eq(front, packet));
-        if !self.room()
-            && !(replay_front && !self.quarantined && !self.released && self.active.len < IN_FLIGHT)
-        {
-            return Err(EBUSY);
-        }
+        retained_capacity(self.quarantined, self.released, self.active.len,
+                          self.replays.len, replay_front)?;
         if !packet.context.is_current()
             || !self
                 .binding
