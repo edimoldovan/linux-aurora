@@ -15,7 +15,7 @@
 //! TTBAT contexts other than a VM's bind slot may name a VM's root. See [`UatFirmware`].
 
 use core::fmt::Debug;
-use core::mem::{size_of, ManuallyDrop};
+use core::mem::size_of;
 use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::sync::atomic::{
@@ -114,13 +114,12 @@ const DEBUG_CLASS: DebugFlags = DebugFlags::Mmu;
 
 mod bind;
 mod context;
-mod lifetime;
-mod ppl;
-mod residency;
 mod shared;
+mod lifetime;
+mod residency;
+pub(crate) use residency::{Gate as ResidencyGate, VmShrinker};
 pub(crate) use bind::PreparedUserBindBatch;
 pub(crate) use lifetime::VmJobGuard;
-pub(crate) use residency::{Gate as ResidencyGate, VmShrinker};
 
 /// PPL magic number for the handoff region
 const PPL_MAGIC: u64 = 0x4b1d000000000002;
@@ -154,80 +153,22 @@ pub(crate) enum UatFirmware {
     /// One coprocessor that publishes its magic number in the handoff region, arbitrates the
     /// handoff lock with the driver, and acknowledges cache flush requests (G13/G14).
     Handoff,
-    /// One or two coprocessor instances that never touch the handoff region (G17).
+    /// Two coprocessor instances that never touch the handoff region (G17).
     ///
     /// Each instance has its own kernel root and writes the top-level entries below and including
     /// the driver-managed kernel window into it while it boots: the lower ones are private to the
     /// instance, and the kernel window entry points at a table that the bootloader reserved. The
-    /// primary instance uses the `pagetables` root, a secondary one (A18 Pro) the root at
-    /// `secondary_root_offset` in the same region; a single-instance firmware (M4 Pro) has none.
-    /// TTBAT context 1 starts as an alias of the kernel context.
+    /// primary instance uses the `pagetables` root, the secondary one the root at
+    /// `secondary_root_offset` in the same region. TTBAT context 1 starts as an alias of the kernel
+    /// context.
     PublishedRoots {
         /// Offset of the secondary instance's kernel root in the `pagetables` region.
-        secondary_root_offset: Option<u64>,
+        secondary_root_offset: u64,
     },
-}
-
-/// UAT policy of a SoC where it differs from the A18 Pro's.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct UatQuirks {
-    /// The firmware builds its root and kernel-window tables in the no-map `pagetables` and
-    /// `l2-pagetables` regions: reach tables there through a write-back mapping instead of
-    /// `struct page`.
-    ///
-    /// Temporary: once the boot loader adds these regions to `/memory`, as m1n1 does, the
-    /// regions lose `no-map` and this path goes away.
-    pub(crate) reserved_tables: bool,
-    // The following settings keep a SoC on the only policy it was tested with. Each one is
-    // a candidate for the A18 Pro's value once a test on that SoC shows it is not needed.
-    /// Write back every page-table and context-table change: the GPU table walker is not
-    /// assumed to snoop the CPU caches.
-    pub(crate) clean_tables: bool,
-    /// Invalidate ranges one page at a time, never with range TLBI operations.
-    pub(crate) page_tlbi: bool,
-    /// Take the handoff lock around context-table edits. Where the firmware leaves its half of
-    /// the handoff page alone, its lock bytes are not initialized and are never taken.
-    pub(crate) handoff_lock: bool,
-    /// Handoff "current slot" written at initialization.
-    pub(crate) handoff_slot: u32,
-    /// Store GPU-only mappings of client and kernel-lower tables as AP 0 with the access in
-    /// PXN (read) and UXN (write), the form the firmware itself uses, instead of AP 2.
-    pub(crate) native_gpu_permissions: bool,
-}
-
-impl UatQuirks {
-    /// The A18 Pro and earlier policy.
-    pub(crate) const DEFAULT: UatQuirks = UatQuirks {
-        reserved_tables: false,
-        clean_tables: false,
-        page_tlbi: false,
-        handoff_lock: true,
-        handoff_slot: 0,
-        native_gpu_permissions: false,
-    };
 }
 
 const TTBR_VALID: u64 = 0x1; // BIT(0)
 const TTBR_ASID_SHIFT: usize = 48;
-
-/// M4's nonzero wire incarnation of a host-owned root installation.
-const fn binding_wire_generation(incarnation: u64) -> u8 {
-    if incarnation == 0 {
-        0
-    } else {
-        (1 + (incarnation - 1) % 255) as u8
-    }
-}
-
-/// Upper word of an application TTBAT slot. M4 exposes firmware upper mappings only in
-/// context 0; the existing G15 handoff shares them with user contexts.
-const fn application_ttb1(root: u64, asid: usize, map_kernel_to_user: bool) -> u64 {
-    if map_kernel_to_user {
-        root | TTBR_VALID | (asid as u64) << TTBR_ASID_SHIFT
-    } else {
-        0
-    }
-}
 
 /// UAT address space geometry of a given SoC.
 #[derive(Debug, Copy, Clone)]
@@ -418,8 +359,6 @@ struct VmBinding {
     active_users: usize,
     binding: Option<slotalloc::Guard<SlotInner>>,
     bind_token: Option<slotalloc::SlotToken>,
-    /// Nonzero M4 wire incarnation of the root currently owning this slot.
-    generation: u8,
     ttb: u64,
 }
 
@@ -684,8 +623,7 @@ impl gpuvm::DriverGpuVm for VmInner {
 
         let _mutation = self.mapping_mutation();
         if orig_invalidated {
-            self.page_table
-                .discard_partial_map(unmap_start..unmap_end)?;
+            self.page_table.discard_partial_map(unmap_start..unmap_end)?;
         } else {
             self.page_table.unmap_pages(unmap_start..unmap_end)?;
         }
@@ -726,12 +664,7 @@ impl gpuvm::DriverGpuVm for VmInner {
 impl VmInner {
     /// Remove hardware leaves for one complete user GPUVA without allocating.
     fn unmap_gpuva(&mut self, va: &gpuvm::GpuVa<Self>) -> Result {
-        mod_dev_dbg!(
-            self.dev,
-            "MMU: unmap: {:#x}:{:#x}\n",
-            va.addr(),
-            va.length()
-        );
+        mod_dev_dbg!(self.dev, "MMU: unmap: {:#x}:{:#x}\n", va.addr(), va.length());
 
         let _mutation = self.mapping_mutation();
         if va.flags().contains(GpuVaFlag::INVALIDATED) {
@@ -766,7 +699,14 @@ impl VmInner {
         // Include the current segment: map_pages can fail after writing some of its leaves.
         // The checked GPUVM operation supplies an aligned range without overflow.
         let result = self.page_table.discard_partial_map(addr..addr + size);
-        self.finish_failed_map(addr, size as usize);
+        if self.uat_inner.firmware == UatFirmware::Handoff {
+            if let Some(asid) = self.slot() {
+                mem::sync();
+                self.tlbi_range(asid as u8, addr, size as usize);
+                mem::sync();
+            }
+        }
+        self.tlbi_contexts_naming_root(addr, size as usize);
         if let Err(error) = result {
             dev_err!(
                 self.dev.as_ref(),
@@ -774,19 +714,6 @@ impl VmInner {
                 error
             );
         }
-    }
-
-    /// Complete discarded stores and invalidate both the legacy bound slot and
-    /// every M4/G17 context naming this root. Call only after releasing PPL.
-    fn finish_failed_map(&self, addr: u64, size: usize) {
-        if self.uat_inner.firmware == UatFirmware::Handoff {
-            if let Some(asid) = self.slot() {
-                mem::sync();
-                self.tlbi_range(asid as u8, addr, size);
-                mem::sync();
-            }
-        }
-        self.tlbi_contexts_naming_root(addr, size);
     }
 
     fn mapping_mutation(&mut self) -> MappingMutation {
@@ -843,19 +770,15 @@ impl VmInner {
     ///
     /// With [`UatFirmware::PublishedRoots`], contexts other than a Vm's bind slot name its root
     /// (the kernel lower root sits in contexts 0 and 1 and has no slot at all), so a mapping
-    /// change must reach all of them. Adopted M4 roots also remain in the TTBAT after a bind
-    /// lease is dropped, until the slot is reassigned or the root is destroyed. Include those
-    /// contexts before allowing an unmapped object's backing to be released.
+    /// change must reach all of them. Other firmware only uses the bind slot, which the callers
+    /// already invalidate.
     fn tlbi_contexts_naming_root(&self, iova: u64, size: usize) {
-        if self.uat_inner.firmware == UatFirmware::Handoff && !self.uat_inner.m4_adopted {
+        if self.uat_inner.firmware == UatFirmware::Handoff {
             mem::sync();
             return;
         }
 
-        let contexts = self
-            .uat_inner
-            .lock()
-            .contexts_naming_root(self.ttb(), self.uat_inner.m4_adopted);
+        let contexts = self.uat_inner.lock().contexts_naming_root(self.ttb());
         self.tlbi_context_mask(iova, size, contexts);
     }
 
@@ -883,35 +806,10 @@ impl VmInner {
             .checked_add(node.mapped_size as u64)
             .ok_or(EOVERFLOW)?;
         let _mutation = self.mapping_mutation();
-        // Allocate detached RAM tables before excluding the firmware. The shadow L2 is not
-        // the reserved shared-L2; only final leaf stores below already linked L3s are live.
         self.page_table.prepare_map(node.start()..end)?;
-        let uat_inner = self.uat_inner.clone();
-        let handoff = uat_inner.lock_m4_upper(self.is_kernel)?;
         let result = self.map_node_prepared(node, prot);
-        let discard = if result.is_err() {
-            // Rollback still changes live leaves and must remain under the PPL lease.
-            self.page_table.discard_partial_map(node.start()..end)
-        } else {
-            Ok(())
-        };
-        // The M4 handoff guard owns UatShared's mutex. Invalidation follows its release.
-        drop(handoff);
         if result.is_err() {
-            self.finish_failed_map(node.start(), node.mapped_size);
-        } else {
-            self.tlbi_contexts_naming_root(node.start(), node.mapped_size);
-        }
-        if let Err(error) = discard {
-            if self.uat_inner.m4_adopted {
-                // The caller retains its node and backing when this latch is set.
-                self.uat_inner.failed.store(true, Ordering::Release);
-            }
-            dev_err!(
-                self.dev.as_ref(),
-                "Could not discard failed kernel mapping: {:?}\n",
-                error
-            );
+            self.rollback_failed_map(node.start(), node.mapped_size as u64);
         }
         result
     }
@@ -919,14 +817,7 @@ impl VmInner {
     /// Install only into the empty range reserved by `map_node`.
     fn map_node_prepared(&mut self, node: &mm::Node<(), KernelMappingInner>, prot: Prot) -> Result {
         let mut iova = node.start();
-        let segments = node
-            .bo
-            .as_ref()
-            .ok_or(EINVAL)?
-            .get()?
-            .data()
-            .segments
-            .lock();
+        let segments = node.bo.as_ref().ok_or(EINVAL)?.get()?.data().segments.lock();
         let mut offset = node.offset;
         let mut left = node.mapped_size;
 
@@ -984,7 +875,8 @@ impl VmInner {
             }
         }
 
-        // The caller invalidates negative translations after releasing its PPL lease.
+        // A context naming this root may be live and hold a negative translation for the range.
+        self.tlbi_contexts_naming_root(node.start(), node.mapped_size);
         Ok(())
     }
 }
@@ -1061,7 +953,7 @@ impl ExecutionRoot {
         let id = usize::from(self.id);
         let release = {
             let inner = self.inner.lock();
-            inner.handoff_lock();
+            inner.handoff().lock();
             let roots = &inner.ttbs()[id];
             let low = roots.ttb0.load(Ordering::Acquire);
             let high = roots.ttb1.load(Ordering::Acquire);
@@ -1069,9 +961,8 @@ impl ExecutionRoot {
             if owned {
                 roots.ttb0.store(0, Ordering::Release);
                 roots.ttb1.store(0, Ordering::Release);
-                inner.publish_slot(id);
             }
-            inner.handoff_unlock();
+            inner.handoff().unlock();
             owned || (low == 0 && high == 0)
         };
         if release {
@@ -1111,12 +1002,6 @@ impl VmBind {
     /// Returns the slot that this `Vm` is bound to.
     pub(crate) fn slot(&self) -> u32 {
         self.1
-    }
-
-    /// Stable wire incarnation for this active root lease. M4 reserves zero as unbound.
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
-    pub(crate) fn generation(&self) -> u8 {
-        self.0.binding.lock().generation
     }
 }
 
@@ -1158,7 +1043,10 @@ struct MappingBo {
     owner: ARef<gpuvm::GpuVm<VmInner>>,
 }
 impl MappingBo {
-    fn new(bo: ARef<gpuvm::GpuVmBo<VmInner>>, owner: ARef<gpuvm::GpuVm<VmInner>>) -> Self {
+    fn new(
+        bo: ARef<gpuvm::GpuVmBo<VmInner>>,
+        owner: ARef<gpuvm::GpuVm<VmInner>>,
+    ) -> Self {
         Self {
             bo: Some(bo),
             owner,
@@ -1208,51 +1096,22 @@ pub(crate) struct TimestampMapping {
 }
 
 impl TimestampMapping {
-    /// Prepare one bounded CPU timestamp destination on retained GEM backing.
-    pub(crate) fn new(gem: &gem::Object, offset: usize) -> Result<Self> {
-        use kernel::drm::gem::BaseObject;
-        if offset.checked_add(size_of::<u64>()).ok_or(EOVERFLOW)? > gem.size() {
-            return Err(ERANGE);
-        }
-        Ok(Self {
-            mapping: gem.owned_vmap::<0>()?,
-            offset,
-        })
-    }
-
     pub(crate) fn write(&self, value: u64) {
-        // Completion runs in task context. Bindings of the same BO share this lock,
-        // so aligned u64 and overlapping unaligned byte stores never race in Rust.
-        let _guard = self.mapping.owner().timestamp_lock.lock();
-        // SAFETY: timestamp_mapping checked the complete extent inside this pinned vmap.
         let base = self.mapping.addr.cast::<u8>();
-        let pointer = unsafe { base.add(self.offset) };
-        if pointer as usize % core::mem::align_of::<AtomicU64>() == 0 {
-            // SAFETY: timestamp_mapping checked all eight bytes; the vmap pins the backing.
-            // A naturally aligned query result becomes available in one complete store.
-            let destination = unsafe { &*pointer.cast::<AtomicU64>() };
-            destination.store(value.to_le(), Ordering::Relaxed);
-        } else {
-            for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
-                // SAFETY: timestamp_mapping checked the complete eight-byte extent.
-                // The owned vmap pins its backing; byte atomics permit unaligned and
-                // overlapping timestamp destinations without mutable slice aliases.
-                let destination = unsafe { &*base.add(self.offset + index).cast::<AtomicU8>() };
-                destination.store(byte, Ordering::Relaxed);
-            }
+        for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
+            // SAFETY: timestamp_mapping checked the complete eight-byte extent.
+            // The owned vmap pins its backing; byte atomics permit unaligned and
+            // overlapping timestamp destinations without mutable slice aliases.
+            let destination = unsafe {
+                &*base.add(self.offset + index).cast::<AtomicU8>()
+            };
+            destination.store(byte, Ordering::Relaxed);
         }
-        // A CPU-retired query can be consumed by a later GPU command. WRITEBACK
-        // objects use a cacheable vmap, while GPU mappings need not snoop that cache.
-        // Publish the bytes before signalling the completion fence or queue frontier.
-        if self.mapping.owner().is_writeback() {
-            crate::pgtable::clean_poc(pointer, size_of::<u64>());
-        }
-        crate::pgtable::poc_barrier();
     }
 }
 
 /// An object mapping into a [`Vm`], which reserves the address range from use by other mappings.
-pub(crate) struct KernelMapping(ManuallyDrop<mm::Node<(), KernelMappingInner>>);
+pub(crate) struct KernelMapping(mm::Node<(), KernelMappingInner>);
 
 impl KernelMapping {
     /// Returns the IOVA base of this mapping
@@ -1276,14 +1135,12 @@ impl KernelMapping {
             return Err(EINVAL);
         }
         let address = self.iova().checked_add(offset as u64).ok_or(EOVERFLOW)?;
-        lock_vm(&self.0.owner, None, false)?
-            .page_table
-            .translate_iova(address)
+        lock_vm(&self.0.owner, None, false)?.page_table.translate_iova(address)
     }
 
-    /// Writes a userspace timestamp through the retained GEM mapping. Aligned results
-    /// use a complete atomic store; byte stores support unaligned destinations without
-    /// creating mutable aliases. An unaligned complete timestamp is not atomic.
+    /// Writes a userspace timestamp through the retained GEM mapping. Byte
+    /// stores support unaligned destinations and concurrent completion writes
+    /// without creating mutable aliases. The complete timestamp is not atomic.
     /// Retain CPU access before this destination's completion fence is published.
     pub(crate) fn timestamp_mapping(&self, offset: usize) -> Result<TimestampMapping> {
         use kernel::drm::gem::BaseObject;
@@ -1296,7 +1153,10 @@ impl KernelMapping {
         if end > gem.size() {
             return Err(ERANGE);
         }
-        TimestampMapping::new(gem, start)
+        Ok(TimestampMapping {
+            mapping: gem.owned_vmap::<0>()?,
+            offset: start,
+        })
     }
 
     /// Gives a fresh kernel mapping a firmware-cached prefix, preserving its tail.
@@ -1411,10 +1271,10 @@ impl KernelMapping {
             let ttb = owner.ttb() | TTBR_VALID | (slot as u64) << TTBR_ASID_SHIFT;
 
             let uat_inner = self.0.uat_inner.lock();
-            uat_inner.handoff_lock();
+            uat_inner.handoff().lock();
             let cur_slot = uat_inner.handoff().current_slot();
             let ttb_cur = uat_inner.ttbs()[slot as usize].ttb0.load(Ordering::Relaxed);
-            uat_inner.handoff_unlock();
+            uat_inner.handoff().unlock();
             if cur_slot == Some(slot) && ttb_cur == ttb {
                 slot
             } else {
@@ -1504,19 +1364,6 @@ no_debug!(KernelMapping);
 
 impl Drop for KernelMapping {
     fn drop(&mut self) {
-        // An ASC-cached M4 mapping has no qualified cache-flush teardown. Even an unexpected
-        // failed construction must retain its complete node/backing instead of invoking the
-        // unrelated G13/G14 FwCtl protocol.
-        if self.0.uat_inner.m4_adopted && self.0.prot.is_cached_noncoherent() {
-            self.0.uat_inner.failed.store(true, Ordering::Release);
-            pr_err!(
-                "MMU: retaining cached M4 mapping {:#x}+{:#x} until reboot\n",
-                self.iova(),
-                self.size()
-            );
-            return;
-        }
-
         // This is the main unmap function for UAT mappings.
         // The sequence of operations here is finicky, due to the interaction
         // between cached GFX ASC mappings and the page tables. These mappings
@@ -1559,27 +1406,8 @@ impl Drop for KernelMapping {
             self.size()
         );
 
-        let upper_handoff = match self.0.uat_inner.lock_m4_upper(owner.is_kernel) {
-            Ok(guard) => guard,
-            Err(error) => {
-                dev_err!(
-                    owner.dev.as_ref(),
-                    "MMU: retaining M4 mapping after PPL failure: {:?}\n",
-                    error
-                );
-                return;
-            }
-        };
         let _mutation = owner.mapping_mutation();
         if owner.page_table.unmap_pages(self.iova_range()).is_err() {
-            if self.0.uat_inner.m4_adopted {
-                self.0.uat_inner.failed.store(true, Ordering::Release);
-                dev_err!(
-                    owner.dev.as_ref(),
-                    "MMU: retaining M4 mapping after partial unmap failure\n"
-                );
-                return;
-            }
             dev_err!(
                 owner.dev.as_ref(),
                 "MMU: unmap {:#x}:{:#x} failed\n",
@@ -1587,8 +1415,6 @@ impl Drop for KernelMapping {
                 self.size()
             );
         }
-
-        drop(upper_handoff);
 
         if let Some(asid) = owner.slot() {
             mem::sync();
@@ -1606,11 +1432,6 @@ impl Drop for KernelMapping {
         // The range returns to the VA allocator once this mapping is gone, so no context that
         // names this root may keep a stale translation for it.
         owner.tlbi_contexts_naming_root(self.iova(), self.size());
-        drop(_mutation);
-        drop(owner);
-        // SAFETY: Every normal path reaches this exactly once, after all GPUVM locks have
-        // been released. Uncertain M4 paths return earlier, retaining the node and its pins.
-        unsafe { ManuallyDrop::drop(&mut self.0) };
     }
 }
 
@@ -1619,44 +1440,14 @@ struct UatShared {
     kernel_ttb1: u64,
     execution_contexts: u64,
     context_generations: [u8; UAT_NUM_CTX],
-    /// Firmware-observed incarnations of application roots installed by the VM slot allocator.
-    binding_generations: [u64; UAT_NUM_CTX],
-    binding_published: [bool; UAT_NUM_CTX],
-    /// Expected lower words of user roots owned by the VM slot allocator. Replaced only by
-    /// successful host publications, never learned by accepting observed hardware words.
-    owned_user_roots: [u64; UAT_NUM_CTX],
     /// Kernel root of the secondary firmware instance, if there is one.
     secondary_ttb1: Option<PhysicalAddr>,
     map_kernel_to_user: bool,
     handoff_rgn: UatRegion,
     ttbs_rgn: UatRegion,
-    quirks: UatQuirks,
 }
 
 impl UatShared {
-    /// Takes the handoff lock, where this SoC uses it.
-    fn handoff_lock(&self) {
-        if self.quirks.handoff_lock {
-            self.handoff().lock();
-        }
-    }
-
-    /// Releases the handoff lock taken by [`Self::handoff_lock`].
-    fn handoff_unlock(&self) {
-        if self.quirks.handoff_lock {
-            self.handoff().unlock();
-        }
-    }
-
-    /// Writes back context-table slot `idx` after it changed, where this SoC needs it.
-    fn publish_slot(&self, idx: usize) {
-        if self.quirks.clean_tables {
-            let slot = &self.ttbs()[idx] as *const SlotTTBS as *const u8;
-            pgtable::clean_poc(slot, size_of::<SlotTTBS>());
-            pgtable::poc_barrier();
-        }
-    }
-
     /// Returns the handoff region area
     fn handoff(&self) -> &Handoff {
         // SAFETY: pointer is non-null per the type invariant
@@ -1670,15 +1461,11 @@ impl UatShared {
     }
 
     /// Returns the mask of TTBAT contexts whose lower half is the root `ttb`.
-    fn contexts_naming_root(&self, ttb: u64, adopted: bool) -> u64 {
+    fn contexts_naming_root(&self, ttb: u64) -> u64 {
         self.ttbs()
             .iter()
             .enumerate()
-            .filter(|(ctx, slot)| {
-                let expected = tagged_root(ttb, *ctx);
-                let _ = adopted; // Context 0 is naturally untagged; user contexts carry their ASID.
-                slot.ttb0.load(Ordering::Acquire) == expected
-            })
+            .filter(|(ctx, slot)| slot.ttb0.load(Ordering::Acquire) == tagged_root(ttb, *ctx))
             .fold(0, |mask, (ctx, _)| mask | (1 << ctx))
     }
 }
@@ -1695,136 +1482,18 @@ unsafe impl Send for UatShared {}
 #[pin_data]
 struct UatInner {
     firmware: UatFirmware,
-    /// The stopped J713 handoff: bounded full-barrier PPL and upper words zero in users.
-    m4_adopted: bool,
-    /// An uncertain mapping/root is retained; future M4 allocation and publication fail.
-    failed: AtomicBool,
-    /// Clean page tables to the point of coherency for a walker that does not snoop the CPU
-    /// caches: [`Uat::new_adopted`], and [`UatQuirks::clean_tables`] otherwise.
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
     clean_poc: bool,
-    /// This SoC's UAT policy.
-    quirks: UatQuirks,
-    /// No-map reserved regions holding firmware tables (`UatQuirks::reserved_tables`).
-    reserved: Option<Arc<pgtable::ReservedTables>>,
     #[pin]
     shared: Mutex<UatShared>,
     #[pin]
     handoff_flush: [Mutex<HandoffFlush>; UAT_NUM_CTX + 1],
 }
 
-/// A transport owns the sole host-side PPL mutex before touching AP interest.
-struct M4Transport<'a> {
-    shared: Guard<'a, UatShared, MutexBackend>,
-    start: Instant<Monotonic>,
-    failed: &'a AtomicBool,
-}
-
-impl ppl::Memory for M4Transport<'_> {
-    fn firmware_interested(&self) -> bool {
-        self.shared.handoff().lock_fw.load(Ordering::Relaxed) != 0
-    }
-    fn firmware_turn(&self) -> bool {
-        self.shared.handoff().turn.load(Ordering::Relaxed) != 0
-    }
-    fn ap_interest(&self, interested: bool) {
-        self.shared
-            .handoff()
-            .lock_ap
-            .store(u8::from(interested), Ordering::Relaxed);
-    }
-    fn give_firmware_turn(&self) {
-        self.shared.handoff().turn.store(1, Ordering::Relaxed);
-    }
-    fn barrier(&self) {
-        mem::sync();
-    }
-    fn expired(&self) -> bool {
-        self.start.elapsed() > Delta::from_millis(100)
-    }
-    fn relax(&self) {
-        core::hint::spin_loop();
-    }
-    fn fail(&self) {
-        self.failed.store(true, Ordering::Release);
-    }
-}
-
-/// Every AP firmware transaction owns the same mutex, including G16 Window operations.
-/// M4 drops its protocol guard before its transport releases the host mutex. The legacy
-/// handoff path keeps the preexisting protocol and lock ordering for other generations.
-#[must_use = "retain the guard until protected table mutations have completed"]
-enum HandoffGuard<'a> {
-    M4(ppl::Guard<M4Transport<'a>>),
-    Legacy(Guard<'a, UatShared, MutexBackend>),
-}
-
-impl HandoffGuard<'_> {
-    fn shared_mut(&mut self) -> &mut UatShared {
-        match self {
-            Self::M4(guard) => &mut guard.memory_mut().shared,
-            Self::Legacy(shared) => shared,
-        }
-    }
-}
-
-impl Drop for HandoffGuard<'_> {
-    fn drop(&mut self) {
-        if let Self::Legacy(shared) = self {
-            shared.handoff_unlock();
-        }
-    }
-}
-
-/// Opaque host-and-firmware lease for G16 window transactions. No caller may
-/// independently manipulate the AP-interest or turn words.
-#[cfg(CONFIG_DRM_ASAHI_G16)]
-#[must_use = "retain the guard throughout the reserved-table window transaction"]
-pub(crate) struct M4HandoffGuard<'a> {
-    _transaction: HandoffGuard<'a>,
-}
-
 impl UatInner {
     /// Take the lock on the shared data and return the guard.
     fn lock(&self) -> Guard<'_, UatShared, MutexBackend> {
         self.shared.lock()
-    }
-
-    fn check_m4(&self) -> Result {
-        if self.m4_adopted && self.failed.load(Ordering::Acquire) {
-            Err(EIO)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Serialize AP callers before taking the firmware exclusion. Timeouts withdraw
-    /// AP interest while still holding the mutex and latch M4 failure before releasing it.
-    fn lock_handoff(&self) -> Result<HandoffGuard<'_>> {
-        self.check_m4()?;
-        let shared = self.lock();
-        self.check_m4()?;
-        if !self.m4_adopted {
-            shared.handoff_lock();
-            return Ok(HandoffGuard::Legacy(shared));
-        }
-        let transport = M4Transport {
-            shared,
-            start: Instant::<Monotonic>::now(),
-            failed: &self.failed,
-        };
-        match ppl::Guard::acquire(transport) {
-            Ok(guard) => Ok(HandoffGuard::M4(guard)),
-            Err(()) => Err(ETIMEDOUT),
-        }
-    }
-
-    /// No leaf is changed on a failed acquisition. Uncertain mappings retain their backing.
-    fn lock_m4_upper(&self, upper: bool) -> Result<Option<HandoffGuard<'_>>> {
-        if upper && self.m4_adopted {
-            self.lock_handoff().map(Some)
-        } else {
-            Ok(None)
-        }
     }
 
     /// Take a lock on a handoff flush slot and return the guard.
@@ -1879,9 +1548,9 @@ impl Handoff {
     }
 
     /// Initialize the handoff region
-    fn init(&self, firmware: UatFirmware, slot: u32) -> Result {
+    fn init(&self, firmware: UatFirmware) -> Result {
         self.magic_ap.store(PPL_MAGIC, Ordering::Relaxed);
-        self.cur_slot.store(slot, Ordering::Relaxed);
+        self.cur_slot.store(0, Ordering::Relaxed);
         self.unk3.store(0, Ordering::Relaxed);
         fence(Ordering::SeqCst);
 
@@ -2016,12 +1685,12 @@ impl Vm {
                 geometry.ias,
                 geometry.oas,
                 uat_inner.firmware != UatFirmware::Handoff,
-                uat_inner.reserved.clone(),
             )?
         } else {
             UatPageTable::new(geometry.ias, geometry.oas)?
-                .with_native_gpu(uat_inner.quirks.native_gpu_permissions)
         };
+
+        #[cfg(CONFIG_DRM_ASAHI_G15)]
         let page_table = {
             let mut page_table = page_table;
             if uat_inner.clean_poc {
@@ -2047,7 +1716,6 @@ impl Vm {
                 VmBinding {
                     binding: None,
                     bind_token: None,
-                    generation: 0,
                     active_users: 0,
                     ttb: page_table.ttb(),
                 },
@@ -2099,10 +1767,7 @@ impl Vm {
 
     /// Attach a status before sharing a newly created user VM with queues.
     pub(crate) fn with_status(mut self) -> Result<Self> {
-        self.status = Some(Arc::pin_init(
-            crate::g17::status::VmStatus::new(),
-            GFP_KERNEL,
-        )?);
+        self.status = Some(Arc::pin_init(crate::g17::status::VmStatus::new(), GFP_KERNEL)?);
         self.lifetime = Some(lifetime::VmLifetime::new()?);
         self.residency = Some(residency::Gate::new()?);
         self.context_bindings = Some(context::ContextBindings::new()?);
@@ -2113,18 +1778,15 @@ impl Vm {
     /// Attach a status and job lifetime tracking before sharing a newly created user VM with
     /// queues, without the G17 canonical context views, shared-object footprints and idle
     /// residency reclaim of [`Self::with_status`]. Used by G15, whose user objects stay pinned.
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
     pub(crate) fn with_tracked_status(mut self) -> Result<Self> {
-        self.status = Some(Arc::pin_init(
-            crate::g17::status::VmStatus::new(),
-            GFP_KERNEL,
-        )?);
+        self.status = Some(Arc::pin_init(crate::g17::status::VmStatus::new(), GFP_KERNEL)?);
         self.lifetime = Some(lifetime::VmLifetime::new()?);
         Ok(self)
     }
 
-    /// The identifier this VM was created with (G15 keeps per-VM state keyed by it; G17 timeout
-    /// attribution compares and logs VMs by it).
+    /// The identifier this VM was created with (G15 keeps per-VM state keyed by it).
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
@@ -2136,7 +1798,7 @@ impl Vm {
     /// and invalidated to the point of coherency first (never only invalidated: CPU-written lines
     /// may be dirty), so the copy sees what the GPU or a write-combined CPU view stored. The
     /// mappings cannot change during the copy (GPUVM exec lock).
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
     pub(crate) fn read_user(&self, va: u64, buf: &mut [u8]) -> Result {
         let mut inner = lock_vm(&self.gpuvm, None, false)?;
         let mut done = 0usize;
@@ -2233,7 +1895,9 @@ impl Vm {
                 return false;
             };
             Self::covers_range_locked(&mut inner, address, block_size, true, true)
-                && !Self::covers_range_locked(&mut inner, guard, stride - block_size, false, false)
+                && !Self::covers_range_locked(
+                    &mut inner, guard, stride - block_size, false, false,
+                )
         })
     }
 
@@ -2387,16 +2051,9 @@ impl Vm {
         let ret = inner.map_node(&node, prot);
         // Drop the exec_lock first, so that if map_node failed the
         // KernelMappingInner destructur does not deadlock.
-        let retain = ret.is_err()
-            && inner.uat_inner.m4_adopted
-            && inner.uat_inner.failed.load(Ordering::Acquire);
         core::mem::drop(vm_exec);
-        if retain {
-            core::mem::forget(node);
-            return Err(ret.err().unwrap_or(EIO));
-        }
         ret?;
-        Ok(KernelMapping(ManuallyDrop::new(node)))
+        Ok(KernelMapping(node))
     }
 
     /// Map a GEM object into this Vm at a specific address.
@@ -2466,16 +2123,9 @@ impl Vm {
         let ret = inner.map_node(&node, prot);
         // Drop the exec_lock first, so that if map_node failed the
         // KernelMappingInner destructur does not deadlock.
-        let retain = ret.is_err()
-            && inner.uat_inner.m4_adopted
-            && inner.uat_inner.failed.load(Ordering::Acquire);
         core::mem::drop(vm_exec);
-        if retain {
-            core::mem::forget(node);
-            return Err(ret.err().unwrap_or(EIO));
-        }
         ret?;
-        Ok(KernelMapping(ManuallyDrop::new(node)))
+        Ok(KernelMapping(node))
     }
 
     /// Map a range of a GEM object into this Vm using GPUVM.
@@ -2559,22 +2209,6 @@ impl Vm {
         vm_exec.unique_gpuvm.sm_map(req)
     }
 
-    /// Spend the binding generation only for an incarnation exposed to firmware.
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
-    pub(crate) fn mark_binding_published(&self) -> Result {
-        let uat = self.gpuvm.lock_inner().uat_inner.clone();
-        let binding = self.binding.lock();
-        let slot = binding.binding.as_ref().ok_or(EIO)?.slot() as usize + UAT_USER_CTX_START;
-        let mut shared = uat.lock();
-        if shared.owned_user_roots[slot] != tagged_root(binding.ttb, slot)
-            || shared.ttbs()[slot].ttb0.load(Ordering::Acquire) != shared.owned_user_roots[slot]
-        {
-            return Err(EIO);
-        }
-        shared.binding_published[slot] = true;
-        Ok(())
-    }
-
     /// Add a direct MMIO mapping to this Vm at a free address.
     pub(crate) fn map_io(
         &self,
@@ -2618,35 +2252,22 @@ impl Vm {
 
         let end = iova.checked_add(size as u64).ok_or(EOVERFLOW)?;
         inner.page_table.prepare_map(iova..end)?;
-        let transaction_uat = inner.uat_inner.clone();
-        let handoff = transaction_uat.lock_m4_upper(inner.is_kernel)?;
         let mutation = inner.mapping_mutation();
-        let ret = inner
-            .page_table
-            .map_pages(iova..end, phys as PhysicalAddr, prot, false);
-        let discard = if ret.is_err() {
-            inner.page_table.discard_partial_map(iova..end)
-        } else {
-            Ok(())
-        };
-        drop(handoff);
+        let ret = inner.page_table.map_pages(
+            iova..end,
+            phys as PhysicalAddr,
+            prot,
+            false,
+        );
         if ret.is_err() {
-            inner.finish_failed_map(iova, size);
-        } else {
-            inner.tlbi_contexts_naming_root(iova, size);
+            inner.rollback_failed_map(iova, size as u64);
         }
-        let retain = discard.is_err() && inner.uat_inner.m4_adopted;
-        if retain {
-            inner.uat_inner.failed.store(true, Ordering::Release);
-        }
+        // Drop the exec_lock first, so that if map_node failed the
+        // KernelMappingInner destructur does not deadlock.
         drop(mutation);
-        drop(vm_exec);
-        if retain {
-            core::mem::forget(node);
-            return Err(ret.err().unwrap_or(EIO));
-        }
+        let _ = inner;
         ret?;
-        Ok(KernelMapping(ManuallyDrop::new(node)))
+        Ok(KernelMapping(node))
     }
 
     /// Unmap everything in an address range.
@@ -2792,18 +2413,8 @@ impl Drop for VmInner {
             let idx = (token.last_slot() as usize) + UAT_USER_CTX_START;
             let ttb = self.ttb() | TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT;
 
-            let mut transaction = match self.uat_inner.lock_handoff() {
-                Ok(guard) => guard,
-                Err(_) => {
-                    self.page_table.retain();
-                    pr_err!(
-                        "MMU: retaining M4 VM {} page tables after PPL failure\n",
-                        self.id
-                    );
-                    return;
-                }
-            };
-            let uat_inner = transaction.shared_mut();
+            let uat_inner = self.uat_inner.lock();
+            uat_inner.handoff().lock();
             let handoff_cur = uat_inner.handoff().current_slot();
             let ttb_cur = uat_inner.ttbs()[idx].ttb0.load(Ordering::SeqCst);
             let inval = ttb_cur == ttb;
@@ -2816,10 +2427,9 @@ impl Drop for VmInner {
                 }
                 uat_inner.ttbs()[idx].ttb0.store(0, Ordering::SeqCst);
                 uat_inner.ttbs()[idx].ttb1.store(0, Ordering::SeqCst);
-                uat_inner.owned_user_roots[idx] = 0;
-                uat_inner.publish_slot(idx);
             }
-            drop(transaction);
+            uat_inner.handoff().unlock();
+            core::mem::drop(uat_inner);
 
             // In principle we dropped all the KernelMappings already, but we might as
             // well play it safe and invalidate the whole ASID.
@@ -2839,7 +2449,7 @@ impl Drop for VmInner {
 
 /// Physical regions of a UAT whose handoff the generation has already established itself
 /// ([`Uat::new_adopted`]). None of them needs to be in the kernel linear map.
-#[cfg(CONFIG_DRM_ASAHI_G16)]
+#[cfg(CONFIG_DRM_ASAHI_G15)]
 pub(crate) struct AdoptedRegions {
     /// The handoff region (PPL magic, lock and flush requests).
     pub(crate) handoff: Range<PhysicalAddr>,
@@ -2850,23 +2460,11 @@ pub(crate) struct AdoptedRegions {
 }
 
 impl Uat {
-    /// Common AP and firmware exclusion for G16's reserved-table window. Acquire
-    /// immutable root addresses before this guard, preserving binding -> UAT lock order.
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
-    pub(crate) fn lock_m4_handoff(&self) -> Result<M4HandoffGuard<'_>> {
-        if !self.inner.m4_adopted {
-            return Err(EINVAL);
-        }
-        Ok(M4HandoffGuard {
-            _transaction: self.inner.lock_handoff()?,
-        })
-    }
-
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
     /// Map a region given by its physical range, write-combined.
     fn map_physical(range: &Range<PhysicalAddr>, min_size: usize) -> Result<UatRegion> {
         let size: usize = (range.end.checked_sub(range.start).ok_or(EINVAL)?).try_into()?;
-        if size < min_size || range.start & (UAT_PGMSK as PhysicalAddr) != 0 {
+        if size < min_size || (range.start | range.end) & (UAT_PGMSK as PhysicalAddr) != 0 {
             return Err(EINVAL);
         }
         // SAFETY: All-zero is a valid `struct resource` (no name, parent or children).
@@ -2878,16 +2476,26 @@ impl Uat {
         // `raw` describes a valid memory range.
         let res: io::resource::Resource =
             unsafe { core::mem::transmute(kernel::types::Opaque::new(raw)) };
+        // A carveout outside System RAM is mapped write-combined; a reserved-memory region
+        // inside System RAM (mapped by the kernel) through the kernel's own mapping, as
+        // `map_region` does for the other generations.
+        let mode = crate::g15::memory_mode(range.start, size as u64)?;
+        let ram = mode == kernel::bindings::MEMREMAP_WB as u32;
+        let flags = if ram {
+            io::mem::MemFlag::WB
+        } else {
+            io::mem::MemFlag::WC
+        };
         // SAFETY: The UAT regions are only accessed through this mapping by the CPU; the GPU
         // reaches them through its own translation.
-        let map = unsafe { io::mem::Mem::try_new(res, io::mem::MemFlag::WC.into()) }?;
+        let map = unsafe { io::mem::Mem::try_new(res, flags.into()) }?;
         Ok(UatRegion {
             base: range.start,
             map,
         })
     }
 
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
     /// Creates a `Uat` for a handoff that the caller establishes itself (G15).
     ///
     /// This only maps the handoff and the TTBAT (write-combined); neither is written here. The
@@ -2901,24 +2509,10 @@ impl Uat {
     /// entries ([`Self::kernel_window_root`]) into the firmware's own table for that window after
     /// mapping and before the firmware uses the new addresses. Page tables are never freed on
     /// unmap, so linked entries stay valid.
-    #[allow(dead_code)]
     pub(crate) fn new_adopted(
         dev: &driver::AsahiDrmDevice,
         geometry: UatGeometry,
         regions: &AdoptedRegions,
-    ) -> Result<Self> {
-        Self::new_adopted_with_user_upper(dev, geometry, regions, true)
-    }
-
-    /// Creates the same owned-RAM adopted UAT, choosing whether application contexts also
-    /// name the firmware upper root. M4 qualifies only context 0 for firmware-upper access;
-    /// its application TTBAT upper words stay zero. G15 preserves its existing shared upper.
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
-    pub(crate) fn new_adopted_with_user_upper(
-        dev: &driver::AsahiDrmDevice,
-        geometry: UatGeometry,
-        regions: &AdoptedRegions,
-        map_kernel_to_user: bool,
     ) -> Result<Self> {
         let handoff_rgn = Self::map_physical(&regions.handoff, HANDOFF_SIZE)?;
         let ttbs_rgn = Self::map_physical(&regions.ttbs, SLOTS_SIZE)?;
@@ -2930,12 +2524,8 @@ impl Uat {
         let inner = Arc::pin_init(
             try_pin_init!(UatInner {
                 firmware: UatFirmware::Handoff,
-                m4_adopted: !map_kernel_to_user,
-                failed: AtomicBool::new(false),
                 // The G15 UAT walker does not snoop the CPU caches.
                 clean_poc: true,
-                reserved: None,
-                quirks: UatQuirks::DEFAULT,
                 handoff_flush <- pin_init::pin_init_array_from_fn(|i| {
                     new_mutex!(HandoffFlush(&handoff.flush[i]), "handoff_flush")
                 }),
@@ -2944,14 +2534,10 @@ impl Uat {
                         kernel_ttb1: regions.kernel_root,
                         execution_contexts: !EXECUTION_CONTEXT_MASK,
                         context_generations: [0; UAT_NUM_CTX],
-                        binding_generations: [0; UAT_NUM_CTX],
-                        binding_published: [false; UAT_NUM_CTX],
-                        owned_user_roots: [0; UAT_NUM_CTX],
                         secondary_ttb1: None,
-                        map_kernel_to_user,
+                        map_kernel_to_user: true,
                         handoff_rgn,
                         ttbs_rgn,
-                        quirks: UatQuirks::DEFAULT,
                     },
                     "uat_shared"
                 ),
@@ -2963,14 +2549,8 @@ impl Uat {
         let shadow = kernel::page::Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
         let shadow_root = kernel::page::Page::into_phys(shadow);
 
-        let kernel_lower_vm = Vm::new(
-            dev.into(),
-            inner.clone(),
-            geometry.user_range(),
-            geometry,
-            None,
-            1,
-        )?;
+        let kernel_lower_vm =
+            Vm::new(dev.into(), inner.clone(), geometry.user_range(), geometry, None, 1)?;
         let kernel_vm = Vm::new(
             dev.into(),
             inner.clone(),
@@ -2997,13 +2577,13 @@ impl Uat {
         })
     }
 
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
     /// Root of the kernel lower `Vm`, for TTBAT context 0 of an adopted handoff.
     pub(crate) fn kernel_lower_root(&self) -> PhysicalAddr {
         self.kernel_lower_vm.ttb()
     }
 
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
     /// Root whose driver-window entry names the second-level table of [`Self::kernel_vm`]'s
     /// driver window. With [`Self::new_adopted`] this is the shadow root that no context names.
     pub(crate) fn kernel_window_root(&self) -> PhysicalAddr {
@@ -3073,10 +2653,7 @@ impl Uat {
             }
             owner.ttb()
         };
-        Ok(self
-            .inner
-            .lock()
-            .contexts_naming_root(root, self.inner.m4_adopted))
+        Ok(self.inner.lock().contexts_naming_root(root))
     }
 
     /// Publish a completed alias set before its descriptors become visible.
@@ -3105,9 +2682,7 @@ impl Uat {
 
     /// Binds a `Vm` to a slot, preferring the last used one.
     pub(crate) fn bind(&self, vm: &Vm) -> Result<VmBind> {
-        self.inner.check_m4()?;
         let mut binding = vm.binding.lock();
-        self.inner.check_m4()?;
 
         if binding.binding.is_none() {
             assert_eq!(binding.active_users, 0);
@@ -3126,24 +2701,16 @@ impl Uat {
                 let idx = (slot.slot() as usize) + UAT_USER_CTX_START;
                 let ttb = binding.ttb | TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT;
 
-                let mut transaction = self.inner.lock_handoff()?;
-                let uat_inner = transaction.shared_mut();
-                // On M4, empty bind/close churn must not wrap the wire generation
-                // back to firmware's last observed identity for a different root.
-                let previous = uat_inner.binding_generations[idx];
-                let incarnation = if !self.inner.m4_adopted
-                    || previous == 0
-                    || uat_inner.binding_published[idx]
-                {
-                    previous.checked_add(1).ok_or(EOVERFLOW)?
+                let uat_inner = self.inner.lock();
+
+                let ttb1 = if uat_inner.map_kernel_to_user {
+                    uat_inner.kernel_ttb1 | TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT
                 } else {
-                    previous
+                    0
                 };
 
-                let ttb1 =
-                    application_ttb1(uat_inner.kernel_ttb1, idx, uat_inner.map_kernel_to_user);
-
                 let ttbs = uat_inner.ttbs();
+                uat_inner.handoff().lock();
                 if uat_inner.handoff().current_slot() == Some(idx as u32) {
                     pr_err!(
                         "Vm::bind to slot {}, but it is currently in use by the ASC?\n",
@@ -3152,12 +2719,8 @@ impl Uat {
                 }
                 ttbs[idx].ttb0.store(ttb, Ordering::Release);
                 ttbs[idx].ttb1.store(ttb1, Ordering::Release);
-                uat_inner.binding_generations[idx] = incarnation;
-                uat_inner.binding_published[idx] = false;
-                uat_inner.owned_user_roots[idx] = ttb;
-                binding.generation = binding_wire_generation(incarnation);
-                uat_inner.publish_slot(idx);
-                drop(transaction);
+                uat_inner.handoff().unlock();
+                core::mem::drop(uat_inner);
 
                 // Make sure all TLB entries from the previous owner of this ASID are gone
                 mem::sync();
@@ -3174,35 +2737,6 @@ impl Uat {
         let slot = binding.binding.as_ref().unwrap().slot() + UAT_USER_CTX_START as u32;
         mod_pr_debug!("MMU: slot {} active users {}\n", slot, binding.active_users);
         Ok(VmBind(vm.clone(), slot))
-    }
-
-    /// Confirms the exact stopped-adopted M4 TTBAT contract. The same mutex serializes every
-    /// host root installation/removal; firmware does not write these words. An unexpected
-    /// observed root is an error, never a new ownership grant.
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
-    pub(crate) fn check_adopted_bindings(&self) -> Result {
-        self.inner.check_m4()?;
-        // Binding locks precede the global UAT lock, as in bind().
-        let lower = self.kernel_lower_vm.ttb() | TTBR_VALID;
-        let inner = self.inner.lock();
-        self.inner.check_m4()?;
-        if self.inner.firmware != UatFirmware::Handoff || inner.map_kernel_to_user {
-            return Err(EINVAL);
-        }
-        let ttbs = inner.ttbs();
-        if ttbs[0].ttb0.load(Ordering::Acquire) != lower
-            || ttbs[0].ttb1.load(Ordering::Acquire) != inner.kernel_ttb1 | TTBR_VALID
-        {
-            return Err(EIO);
-        }
-        for index in UAT_USER_CTX_START..UAT_NUM_CTX {
-            if ttbs[index].ttb0.load(Ordering::Acquire) != inner.owned_user_roots[index]
-                || ttbs[index].ttb1.load(Ordering::Acquire) != 0
-            {
-                return Err(EIO);
-            }
-        }
-        Ok(())
     }
 
     /// Allocates a stable application context without changing the VM bind slot.
@@ -3256,7 +2790,6 @@ impl Uat {
             }
             roots.ttb0.store(low, Ordering::Release);
             roots.ttb1.store(high, Ordering::Release);
-            inner.publish_slot(id);
         }
         mem::sync();
         mem::tlbi_asid(id as u8);
@@ -3266,17 +2799,14 @@ impl Uat {
 
     /// Creates a new `Vm` linked to this UAT.
     pub(crate) fn new_vm(&self, id: u64, kernel_range: Range<u64>) -> Result<Vm> {
-        self.inner.check_m4()?;
-        let vm = Vm::new(
+        Vm::new(
             self.dev.clone(),
             self.inner.clone(),
             kernel_range,
             self.geometry,
             None,
             id,
-        )?;
-        self.inner.check_m4()?;
-        Ok(vm)
+        )
     }
 
     /// Returns the address space geometry of this UAT.
@@ -3298,7 +2828,7 @@ impl Uat {
         // SAFETY: The kernel root is the bootloader-reserved `pagetables` region, which outlives
         // this `Uat`.
         unsafe {
-            pgtable::with_root_entries(self.inner.reserved.as_deref(), self.kernel_vm.ttb(), UAT_PGSZ / size_of::<u64>(), |ptes| {
+            pgtable::with_root_entries(self.kernel_vm.ttb(), UAT_PGSZ / size_of::<u64>(), |ptes| {
                 for (value, pte) in snapshot.iter_mut().zip(ptes) {
                     *value = pte.load(Ordering::Relaxed);
                 }
@@ -3318,7 +2848,7 @@ impl Uat {
     pub(crate) fn confirm_firmware_root_entries(&self, snapshot: [u64; 3]) -> Result {
         // SAFETY: The root is a bootloader-reserved page retained for this UAT's lifetime.
         let matches = unsafe {
-            pgtable::with_root_entries(self.inner.reserved.as_deref(), self.kernel_vm.ttb(), snapshot.len(), |ptes| {
+            pgtable::with_root_entries(self.kernel_vm.ttb(), snapshot.len(), |ptes| {
                 ptes.iter()
                     .zip(snapshot)
                     .all(|(pte, expected)| pte.load(Ordering::Relaxed) == expected)
@@ -3334,19 +2864,15 @@ impl Uat {
     /// secondary firmware instance ([`UatFirmware::PublishedRoots`]), whose lower entries are
     /// private to that instance.
     pub(crate) fn mirror_secondary_root(&self) -> Result {
-        let Some(secondary) = self.inner.lock().secondary_ttb1 else {
-            // A single-instance firmware has no secondary root to mirror.
-            return Ok(());
-        };
+        let secondary = self.inner.lock().secondary_ttb1.ok_or(EINVAL)?;
         let count = UAT_PGSZ / size_of::<u64>();
         let first = IOVA_KERN_TOP_LEVEL_INDEX as usize;
 
-        let reserved = self.inner.reserved.as_deref();
         // SAFETY: Both roots are in the bootloader-reserved `pagetables` region, which outlives
         // this `Uat`.
         unsafe {
-            pgtable::with_root_entries(reserved, self.kernel_vm.ttb(), count, |primary| {
-                pgtable::with_root_entries(reserved, secondary, count, |secondary| {
+            pgtable::with_root_entries(self.kernel_vm.ttb(), count, |primary| {
+                pgtable::with_root_entries(secondary, count, |secondary| {
                     for (src, dst) in primary.iter().zip(secondary).skip(first) {
                         let pte = src.load(Ordering::Relaxed);
                         if pte != 0 && dst.load(Ordering::Relaxed) != pte {
@@ -3363,33 +2889,24 @@ impl Uat {
         Ok(())
     }
 
-    /// Discards the CPU's cached lines of the no-map table regions after the firmware built its
-    /// root there during boot, before the first host edit (`UatQuirks::reserved_tables`).
-    pub(crate) fn invalidate_reserved_tables(&self) {
-        if let Some(reserved) = self.inner.reserved.as_ref() {
-            reserved.invalidate();
-        }
-    }
-
     /// Activates the device-global render root in context 1 after the boot records retire.
     /// Both contexts must still contain their original kernel roots.
     pub(crate) fn activate_render_context(&self, vm: &Vm) -> Result {
         let inner = self.inner.lock();
-        inner.handoff_lock();
+        inner.handoff().lock();
         let ttbs = inner.ttbs();
         let ready = [0, KERNEL_ALIAS_CTX].into_iter().all(|ctx| {
             ttbs[ctx].ttb0.load(Ordering::Acquire) == tagged_root(self.kernel_lower_vm.ttb(), ctx)
                 && ttbs[ctx].ttb1.load(Ordering::Acquire) == tagged_root(self.kernel_vm.ttb(), ctx)
         });
         if !ready {
-            inner.handoff_unlock();
+            inner.handoff().unlock();
             return Err(EIO);
         }
         ttbs[KERNEL_ALIAS_CTX]
             .ttb0
             .store(tagged_root(vm.ttb(), KERNEL_ALIAS_CTX), Ordering::Release);
-        inner.publish_slot(KERNEL_ALIAS_CTX);
-        inner.handoff_unlock();
+        inner.handoff().unlock();
         core::mem::drop(inner);
         mem::sync();
         mem::tlbi_asid(KERNEL_ALIAS_CTX as u8);
@@ -3399,12 +2916,7 @@ impl Uat {
 
     /// Creates the reference-counted inner data for a new `Uat` instance.
     #[inline(never)]
-    fn make_inner(
-        dev: driver::AsahiDevice,
-        firmware: UatFirmware,
-        quirks: UatQuirks,
-        reserved: Option<Arc<pgtable::ReservedTables>>,
-    ) -> Result<Arc<UatInner>> {
+    fn make_inner(dev: driver::AsahiDevice, firmware: UatFirmware) -> Result<Arc<UatInner>> {
         let handoff_rgn = Self::map_region(dev.as_ref().as_ref(), c"handoff", HANDOFF_SIZE, true)?;
         let ttbs_rgn = Self::map_region(dev.as_ref().as_ref(), c"ttbs", SLOTS_SIZE, true)?;
 
@@ -3413,16 +2925,12 @@ impl Uat {
         let handoff = unsafe { &(handoff_rgn.map.ptr() as *mut Handoff).as_ref().unwrap() };
 
         dev_info!(dev.as_ref(), "MMU: Initializing kernel page table\n");
-        let shared_quirks = quirks;
 
         Arc::pin_init(
             try_pin_init!(UatInner {
                 firmware,
-                m4_adopted: false,
-                failed: AtomicBool::new(false),
-                clean_poc: quirks.clean_tables,
-                quirks,
-                reserved,
+                #[cfg(CONFIG_DRM_ASAHI_G15)]
+                clean_poc: false,
                 handoff_flush <- pin_init::pin_init_array_from_fn(|i| {
                     new_mutex!(HandoffFlush(&handoff.flush[i]), "handoff_flush")
                 }),
@@ -3431,14 +2939,10 @@ impl Uat {
                         kernel_ttb1: 0,
                         execution_contexts: !EXECUTION_CONTEXT_MASK,
                         context_generations: [0; UAT_NUM_CTX],
-                        binding_generations: [0; UAT_NUM_CTX],
-                        binding_published: [false; UAT_NUM_CTX],
-                        owned_user_roots: [0; UAT_NUM_CTX],
                         secondary_ttb1: None,
                         map_kernel_to_user: false,
                         handoff_rgn,
                         ttbs_rgn,
-                        quirks: shared_quirks,
                     },
                     "uat_shared"
                 ),
@@ -3454,27 +2958,12 @@ impl Uat {
         geometry: UatGeometry,
         map_kernel_to_user: bool,
         firmware: UatFirmware,
-        quirks: UatQuirks,
     ) -> Result<Self> {
         dev_info!(dev.as_ref(), "MMU: Initializing...\n");
 
-        mem::set_page_tlbi(quirks.page_tlbi);
+        let inner = Self::make_inner(dev.clone(), firmware)?;
+
         let of_node = dev.as_ref().as_ref().of_node().ok_or(EINVAL)?;
-        let reserved = if quirks.reserved_tables {
-            let mut tables = pgtable::ReservedTables::new();
-            for name in [c"pagetables", c"l2-pagetables"] {
-                let res = of_node.reserved_mem_region_to_resource_byname(name)?;
-                // SAFETY: The boot loader reserved these regions (no-map) for the firmware's
-                // page tables; they stay reserved until reboot.
-                unsafe { tables.add(res)? };
-            }
-            Some(Arc::new(tables, GFP_KERNEL)?)
-        } else {
-            None
-        };
-
-        let inner = Self::make_inner(dev.clone(), firmware, quirks, reserved)?;
-
         let res = of_node.reserved_mem_region_to_resource_byname(c_str!("pagetables"))?;
         let ttb1 = res.start();
         let ttb1size: usize = res.size().try_into()?;
@@ -3482,11 +2971,11 @@ impl Uat {
         let (pagetables_size, secondary_ttb1) = match firmware {
             UatFirmware::Handoff => (PAGETABLES_SIZE, None),
             UatFirmware::PublishedRoots {
-                secondary_root_offset: Some(offset),
-            } => (offset as usize + UAT_PGSZ, Some(ttb1 + offset)),
-            UatFirmware::PublishedRoots {
-                secondary_root_offset: None,
-            } => (UAT_PGSZ, None),
+                secondary_root_offset,
+            } => (
+                secondary_root_offset as usize + UAT_PGSZ,
+                Some(ttb1 + secondary_root_offset),
+            ),
         };
         if ttb1size < pagetables_size {
             dev_err!(dev.as_ref(), "MMU: Pagetables region is too small\n");
@@ -3537,15 +3026,11 @@ impl Uat {
         inner.kernel_ttb1 = ttb1;
         inner.secondary_ttb1 = secondary_ttb1;
 
-        inner.handoff().init(firmware, quirks.handoff_slot)?;
-        if quirks.clean_tables {
-            pgtable::clean_poc(inner.handoff() as *const Handoff as *const u8, HANDOFF_SIZE);
-            pgtable::poc_barrier();
-        }
+        inner.handoff().init(firmware)?;
 
         dev_info!(dev.as_ref(), "MMU: Initializing TTBs\n");
 
-        inner.handoff_lock();
+        inner.handoff().lock();
 
         let ttbs = inner.ttbs();
 
@@ -3557,7 +3042,7 @@ impl Uat {
             ctx.ttb1.store(0, Ordering::Relaxed);
         }
 
-        if matches!(firmware, UatFirmware::PublishedRoots { .. }) {
+        if secondary_ttb1.is_some() {
             let alias = &ttbs[KERNEL_ALIAS_CTX];
             alias
                 .ttb0
@@ -3566,12 +3051,8 @@ impl Uat {
                 .ttb1
                 .store(tagged_root(ttb1, KERNEL_ALIAS_CTX), Ordering::SeqCst);
         }
-        if quirks.clean_tables {
-            pgtable::clean_poc(ttbs.as_ptr() as *const u8, SLOTS_SIZE);
-            pgtable::poc_barrier();
-        }
 
-        inner.handoff_unlock();
+        inner.handoff().unlock();
 
         core::mem::drop(inner);
 

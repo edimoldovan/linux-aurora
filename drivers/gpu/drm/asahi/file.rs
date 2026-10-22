@@ -17,7 +17,6 @@ use crate::{
     },
     gem,
     memacct,
-    gpu,
     mmu,
     queue,
     util::{
@@ -45,7 +44,6 @@ use kernel::sync::{
     Mutex, //
 };
 use kernel::time::NSEC_PER_SEC;
-use kernel::types::ScopeGuard;
 use kernel::uaccess::{
     UserPtr,
     UserSlice, //
@@ -71,7 +69,6 @@ struct Vm {
     user_range: Range<u64>,
     kernel_range: Range<u64>,
     _dummy_mapping: mmu::KernelMapping,
-    gpu: Arc<dyn gpu::Gpu>,
 }
 
 impl Drop for Vm {
@@ -93,7 +90,6 @@ impl Drop for Vm {
                 pr_err!("Vm::Drop: deferred user unmap failed: {:?}\n", error);
             }
             self.vm.bo_deferred_cleanup();
-            self.gpu.vm_closed(&self.vm);
             return;
         }
         // When the user Vm is dropped, verify that no user mappings exists.
@@ -223,7 +219,7 @@ impl SyncItem {
 
 #[derive(Clone)]
 pub(crate) enum Object {
-    TimestampBuffer(Arc<crate::timestamp::Buffer>),
+    TimestampBuffer(Arc<mmu::KernelMapping>),
 }
 
 /// State associated with a client.
@@ -405,18 +401,7 @@ impl File {
 
         gpu.get_params(&mut params)?;
 
-        if gpu.supports_vm_status() {
-            params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS)
-                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS_MIRROR);
-        }
-        if gpu.queue_limits().is_some() {
-            params.features |=
-                u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES);
-        }
-
-        if gpu.soft_faults() && gpu.supports_soft_faults() {
-            params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
-        }
+        params.features |= gpu.feature_flags();
 
         let size = core::mem::size_of::<uapi::drm_asahi_params_global>().min(data.size.try_into()?);
 
@@ -444,12 +429,9 @@ impl File {
             return Err(EINVAL);
         }
         let status = Self::vm_status(file, vm_id)?;
-        UserSlice::new(user, size).writer().write(&[
-            vm_id,
-            0,
-            status.reported_error() as u32,
-            0,
-        ])?;
+        UserSlice::new(user, size)
+            .writer()
+            .write(&[vm_id, 0, status.reported_error() as u32, 0])?;
         Ok(0)
     }
 
@@ -524,22 +506,7 @@ impl File {
 
         let gpu = &reg_data.gpu;
         let file_id = file.inner().id;
-        let vm = gpu.new_vm_for_file(kernel_range.clone(), file_id)?;
-        // G16 registers a retained backend owner before returning this VM. Any later
-        // allocation can fail before file::Vm exists to run its normal close path.
-        let failed_vm = ScopeGuard::new_with_data(
-            (vm.clone(), user_range.clone(), kernel_range.clone()),
-            |(vm, user_range, kernel_range)| {
-                if gpu.tracked_submission() && vm.status().is_some() && !vm.is_closed() {
-                    vm.close_idle_reclaim();
-                    if let Err(error) = vm.unmap_user_ranges(user_range, kernel_range) {
-                        pr_err!("VM create: closing unpublished VM failed: {:?}\n", error);
-                    }
-                    vm.bo_deferred_cleanup();
-                    gpu.vm_closed(&vm);
-                }
-            },
-        );
+        let vm = gpu.new_vm(kernel_range.clone())?;
 
         let vm_xa = file.inner().vms();
         let resv = vm_xa.lock().reserve_limit(1..=u32::MAX, GFP_KERNEL)?;
@@ -615,12 +582,10 @@ impl File {
                 user_range,
                 kernel_range,
                 _dummy_mapping: dummy_mapping,
-                gpu: gpu.clone(),
             },
             GFP_KERNEL,
         )?)?;
 
-        drop(failed_vm.dismiss());
         data.vm_id = id;
 
         Ok(0)
@@ -629,7 +594,7 @@ impl File {
     /// IOCTL: vm_destroy: Destroy a `Vm`.
     pub(crate) fn vm_destroy(
         _device: &AsahiDrmDevice<drm::Registered>,
-        _reg_data: &driver::AsahiDrmRegistrationData<'_>,
+        reg_data: &driver::AsahiDrmRegistrationData<'_>,
         data: &mut uapi::drm_asahi_vm_destroy,
         file: &DrmFile,
     ) -> Result<u32> {
@@ -637,6 +602,8 @@ impl File {
         if vm.is_none() {
             Err(ENOENT)
         } else {
+            drop(vm);
+            reg_data.gpu.vm_closed();
             Ok(0)
         }
     }
@@ -697,12 +664,10 @@ impl File {
         let gem = gem::new_object(
             device, size, data.flags, resv_obj, reclaim_cpu, pages_no_reclaim, commit,
         )?;
-        if reg_data.gpu.prepare_new_objects() {
-            let registered = device.registration_guard().ok_or(ENODEV)?;
-            let parent: &kernel::platform::Device<kernel::device::Bound> = registered.as_ref();
-            gem::prepare_new_object(&gem, parent.as_ref())?;
-        }
 
+        if reg_data.gpu.prepare_new_objects() {
+            gem::prepare_new_object(&gem)?;
+        }
         let handle = gem.create_handle(file)?;
         data.handle = handle;
 
@@ -779,17 +744,11 @@ impl File {
         }
 
         if let Some(limit) = reg_data.gpu.bind_batch_limit() {
-            if data.num_binds == 0
-                || data.num_binds > limit
-                || data.userptr == 0
-                || data.stride % 8 != 0
-                || data.stride as usize > kernel::page::PAGE_SIZE
-            {
-                cls_pr_debug!(Errors, "vm_bind: Batch outside the GPU's limits\n");
+            if data.num_binds == 0 || data.num_binds > limit || data.userptr == 0
+                || data.stride % 8 != 0 || data.stride as usize > kernel::page::PAGE_SIZE {
                 return Err(EINVAL);
             }
         }
-
         if reg_data.gpu.as_any().is::<crate::g17::Gpu>() || reg_data.gpu.tracked_submission() {
             return Self::vm_bind_g17(data, file);
         }
@@ -1266,26 +1225,10 @@ impl File {
             return Err(EINVAL);
         }
 
-        // REALTIME stays reserved. HIGH needs CAP_SYS_NICE or DRM master, as amdgpu and
-        // panthor require for raised queue priority; EACCES lets userspace fall back to MEDIUM.
-        if data.priority == uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_REALTIME {
+        // TODO: Allow with CAP_SYS_NICE
+        if data.priority >= uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_HIGH {
             cls_pr_debug!(Errors, "queue_create: Invalid priority\n");
             return Err(EINVAL);
-        }
-        // HIGH has only been run on G17; G13 and G14 keep refusing it.
-        if data.priority == uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_HIGH
-            && !reg_data.gpu.as_any().is::<crate::g17::Gpu>()
-        {
-            cls_pr_debug!(Errors, "queue_create: HIGH priority is not supported on this GPU\n");
-            return Err(EINVAL);
-        }
-        // SAFETY: capable() only reads the calling task's credentials (ioctl process context).
-        if data.priority == uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_HIGH
-            && !unsafe { bindings::capable(bindings::CAP_SYS_NICE as _) }
-            && !file.is_current_master()
-        {
-            cls_pr_debug!(Errors, "queue_create: HIGH priority needs CAP_SYS_NICE or DRM master\n");
-            return Err(EACCES);
         }
 
         let queues_xa = file.inner().queues();
@@ -1348,9 +1291,6 @@ impl File {
         }
 
         let gpu = &reg_data.gpu;
-        if data.cmdbuf_size as usize > gpu.max_cmdbuf_size() {
-            return Err(E2BIG);
-        }
         if let Some(manager) = gpu.manager() {
             manager.update_globals();
         }
