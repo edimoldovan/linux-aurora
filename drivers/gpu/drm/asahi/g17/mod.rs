@@ -53,6 +53,7 @@ use core::any::Any;
 use core::ops::Range;
 use core::sync::atomic::{
     AtomicBool,
+    AtomicU64,
     Ordering, //
 };
 
@@ -793,6 +794,9 @@ struct Shared {
     state: Mutex<Option<KBox<Firmware>>>,
     #[pin]
     changed: CondVar,
+    /// Counts `changed` notifications, so that a waiter which checked under
+    /// the device mutex can tell whether it already missed one.
+    changes: AtomicU64,
 }
 
 impl_has_work! {
@@ -880,6 +884,16 @@ impl Shared {
         // the reference-slot mutex held.
         let retired = self.drm.lock().take();
         drop(retired);
+    }
+
+    /// Wakes the waiters for a returned pair, binding or capacity change.
+    fn note_changed(&self) {
+        self.changes.fetch_add(1, Ordering::AcqRel);
+        self.changed.notify_all();
+    }
+
+    fn changes(&self) -> u64 {
+        self.changes.load(Ordering::Acquire)
     }
 
     /// Queues the event worker. Callable from any context.
@@ -1061,6 +1075,7 @@ impl Gpu {
                 stop <- new_mutex!((), "g17::Shared::stop"),
                 state <- new_mutex!(None, "g17::Shared::state"),
                 changed <- new_condvar!("g17::Shared::changed"),
+                changes: AtomicU64::new(0),
             }),
             GFP_KERNEL,
         )?;

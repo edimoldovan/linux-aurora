@@ -594,7 +594,7 @@ impl Backend {
                     .queues
                     .compute_building = false;
             }
-            self.shared.changed.notify_all();
+            self.shared.note_changed();
             drop(lease);
             if result != Err(EAGAIN) {
                 return result;
@@ -654,7 +654,7 @@ impl Backend {
                 .queues
                 .compute_scheduler_building = false;
         }
-        self.shared.changed.notify_all();
+        self.shared.note_changed();
         result
     }
 

@@ -426,7 +426,7 @@ impl super::super::Backend {
             }
             firmware.render_grow_ready()
         };
-        self.shared.changed.notify_all();
+        self.shared.note_changed();
         if grow_ready {
             self.shared.queue_grow();
         }
@@ -548,7 +548,7 @@ impl super::super::Backend {
                     .release(id)?;
             }
         }
-        self.shared.changed.notify_all();
+        self.shared.note_changed();
         if grow_ready {
             self.shared.queue_grow();
         }
@@ -711,7 +711,7 @@ impl super::super::Backend {
                 .ok_or(EIO)?
                 .release_owner();
         }
-        self.shared.changed.notify_all();
+        self.shared.note_changed();
         let published = (|| {
             let entry = firmware.queues.render.entry(slot)?;
             if entry.pending_error.is_some() || entry.pending_timeout {

@@ -144,7 +144,7 @@ impl Backend {
     /// scheduler it last ran for to be consumed and the pair parked. The event
     /// worker observes both, so kick it on every poll; time out only after the
     /// same bound as a capacity wait.
-    fn wait_render_busy(&self, since: &mut Option<u64>, sleep: bool) -> Result {
+    fn wait_render_busy(&self, since: &mut Option<u64>, seen: u64, sleep: bool) -> Result {
         if !sleep {
             return Err(FALLBACK);
         }
@@ -153,7 +153,12 @@ impl Backend {
             return Err(ETIMEDOUT);
         }
         self.shared.queue_events();
-        fsleep(Delta::from_micros(200));
+        // Every pair return notifies under the device mutex: wake on it rather
+        // than sleeping out a fixed interval behind a short observation loan.
+        let mut state = self.shared.state.lock();
+        if self.shared.changes() == seen {
+            let _ = self.shared.changed.wait_timeout(&mut state, kernel::time::msecs_to_jiffies(1));
+        }
         Ok(())
     }
 
@@ -194,6 +199,7 @@ impl Backend {
         let mut recovery_polls = 0;
         let capacity_started = super::super::now_ns();
         loop {
+            let seen = self.shared.changes();
             if packet.cancel_requested() {
                 return Err(ECANCELED);
             }
@@ -242,7 +248,7 @@ impl Backend {
                 }
                 Err(error) if error == EAGAIN => continue,
                 Err(error) if error == EBUSY => {
-                    self.wait_render_busy(&mut busy_since, sleep)?;
+                    self.wait_render_busy(&mut busy_since, seen, sleep)?;
                     continue;
                 }
                 result => result?,
@@ -270,7 +276,7 @@ impl Backend {
                         self.shared.queue_events();
                         fsleep(Delta::from_millis(1));
                     } else if error == EBUSY {
-                        self.wait_render_busy(&mut busy_since, sleep)?;
+                        self.wait_render_busy(&mut busy_since, seen, sleep)?;
                     } else if !sleep {
                         return Err(FALLBACK);
                     }
