@@ -55,6 +55,7 @@ impl kernel::debugfs::Writer for View {
             let state = self.0.state.lock();
             let Some(firmware) = state.as_deref() else { return writeln!(f, "online=0"); };
             writeln!(f, "online=1")?;
+            writeln!(f, "compute_admission_demand={}", self.0.compute_demand.load(Ordering::Acquire))?;
             firmware.queues.write_capacity(f)?;
             firmware.pool.write_capacity(f)?;
             writeln!(f, "render_pool_ids used={} total=127", firmware.render_ids.used())?;

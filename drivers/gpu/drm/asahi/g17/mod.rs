@@ -53,6 +53,7 @@ use core::any::Any;
 use core::ops::Range;
 use core::sync::atomic::{
     AtomicBool,
+    AtomicU32,
     AtomicU64,
     Ordering, //
 };
@@ -772,6 +773,8 @@ struct Shared {
     #[pin]
     feed_work: Work<Shared, FEED_WORK>,
     preparations: Arc<preparation::Gate>,
+    /// Unbound compute publishers which can reuse a retired channel.
+    compute_demand: AtomicU32,
     #[pin]
     work: Work<Shared, EVENT_WORK>,
     #[pin]
@@ -1066,6 +1069,7 @@ impl Gpu {
                 feed,
                 feed_work <- new_work!("g17::Shared::feed_work"),
                 preparations,
+                compute_demand: AtomicU32::new(0),
                 work <- new_work!("g17::Shared::work"),
                 poll <- new_delayed_work!("g17::Shared::poll"),
                 idle <- new_delayed_work!("g17::Shared::idle"),

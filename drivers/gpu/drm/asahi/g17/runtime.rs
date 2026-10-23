@@ -34,6 +34,30 @@ const FIRST_COMPUTE_QID: u8 = 4;
 const RECOVERY_SETTLE_POLLS: usize = 200;
 const WORK_RING_WAIT_NS: u64 = super::job::TIMEOUT_MS as u64 * 1_000_000;
 
+/// Pending admission keeps exactly retired compute backing available for reuse.
+/// The guard spans retries and disappears on publication, cancellation or error.
+/// It borrows Shared, so the accounting cannot retain the device after teardown.
+struct ComputeDemand<'a>(&'a Arc<super::Shared>);
+
+impl<'a> ComputeDemand<'a> {
+    fn new(shared: &'a Arc<super::Shared>) -> Self {
+        // Each admitted logical queue has at most one scheduler publisher.
+        // The execution-context bound is far below the counter's range.
+        shared.compute_demand.fetch_add(1, Ordering::AcqRel);
+        Self(shared)
+    }
+}
+
+impl Drop for ComputeDemand<'_> {
+    fn drop(&mut self) {
+        if self.0.compute_demand.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Reinstate normal idle retention even if the last publisher was
+            // cancelled before a kick could produce another event.
+            self.0.queue_events();
+        }
+    }
+}
+
 /// A reservation remains identifiable while its backing is built without the
 /// device mutex. Failed construction returns the slot, never its host identity.
 #[derive(Clone, Copy)]
@@ -782,7 +806,7 @@ impl Backend {
                     Err(error) if error == ENOSPC => {
                         drop(state);
                         drop(lease);
-                        self.wait_compute_capacity(admission)?;
+                        self.wait_compute_capacity(admission, true)?;
                         continue;
                     }
                     result => result?,
@@ -795,11 +819,12 @@ impl Backend {
                         let reservation = match firmware.queues.reserve_compute(self.owner) {
                             Ok(reservation) => reservation,
                             Err(error) if error == EAGAIN => {
-                                // The event worker owns release observation and
-                                // drops vacated aliases/backing off this mutex.
+                                // All physical channels are occupied. Retain their
+                                // USC backing for exact-retirement handoff; releasing
+                                // it cannot create a QID and forces fresh allocation.
                                 drop(state);
                                 drop(lease);
-                                self.wait_compute_capacity(admission)?;
+                                self.wait_compute_capacity(admission, false)?;
                                 continue;
                             }
                             Err(error) if error == ENOSPC => {
@@ -833,7 +858,7 @@ impl Backend {
                     let (pages, ring) = match built {
                         Err(error) if error == ENOSPC => {
                             drop(lease);
-                            self.wait_compute_capacity(admission)?;
+                            self.wait_compute_capacity(admission, true)?;
                             continue;
                         }
                         result => result?,
@@ -922,7 +947,7 @@ impl Backend {
             }
             drop(lease);
             if result == Err(ENOSPC) {
-                self.wait_compute_capacity(admission)?;
+                self.wait_compute_capacity(admission, true)?;
                 continue;
             }
             if result != Err(EAGAIN) { return result; }
@@ -1423,6 +1448,7 @@ impl Backend {
         // A bound queue needs none of ensure_compute's admission passes. Try
         // without them; the publication section below checks the same state.
         let mut bound = true;
+        let mut demand = None;
         let mut recovery_polls = 0;
         let mut state_delay = 20i64;
         let deadline = now_ns().saturating_add(WORK_RING_WAIT_NS);
@@ -1439,6 +1465,7 @@ impl Backend {
             // Recheck on every retry: pressure may yield an idle binding between
             // admission and publication without changing this logical queue.
             if !bound {
+                demand.get_or_insert_with(|| ComputeDemand::new(&self.shared));
                 Backend::ensure_compute(self, scratch.pages(), &admission)?;
                 admission.check()?;
             }
@@ -1670,6 +1697,11 @@ impl super::Firmware {
         // retained compute pool stays warm: render and new compute need it more.
         let cap = if super::freelist::lower_pressure() {
             0
+        } else if self.primary.state.shared.compute_demand.load(Ordering::Acquire) != 0 {
+            // A retired channel being requested by another runnable publisher
+            // is not an unused warm pool. Keep its existing backing through
+            // handoff; real allocation pressure above still forces reclamation.
+            super::kick::COMPUTE_CHANNELS
         } else {
             COMPUTE_WARM_CAP
         };
@@ -1714,10 +1746,10 @@ impl Backend {
     pub(super) fn wait_capacity(&self, started: u64) -> Result {
         let check = || self.admission_open();
         let admission = Admission::new(started.saturating_add(WORK_RING_WAIT_NS), &check);
-        self.wait_compute_capacity(&admission)
+        self.wait_compute_capacity(&admission, true)
     }
 
-    fn wait_compute_capacity(&self, admission: &Admission<'_>) -> Result {
+    fn wait_compute_capacity(&self, admission: &Admission<'_>, reclaim_backing: bool) -> Result {
         admission.check()?;
         let mut deferred = DeferredBatch::publication()?;
         let result: Result = (|| {
@@ -1738,8 +1770,13 @@ impl Backend {
             }
             // Consumption, not publication or an elapsed timeout, frees backing.
             firmware.queues.observe_pool_releases(&firmware.init, &mut deferred)?;
-            firmware.queues.reclaim_idle_render_pools(&firmware.init, &mut deferred)?;
-            if !firmware.render_control_backpressured() {
+            // Pool eviction addresses backing allocation pressure, not channel
+            // occupancy. Normal idle expiry and the retained-pool cap still run
+            // in the event worker for either kind of admission wait.
+            if reclaim_backing {
+                firmware.queues.reclaim_idle_render_pools(&firmware.init, &mut deferred)?;
+            }
+            if reclaim_backing && !firmware.render_control_backpressured() {
                 let (published, _) = firmware.queues.vacate_idle_pools(&firmware.init, 0, now_ns(), 0)?;
                 if published != 0 { firmware.primary.notify(super::MSG_CONTROL_NOTIFY)?; }
             }
