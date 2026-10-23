@@ -216,7 +216,7 @@ impl<B: Backend> Queue<B> {
             destinations,
             engine == Engine::Compute,
             host_predecessors.clone().next().is_some(),
-            if engine == Engine::Render { self.backend.feed() } else { None },
+            self.backend.feed(),
         )?;
         let publication = completion.publication()
             .map(|target| PreparedPublication::new(target, host_predecessors))
@@ -298,8 +298,7 @@ impl<B: Backend> Queue<B> {
                 checked_inputs.push(fence.clone(), GFP_KERNEL)?;
             }
         }
-        let early = engine == Engine::Render
-            && dependencies.is_empty()
+        let early = dependencies.is_empty()
             && self.frontiers[index].len() < EARLY_DEPTH;
         let packet = Packet::new(
             id,

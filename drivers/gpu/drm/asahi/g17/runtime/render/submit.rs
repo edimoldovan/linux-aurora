@@ -17,13 +17,13 @@ use kernel::{
 /// Internal result of a publication attempted from the submitting ioctl that
 /// met contention before anything became visible: the scheduler publishes the
 /// command instead. Never returned to userspace.
-pub(super) const FALLBACK: Error = EINPROGRESS;
+pub(in crate::g17::runtime) const FALLBACK: Error = EINPROGRESS;
 
 impl Backend {
     /// The submitting ioctl holds the logical queue's mutex and never sleeps
     /// for contention or a closed preparation gate: it returns FALLBACK, and
     /// the scheduler's worker publishes the command and owns the waits.
-    pub(super) fn enter_preparation(&self, sleep: bool) -> Result<crate::g17::preparation::Lease> {
+    pub(in crate::g17::runtime) fn enter_preparation(&self, sleep: bool) -> Result<crate::g17::preparation::Lease> {
         if sleep {
             return self.shared.preparations.enter(false);
         }

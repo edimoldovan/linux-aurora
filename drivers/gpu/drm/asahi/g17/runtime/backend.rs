@@ -13,7 +13,14 @@ use kernel::{dma_fence::Fence, drm::sched, prelude::*, sync::Arc};
 impl Backend {
     pub(super) fn release_backlog(&self, packet: &Packet) {
         if packet.take_backlog() {
-            self.backlog.fetch_sub(1, Ordering::AcqRel);
+            self.backlog_of(packet).fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    pub(super) fn backlog_of(&self, packet: &Packet) -> &core::sync::atomic::AtomicU32 {
+        match packet.engine() {
+            Engine::Render => &self.backlog,
+            Engine::Compute => &self.compute_backlog,
         }
     }
 
@@ -274,11 +281,14 @@ impl job::Backend for Backend {
     }
 
     fn try_early(&self, packet: &Arc<Packet>) -> bool {
-        self.try_render_early(packet)
+        match packet.engine() {
+            Engine::Render => self.try_render_early(packet),
+            Engine::Compute => self.try_compute_early(packet),
+        }
     }
 
     fn count_backlog(&self, packet: &Packet) {
         packet.count_backlog();
-        self.backlog.fetch_add(1, Ordering::AcqRel);
+        self.backlog_of(packet).fetch_add(1, Ordering::AcqRel);
     }
 }

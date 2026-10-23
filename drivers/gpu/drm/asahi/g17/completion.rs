@@ -546,7 +546,13 @@ impl Completion {
             return;
         }
         if let (Some(feed), Ok(ticks)) = (&self.feed, &result) {
-            feed.note_render_pass(ticks[2], ticks[3]);
+            // Compute reports its dispatch envelope in the first pair, a
+            // render its fragment pass in the second.
+            if self.compute.is_some() {
+                feed.note_pass(ticks[0], ticks[1]);
+            } else {
+                feed.note_pass(ticks[2], ticks[3]);
+            }
         }
         if let Err(error) = result {
             // Spared work cancelled after another VM's recovery is not this client's device loss.

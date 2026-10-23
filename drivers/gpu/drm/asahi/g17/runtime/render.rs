@@ -16,6 +16,7 @@ mod settle;
 mod submit;
 pub(super) mod teardown;
 
+pub(super) use submit::FALLBACK;
 use super::{DeferredBatch, Registry};
 use crate::g17::{context::Context, fw::queue::DataMaster, job::Packet, kick, queue::render::Pair};
 use crate::hw::t8140::queues::RENDER_SLOTS;

@@ -394,6 +394,12 @@ impl InitData {
         Ok(())
     }
 
+    pub(super) fn compute_vm_cached(&self, vm: &mmu::Vm) -> bool {
+        self.compute_shared
+            .as_ref()
+            .is_some_and(|shared| vm.compute_pool_mappings_match(shared.id))
+    }
+
     pub(super) fn cache_compute_vm(&self, vm: &mmu::Vm) -> Result {
         let shared = self.compute_shared.as_ref().ok_or(EIO)?;
         if vm.compute_pool_mappings_match(shared.id) {

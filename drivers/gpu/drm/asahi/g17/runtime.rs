@@ -441,6 +441,7 @@ pub(super) struct Backend {
     pub(super) context: Arc<Context>,
     owner: u64,
     backlog: core::sync::atomic::AtomicU32,
+    compute_backlog: core::sync::atomic::AtomicU32,
     closed: core::sync::atomic::AtomicBool,
 }
 
@@ -521,6 +522,7 @@ impl Backend {
                     context,
                     owner,
                     backlog: core::sync::atomic::AtomicU32::new(0),
+                    compute_backlog: core::sync::atomic::AtomicU32::new(0),
                     closed: core::sync::atomic::AtomicBool::new(false),
                 },
                 GFP_KERNEL,
@@ -1163,6 +1165,18 @@ impl super::Firmware {
 }
 
 impl Registry {
+    /// Everything ensure_compute establishes for `owner`: the shared compute
+    /// objects mapped into its VM, and its queue bound to `context` with a
+    /// pool that fits and no spared witness to release.
+    fn compute_bound(&self, owner: u64, context: &Arc<Context>, required: usize) -> Result<bool> {
+        let Some(queue) = self.compute(owner) else {
+            return Ok(false);
+        };
+        Ok(!queue.spared_pending()
+            && queue.pool_fits(required)
+            && queue.matches(owner, queue.qid(), context)?)
+    }
+
     fn release_compute_witness(
         &mut self,
         init: &super::initdata::InitData,
@@ -1317,6 +1331,85 @@ impl Backend {
         Err(EBUSY)
     }
 
+    /// Publishes a dependency-free compute command from its submit ioctl when
+    /// its queue is already bound and nothing has to wait, as renders do. Any
+    /// wait leaves the command, unpublished, to its scheduler.
+    pub(super) fn try_compute_early(&self, packet: &Arc<super::job::Packet>) -> bool {
+        if self.compute_backlog.load(Ordering::Acquire) != 0 || packet.has_dependencies() {
+            return false;
+        }
+        if !packet.begin_publication() {
+            packet.completion.fail_unpublished(ECANCELED);
+            packet.set_early_result(Err(ECANCELED));
+            return true;
+        }
+        let mut deferred = match DeferredBatch::publication() {
+            Ok(deferred) => deferred,
+            Err(error) => {
+                if packet.completion.status().get() != 0 {
+                    <Self as super::job::Backend>::fail_vm(self, error);
+                }
+                packet.completion.fail_unpublished(error);
+                packet.set_early_result(Err(error));
+                return true;
+            }
+        };
+        let result = self.compute_inline(packet, &mut deferred);
+        if matches!(result, Err(error) if error == render::FALLBACK) && !packet.is_published() {
+            deferred.finish();
+            packet.abandon_publication();
+            return false;
+        }
+        let result = self
+            .finish_publication(packet, result, &mut deferred)
+            .map(|_| ());
+        packet.set_early_result(result);
+        true
+    }
+
+    /// compute_packet's publication section without its waits: every condition
+    /// it would sleep or retry for returns FALLBACK instead.
+    fn compute_inline(
+        &self,
+        packet: &Arc<super::job::Packet>,
+        deferred: &mut DeferredBatch,
+    ) -> Result {
+        let super::command::Validated::Compute { scratch, .. } = &packet.command else { return Err(EINVAL); };
+        let required = super::fw::compute_pool::required_blocks(self.shared.active_cores, scratch.pages())?;
+        if packet.cancel_requested() || self.admission_open().is_err() || packet.completion.status().get() != 0 {
+            return Err(render::FALLBACK);
+        }
+        let lease = self.enter_preparation(false)?;
+        match packet.completion.work_state()?.acquire() {
+            Err(error) if error == EBUSY => return Err(render::FALLBACK),
+            result => {
+                result?;
+            }
+        }
+        let mut state = self.shared.state.lock();
+        let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+        if !lease.is_current()
+            || self.shared.crashed.load(Ordering::Acquire)
+            || firmware.recovery.pending()
+            || super::recovery::Memory::recovery_state(&firmware.init)? != 0
+        {
+            return Err(render::FALLBACK);
+        }
+        firmware.replay_compute(deferred)?;
+        if !firmware.init.compute_vm_cached(self.context.vm())
+            || !firmware.queues.compute_bound(self.owner, &self.context, required)?
+        {
+            return Err(render::FALLBACK);
+        }
+        let dependencies = firmware.queues.render_prefix(self.owner, packet)?;
+        match firmware.publish_compute(self.owner, packet.clone(), dependencies.as_slice(), deferred) {
+            Err(error) if (error == EBUSY || error == EAGAIN) && !packet.is_published() => {
+                Err(render::FALLBACK)
+            }
+            result => result,
+        }
+    }
+
     /// Called after taking this packet's publication claim. All waits and work
     /// state allocation precede the device mutex; only the checked epoch commits.
     fn compute_packet(
@@ -1326,6 +1419,10 @@ impl Backend {
     ) -> Result {
         packet.check_dependencies()?;
         let super::command::Validated::Compute { scratch, .. } = &packet.command else { return Err(EINVAL); };
+        let required = super::fw::compute_pool::required_blocks(self.shared.active_cores, scratch.pages())?;
+        // A bound queue needs none of ensure_compute's admission passes. Try
+        // without them; the publication section below checks the same state.
+        let mut bound = true;
         let mut recovery_polls = 0;
         let mut state_delay = 20i64;
         let deadline = now_ns().saturating_add(WORK_RING_WAIT_NS);
@@ -1341,8 +1438,10 @@ impl Backend {
             // All DRM dependencies were satisfied before this scheduler callback.
             // Recheck on every retry: pressure may yield an idle binding between
             // admission and publication without changing this logical queue.
-            Backend::ensure_compute(self, scratch.pages(), &admission)?;
-            admission.check()?;
+            if !bound {
+                Backend::ensure_compute(self, scratch.pages(), &admission)?;
+                admission.check()?;
+            }
             let lease = self.shared.preparations.enter_until(&admission)?;
             // Work states free as this context's earlier commands retire.
             // Wait for one under the packet's admission deadline, as render
@@ -1387,7 +1486,10 @@ impl Backend {
                 continue;
             }
             firmware.replay_compute(deferred)?;
-            if firmware.queues.compute(self.owner).is_none() {
+            if !firmware.init.compute_vm_cached(self.context.vm())
+                || !firmware.queues.compute_bound(self.owner, &self.context, required)?
+            {
+                bound = false;
                 drop(state);
                 drop(lease);
                 continue;
