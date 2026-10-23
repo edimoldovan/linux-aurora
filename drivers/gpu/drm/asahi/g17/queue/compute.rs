@@ -1904,7 +1904,7 @@ impl Queue {
                 .object
                 .initialize::<ComputeDescriptor>(
                     kick_timestamp.slot() % DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE,
-                    |descriptor| descriptor.write(&args),
+                    |descriptor| descriptor.write_zeroed(&args),
                 )?;
             if first {
                 self.graph.context_high.write(
