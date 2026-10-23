@@ -38,6 +38,13 @@ struct drm_gem_shmem_object {
 	bool reclaimable_cpu_mappings;
 
 	/**
+	 * @pages_no_reclaim: Disable direct reclaim during backing population.
+	 * Set before drm_gem_shmem_init(). Drivers that can fail a large pin
+	 * request cheaply may opt in; background reclaim remains enabled.
+	 */
+	bool pages_no_reclaim;
+
+	/**
 	 * @cpu_pages: Pages populated one at a time by CPU faults on revocable
 	 * VMAs while no device mapping holds @pages. Sparse; under base.resv.
 	 */

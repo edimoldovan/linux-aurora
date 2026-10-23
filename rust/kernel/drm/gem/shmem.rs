@@ -82,6 +82,12 @@ pub struct ObjectConfig<'a, T: DriverObject> {
     /// Opt in to revocable CPU VMAs, with driver-controlled idle eviction.
     pub reclaimable_cpu_mappings: bool,
 
+    /// Fail backing population when it would need direct reclaim.
+    ///
+    /// Background reclaim and ordinary allocation placement are preserved.
+    /// Intended for large, fallible pin requests, not essential kernel backing.
+    pub pages_no_reclaim: bool,
+
     /// Reuse the DMA reservation from another GEM object.
     ///
     /// The newly created [`Object`] will hold an owned refcount to `parent_resv_obj` if specified.
@@ -94,6 +100,7 @@ impl<'a, T: DriverObject> Default for ObjectConfig<'a, T> {
         Self {
             map_wc: false,
             reclaimable_cpu_mappings: false,
+            pages_no_reclaim: false,
             parent_resv_obj: None,
         }
     }
@@ -343,6 +350,10 @@ impl<T: DriverObject> Object<T> {
 
         // SAFETY: `obj.as_raw()` is guaranteed to be valid by the initialization above.
         unsafe { (*new.as_raw()).funcs = &Self::VTABLE };
+
+        // SAFETY: The object is initialized but not published. The C initializer
+        // reads this policy when setting up the backing mapping's GFP mask.
+        unsafe { (*new.as_raw_shmem()).pages_no_reclaim = config.pages_no_reclaim };
 
         // SAFETY: The arguments are all valid via the type invariants.
         to_result(unsafe { bindings::drm_gem_shmem_init(dev.as_raw(), new.as_raw_shmem(), size) })?;

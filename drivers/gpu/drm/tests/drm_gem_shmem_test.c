@@ -8,7 +8,11 @@
  */
 
 #include <linux/dma-buf.h>
+#include <linux/file.h>
 #include <linux/iosys-map.h>
+#include <linux/ktime.h>
+#include <linux/mm.h>
+#include <linux/pagemap.h>
 #include <linux/sizes.h>
 
 #include <kunit/test.h>
@@ -344,6 +348,93 @@ static void drm_gem_shmem_test_purge(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, shmem->madv, -1);
 }
 
+/* Test the opt-in mapping policy and real population, including retry after
+ * releasing the backing. No large allocation is needed to exercise the path.
+ */
+static void drm_gem_shmem_test_no_reclaim(struct kunit *test)
+{
+	struct drm_device *drm_dev = test->priv;
+	struct drm_gem_shmem_object *shmem;
+	gfp_t gfp;
+	int ret;
+
+	shmem = kzalloc_obj(*shmem);
+	KUNIT_ASSERT_NOT_NULL(test, shmem);
+	shmem->pages_no_reclaim = true;
+	ret = drm_gem_shmem_init(drm_dev, shmem, TEST_SIZE);
+	if (ret) {
+		kfree(shmem);
+		KUNIT_FAIL(test, "shmem init failed: %d", ret);
+		return;
+	}
+	ret = kunit_add_action_or_reset(test, drm_gem_shmem_free_wrapper, shmem);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	gfp = mapping_gfp_mask(shmem->base.filp->f_mapping);
+	KUNIT_EXPECT_EQ(test, gfp & __GFP_DIRECT_RECLAIM, 0);
+	KUNIT_EXPECT_EQ(test, gfp & __GFP_RETRY_MAYFAIL, 0);
+	KUNIT_EXPECT_NE(test, gfp & __GFP_KSWAPD_RECLAIM, 0);
+	KUNIT_EXPECT_EQ(test, gfp & __GFP_MOVABLE, 0);
+	KUNIT_EXPECT_NE(test, gfp & __GFP_HIGHMEM, 0);
+	ret = drm_gem_shmem_pin(shmem);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_NOT_NULL(test, shmem->pages);
+	drm_gem_shmem_unpin(shmem);
+	ret = drm_gem_shmem_pin(shmem);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	drm_gem_shmem_unpin(shmem);
+}
+
+/* Exercise real allocation failure in a small KUnit VM. Request all physical
+ * RAM as one pinned object, which cannot fit alongside the running kernel.
+ * Limit this stress case to <= 2 GiB VMs; do not exhaust a developer's host.
+ */
+static void drm_gem_shmem_test_free_flush(void *object)
+{
+	drm_gem_shmem_free(object);
+	/* KUnit cases run in kernel threads: there is no return to userspace
+	 * to drain fput task work before the next case needs this memory.
+	 */
+	flush_delayed_fput();
+}
+
+static void drm_gem_shmem_test_no_reclaim_oom(struct kunit *test)
+{
+	struct drm_device *drm_dev = test->priv;
+	struct drm_gem_shmem_object *shmem;
+	u64 bytes = (u64)totalram_pages() << PAGE_SHIFT;
+	ktime_t start;
+	s64 elapsed_ms;
+	int ret;
+
+	if (bytes > SZ_2G) {
+		kunit_skip(test, "requires a VM with at most 2 GiB RAM");
+		return;
+	}
+	shmem = kzalloc_obj(*shmem);
+	KUNIT_ASSERT_NOT_NULL(test, shmem);
+	shmem->pages_no_reclaim = true;
+	ret = drm_gem_shmem_init(drm_dev, shmem, bytes);
+	if (ret) {
+		kfree(shmem);
+		KUNIT_FAIL(test, "shmem init failed: %d", ret);
+		return;
+	}
+	ret = kunit_add_action_or_reset(test, drm_gem_shmem_test_free_flush, shmem);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	start = ktime_get();
+	ret = drm_gem_shmem_pin(shmem);
+	elapsed_ms = ktime_ms_delta(ktime_get(), start);
+	kunit_info(test, "oversized pin: %llu bytes, ret=%d, %lld ms\n",
+		   bytes, ret, elapsed_ms);
+	if (!ret)
+		drm_gem_shmem_unpin(shmem);
+	KUNIT_EXPECT_EQ(test, ret, -ENOMEM);
+	KUNIT_EXPECT_LT(test, elapsed_ms, (s64)10000);
+	KUNIT_EXPECT_NULL(test, shmem->pages);
+	KUNIT_EXPECT_EQ(test, refcount_read(&shmem->pages_use_count), 0);
+	KUNIT_EXPECT_FALSE(test, mapping_unevictable(shmem->base.filp->f_mapping));
+}
+
 static int drm_gem_shmem_test_init(struct kunit *test)
 {
 	struct device *dev;
@@ -377,6 +468,8 @@ static int drm_gem_shmem_test_init(struct kunit *test)
 
 static struct kunit_case drm_gem_shmem_test_cases[] = {
 	KUNIT_CASE(drm_gem_shmem_test_obj_create),
+	KUNIT_CASE(drm_gem_shmem_test_no_reclaim),
+	KUNIT_CASE_SLOW(drm_gem_shmem_test_no_reclaim_oom),
 	KUNIT_CASE(drm_gem_shmem_test_obj_create_private),
 	KUNIT_CASE(drm_gem_shmem_test_pin_pages),
 	KUNIT_CASE(drm_gem_shmem_test_vmap),

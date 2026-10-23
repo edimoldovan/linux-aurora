@@ -87,8 +87,16 @@ static int __drm_gem_shmem_init(struct drm_device *dev, struct drm_gem_shmem_obj
 		 * why this is required _and_ expected if you're
 		 * going to pin these pages.
 		 */
-		mapping_set_gfp_mask(obj->filp->f_mapping, GFP_HIGHUSER |
-				     __GFP_RETRY_MAYFAIL | __GFP_NOWARN);
+		gfp_t gfp = GFP_HIGHUSER | __GFP_RETRY_MAYFAIL | __GFP_NOWARN;
+
+		/* A bulk pin must not run direct reclaim once per folio when
+		 * the driver can instead return an allocation failure. Clearing
+		 * DIRECT_RECLAIM also makes memcg charges fail without reclaim
+		 * or invoking the OOM killer. Preserve placement and kswapd.
+		 */
+		if (shmem->pages_no_reclaim)
+			gfp &= ~(__GFP_DIRECT_RECLAIM | __GFP_RETRY_MAYFAIL);
+		mapping_set_gfp_mask(obj->filp->f_mapping, gfp);
 	}
 
 	return 0;
