@@ -1411,7 +1411,11 @@ impl Backend {
                 result?;
             }
         }
-        if !self.context.compute_binding_hint() {
+        // A lone admission keeps the original latency-sensitive probe.
+        // Competing publishers otherwise spin on a binding they do not own.
+        if !self.context.compute_binding_hint()
+            && self.shared.compute_demand.load(Ordering::Relaxed) > 1
+        {
             return Err(render::FALLBACK);
         }
         let mut state = self.shared.state.lock();
