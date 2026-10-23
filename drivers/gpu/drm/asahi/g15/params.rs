@@ -18,47 +18,47 @@ pub(crate) const MAX_BINDS: u32 = 1 << 20;
 
 /// Host deadline of a published prefix without progress, ms (at least 100).
 pub(crate) fn deadline_ms() -> u32 {
-    (*module_parameters::g15_deadline_ms.value()).max(100)
+    module_parameters::g15_deadline_ms.value().max(100)
 }
 
 /// Compute no-progress budget before the kill, ms.
 pub(crate) fn compute_deadline_ms() -> u32 {
-    (*module_parameters::g15_compute_deadline_ms.value()).max(100)
+    module_parameters::g15_compute_deadline_ms.value().max(100)
 }
 
 /// Repoll while a ready prefix waits for record consumption, us.
 pub(crate) fn repoll_us() -> u32 {
-    (*module_parameters::g15_repoll_us.value()).clamp(5, 100)
+    module_parameters::g15_repoll_us.value().clamp(5, 100)
 }
 
 /// Completion repoll interval, us.
 pub(crate) fn resnap_us() -> u32 {
-    (*module_parameters::g15_resnap_us.value()).clamp(25, 1000)
+    module_parameters::g15_resnap_us.value().clamp(25, 1000)
 }
 
 /// The explicit firmware idle standby time, us (0: not set).
 pub(crate) fn idle_standby_override_us() -> u32 {
-    *module_parameters::g15_idle_standby_us.value()
+    module_parameters::g15_idle_standby_us.value()
 }
 
 /// Firmware idle minimum confidence, permille.
 pub(crate) fn idle_min_conf() -> u32 {
-    (*module_parameters::g15_idle_min_conf.value()).clamp(1, 1000)
+    module_parameters::g15_idle_min_conf.value().clamp(1, 1000)
 }
 
 /// Whether firmware halts are answered with the handshake (else fail-stop).
 pub(crate) fn recovery() -> bool {
-    *module_parameters::g15_recovery.value() != 0
+    module_parameters::g15_recovery.value() != 0
 }
 
 /// Whether the CDM/VDM stream gates are on.
 pub(crate) fn stream_gate() -> bool {
-    *module_parameters::g15_stream_gate.value() != 0
+    module_parameters::g15_stream_gate.value() != 0
 }
 
 /// The 8-byte TEXT digest prefix of an unpinned firmware build to admit (0: none).
 pub(crate) fn accept_text_prefix() -> u64 {
-    *module_parameters::g15_accept_text_prefix.value()
+    module_parameters::g15_accept_text_prefix.value()
 }
 
 /// The parameter for the PB growth maximum the firmware is given, in blocks, clamped to
@@ -66,12 +66,12 @@ pub(crate) fn accept_text_prefix() -> u64 {
 /// the blocks above it, up to the 4095 posted at most, answer the synchronous requests of
 /// partial renders. It is read-only after boot and does not change the 512 MiB heap.
 pub(crate) fn pb_max_blocks() -> u32 {
-    (*module_parameters::g15_pb_max_blocks.value()).clamp(64, super::hw::tuning::PB_MAX_BLOCKS)
+    module_parameters::g15_pb_max_blocks.value().clamp(64, super::hw::tuning::PB_MAX_BLOCKS)
 }
 
 /// Whether FRAGMENT_BARRIERS is advertised and mapped to early tiling.
 pub(crate) fn early_tiling() -> bool {
-    *module_parameters::g15_early_tiling.value() != 0
+    module_parameters::g15_early_tiling.value() != 0
 }
 
 /// Fills the generation part of GET_PARAMS group 0.

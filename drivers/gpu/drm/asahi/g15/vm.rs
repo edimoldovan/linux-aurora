@@ -179,7 +179,7 @@ impl Registry {
     fn reserve(&self) -> Result<Reservation<'_>> {
         self.prune();
         // The shared slot allocator hands out a single slot with robust isolation.
-        let limit = if *module_parameters::robust_isolation.value() != 0 {
+        let limit = if module_parameters::robust_isolation.value() != 0 {
             1
         } else {
             hw::sizes::MAX_VMS

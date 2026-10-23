@@ -14,9 +14,9 @@
 //!
 //! # Plugging into the shared driver
 //!
-//! - [`Driver`] is a separate platform driver for `apple,agx-t6030` without a module alias, so
-//!   probing (which boots the firmware) happens when userspace loads the module after the native
-//!   display is up. It calls [`crate::driver::AsahiDriver::probe_g15`].
+//! - [`Driver`] is a separate platform driver. T6030 has a module alias; its probe must wait
+//!   for the native display and PMP supplier before booting firmware. T6031 retains explicit
+//!   module loading. It calls [`crate::driver::AsahiPlatformDriver::probe_g15`].
 //! - [`Gpu`] implements [`crate::gpu::Gpu`]: GET_PARAMS identity, VM creation (`new_vm`),
 //!   queues (`new_queue`, see [`queue`]) and timestamp buffers.
 //! - User VMs are shared-layer [`mmu::Vm`]s on a [`mmu::Uat::new_adopted`] UAT with tracked
@@ -77,7 +77,7 @@ mod wire;
 
 use core::any::Any;
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use kernel::{
     c_str,
@@ -139,22 +139,26 @@ impl Config {
 }
 
 /// OF match table of the G15 platform driver.
-///
-/// Deliberately not exported with `module_device_table!`: without a module alias, the asahi
-/// module is not loaded at boot for this GPU, and the firmware only starts when userspace loads
-/// the module after the native display is up (the J514S bring-up order). A built-in driver
-/// probes when the GPU node is populated.
 const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 2> =
     kernel::device_id::IdArray::new([
         (
             of::DeviceId::new(c_str!("apple,agx-t6030")),
-            &hw::t6030::CONFIG,
+            &&hw::t6030::CONFIG,
         ),
         (
             of::DeviceId::new(c_str!("apple,agx-t6031")),
-            &hw::t6031::CONFIG,
+            &&hw::t6031::CONFIG,
         ),
     ]);
+
+// T6030 probe admission requires the native display and PMP supplier before
+// firmware starts. T6031 retains explicit loading until it has an equivalent
+// display-order admission gate.
+kernel::of_device_table!(
+    AUTOLOAD_OF_TABLE,
+    @none,
+    [of::DeviceId::new(c_str!("apple,agx-t6030"))]
+);
 
 /// The G15 platform adapter: the shared DRM registration probed through
 /// [`crate::driver::AsahiPlatformDriver::probe_g15`].
@@ -162,6 +166,7 @@ const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 2> =
 /// `None` after a probe that failed once the firmware had been touched: the device stays bound
 /// (unbinding would detach and power off the GFX domain under the running firmware), the
 /// firmware session is retained until reboot and no DRM device exists.
+#[pin_data]
 pub(crate) struct Driver<'bound> {
     _driver: Option<crate::driver::AsahiPlatformDriverData<'bound>>,
 }
@@ -180,22 +185,45 @@ impl platform::Driver for Driver<'_> {
         pdev: &'bound platform::Device<Core<'_>>,
         info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
-        let cfg = *info.ok_or(ENODEV)?;
-        dev_info!(pdev.as_ref(), "G15: probing ({})\n", cfg.name);
-        match crate::driver::AsahiPlatformDriver::probe_g15(pdev, cfg) {
-            Ok(driver) => Ok(Driver { _driver: Some(driver) }),
-            Err(error) if boot::glue::retained() => {
-                dev_err!(
-                    pdev.as_ref(),
-                    "G15: probe failed after the firmware start ({:?}); device kept bound, firmware retained until reboot\n",
-                    error
-                );
-                Ok(Driver { _driver: None })
-            }
-            Err(error) => Err(error),
-        }
+        // `Device::set_drvdata` allocates its KBox before running this initializer.
+        // Keep every firmware-visible action inside it: otherwise an allocation failure
+        // after probe_g15 started firmware would return an unbound device.
+        try_pin_init!(Driver {
+            _driver: {
+                if !MODULE_READY.load(Ordering::Acquire) {
+                    return Err(EPROBE_DEFER);
+                }
+                let cfg = *info.ok_or(ENODEV)?;
+                dev_info!(pdev.as_ref(), "G15: probing ({})\n", cfg.name);
+                match crate::driver::AsahiPlatformDriver::probe_g15(pdev, cfg) {
+                    Ok(driver) => Some(driver),
+                    Err(error) if boot::glue::retained() => {
+                        dev_err!(
+                            pdev.as_ref(),
+                            "G15: probe failed after the firmware start ({:?}); device kept bound, firmware retained until reboot\n",
+                            error
+                        );
+                        None
+                    }
+                    Err(error) => return Err(error),
+                }
+            },
+        })
     }
 
+}
+
+/// Firmware starts only after every fallible module/driver registration has succeeded.
+/// A deferred probe racing the final activation sees the Release/Acquire publication.
+static MODULE_READY: AtomicBool = AtomicBool::new(false);
+
+/// Last, infallible module initializer: enable native probes and retry this adapter.
+/// No fallible module initialization may follow this call.
+pub(crate) fn activate() {
+    MODULE_READY.store(true, Ordering::Release);
+    // SAFETY: Both pinned platform registrations are fully initialized and remain owned
+    // by DriverModule. The C helper borrows their live driver pointer only for this call.
+    unsafe { boot::glue::asahi_g15_reprobe() };
 }
 
 /// Work item ID of the poll work.
@@ -204,6 +232,8 @@ const POLL_WORK: u64 = 0;
 /// Device state shared with the RTKit callbacks and the poll work.
 #[pin_data]
 pub(crate) struct Shared {
+    /// Reserved host logical queues, shared across every file and VM on this GPU.
+    pub(crate) logical_queues: AtomicU32,
     pub(crate) dev: ARef<device::Device>,
     /// Latched fail-stop: every VM fails with EIO until reboot.
     pub(crate) crashed: AtomicBool,
@@ -288,16 +318,20 @@ impl Shared {
     /// drained by the poll work.
     pub(crate) fn orphan(&self, orphan: boot::Orphan) {
         let mut slot = self.orphan.lock();
-        match KBox::new(orphan, GFP_KERNEL) {
-            Ok(orphan) => {
-                *slot = Some(orphan);
+        match KBox::<boot::Orphan>::new_uninit(GFP_KERNEL) {
+            Ok(storage) => {
+                *slot = Some(KBox::write(storage, orphan));
                 self.orphaned.store(true, Ordering::Release);
             }
-            // Without memory for the box, leak the parts as they are.
-            Err(_) => dev_err!(
-                self.dev.as_ref(),
-                "G15: cannot keep the failed session; leaked\n"
-            ),
+            Err(_) => {
+                // Allocation must not consume the live session: KBox::new would drop it
+                // on failure. Keep its mappings and backing even without ring draining.
+                core::mem::forget(orphan);
+                dev_err!(
+                    self.dev.as_ref(),
+                    "G15: cannot allocate failed-session storage; session leaked without ring draining\n"
+                );
+            }
         }
     }
 
@@ -376,6 +410,7 @@ impl Gpu {
         let data = admitted.adt.data.clone();
         let shared = Arc::pin_init(
             pin_init!(Shared {
+                logical_queues: AtomicU32::new(0),
                 dev: dev.as_ref().as_ref().into(),
                 crashed: AtomicBool::new(false),
                 evented: AtomicBool::new(false),
@@ -394,7 +429,7 @@ impl Gpu {
         )
         .map_err(unretained)?;
         let booted = boot::start(admitted, dev, cfg, &shared).map_err(unretained)?;
-        let uat = booted.session.uat()?;
+        let uat = booted.session.uat();
         let (id, max_frequency_khz) = (booted.id, booted.max_frequency_khz);
         // The backend: graphs, slots, pools, engine, recovery and VM registry.
         let firmware = Firmware::start_backend(dev, cfg, booted, &shared)?;
@@ -474,10 +509,11 @@ impl Firmware {
             let graph = graph::Graphs::new(dev, &mut objects)?;
             let slots = slots::Slots::new(&mut objects)?;
             let pools = pools::Pools::new(dev, &mut objects)?;
+            let vms = vm::Registry::new()?;
             let slot = KBox::<Firmware>::new_uninit(GFP_KERNEL)?;
-            Ok((graph, slots, pools, slot))
+            Ok((graph, slots, pools, vms, slot))
         })();
-        let (graph, slots, pools, slot) = match backend {
+        let (graph, slots, pools, vms, slot) = match backend {
             Ok(backend) => backend,
             Err(e) => return Err(orphan(session, objects, channels, init, events, e)),
         };
@@ -495,7 +531,7 @@ impl Firmware {
                 engine: engine::Engine::new(),
                 recovery: recovery::Recovery::new(),
                 pools,
-                vms: vm::Registry::new()?,
+                vms,
             },
         );
         if let Err(e) = firmware.init_graphs() {

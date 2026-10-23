@@ -147,7 +147,7 @@ impl Shared {
     /// ready prefix waits for a channel record's consumption.
     pub(crate) fn rearm(self: &Arc<Self>, chan_wait: bool) {
         let mut us = params::resnap_us();
-        if chan_wait && *module_parameters::g15_repoll_us.value() != 0 {
+        if chan_wait && module_parameters::g15_repoll_us.value() != 0 {
             us = params::repoll_us();
         }
         {

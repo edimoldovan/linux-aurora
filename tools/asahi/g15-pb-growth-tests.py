@@ -358,12 +358,12 @@ pub mod mem {
     }
 }
 
-/// A boot parameter: read-only after load.
+/// A boot parameter: read-only after load, read by value as on Linux 7.3.
 pub mod module_parameters {
     pub struct Param;
     impl Param {
-        pub fn value(&self) -> &'static u32 {
-            Box::leak(Box::new(crate::PARAM.with(|p| p.get())))
+        pub fn value(&self) -> u32 {
+            crate::PARAM.with(|p| p.get())
         }
     }
     pub static g15_pb_max_blocks: Param = Param;

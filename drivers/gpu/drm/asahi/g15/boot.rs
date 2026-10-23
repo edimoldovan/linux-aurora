@@ -311,6 +311,7 @@ static RTKIT_OPS: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
     recv_message_early: Some(rtkit_recv_early),
     shmem_setup: Some(rtkit_shmem_setup),
     shmem_destroy: Some(rtkit_shmem_destroy),
+    syslog_is_debug: None,
 };
 
 /// The GPU's RTKit client. Never freed: the firmware session lasts until reboot.

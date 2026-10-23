@@ -199,7 +199,8 @@ struct SchedJob {
 impl sched::JobImpl for SchedJob {
     type TimeoutData = ();
 
-    const MODULE: Option<&'static kernel::ThisModule> = Some(&crate::THIS_MODULE);
+    const MODULE: Option<&'static kernel::ThisModule> =
+        Some(kernel::module::this_module::<crate::LocalModule>());
 
     fn timeout_data(&self) {}
 
