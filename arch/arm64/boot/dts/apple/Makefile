@@ -114,3 +114,4 @@ dtb-$(CONFIG_ARCH_APPLE) += t8132-j773g.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8140-j700.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8142-j813.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8152-j873g.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t6050-j714c.dtb

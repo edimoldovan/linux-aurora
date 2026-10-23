@@ -1,0 +1,57 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Pro (14-inch, M5 Max, 18 CPU cores)
+ *
+ * target-type: J714c
+ *
+ * Initial RAM boot resources measured on J714c/T6050.
+ * The loader supplies usable memory, CPU release addresses and
+ * framebuffer geometry; peripheral power management is left with the
+ * boot firmware (t8152-j873g minimal-boot pattern).
+ *
+ * The loader's command line MUST include maxcpus=1 for the first boot:
+ * spin-table bring-up of the secondaries is blocked by the T6050
+ * firmware-parking problem under investigation (dumps/HANDOFF.md),
+ * and arm64 spin-table waits unboundedly for each CPU to check in.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+#include "t6050.dtsi"
+
+/ {
+	compatible = "apple,j714c", "apple,t6050", "apple,arm-platform";
+	model = "Apple MacBook Pro (14-inch, M5 Max, 18 CPU cores)";
+
+	#address-cells = <2>;
+	#size-cells = <2>;
+	interrupt-parent = <&aic>;
+
+	aliases {
+		serial0 = &serial0;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		stdout-path = "serial0:1500000n8";
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* Filled by the loader. */
+			status = "okay"; /* m1n1 only enables it on chips it knows. */
+		};
+	};
+
+	memory@10000000000 {
+		device_type = "memory";
+		reg = <0x100 0 0 0>; /* Filled by the loader. */
+	};
+};

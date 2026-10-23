@@ -1,0 +1,270 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Nodes common for T6050 family SoCs (M5 Max)
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	cpus {
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		cpu-map {
+			cluster0 {
+				core0 { cpu = <&cpu_m00>; };
+				core1 { cpu = <&cpu_m01>; };
+				core2 { cpu = <&cpu_m02>; };
+				core3 { cpu = <&cpu_m03>; };
+				core4 { cpu = <&cpu_m04>; };
+				core5 { cpu = <&cpu_m05>; };
+			};
+
+			cluster1 {
+				core0 { cpu = <&cpu_m10>; };
+				core1 { cpu = <&cpu_m11>; };
+				core2 { cpu = <&cpu_m12>; };
+				core3 { cpu = <&cpu_m13>; };
+				core4 { cpu = <&cpu_m14>; };
+				core5 { cpu = <&cpu_m15>; };
+			};
+
+			cluster2 {
+				core0 { cpu = <&cpu_p00>; };
+				core1 { cpu = <&cpu_p01>; };
+				core2 { cpu = <&cpu_p02>; };
+				core3 { cpu = <&cpu_p03>; };
+				core4 { cpu = <&cpu_p04>; };
+				core5 { cpu = <&cpu_p05>; };
+			};
+		};
+
+		/*
+		 * T6050 (J714c ADT): 18 CPUs, three 6-core clusters. Clusters 0 and 1
+		 * are cluster-type "M", cluster 2 is cluster-type "P". reg encodes
+		 * cluster << 8 | core. MIDR part 0x68 ("Sotra C" family).
+		 */
+		cpu_m00: cpu@0 {
+			compatible = "apple,sotra";
+			device_type = "cpu";
+			reg = <0x0 0x0>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* to be filled by loader */
+			next-level-cache = <&l2_cache_0>;
+		};
+
+		cpu_m01: cpu@1 {
+			compatible = "apple,sotra";
+			device_type = "cpu";
+			reg = <0x0 0x1>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* to be filled by loader */
+			next-level-cache = <&l2_cache_0>;
+		};
+
+		cpu_m02: cpu@2 {
+			compatible = "apple,sotra";
+			device_type = "cpu";
+			reg = <0x0 0x2>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* to be filled by loader */
+			next-level-cache = <&l2_cache_0>;
+		};
+
+		cpu_m03: cpu@3 {
+			compatible = "apple,sotra";
+			device_type = "cpu";
+			reg = <0x0 0x3>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* to be filled by loader */
+			next-level-cache = <&l2_cache_0>;
+		};
+
+		cpu_m04: cpu@4 {
+			compatible = "apple,sotra";
+			device_type = "cpu";
+			reg = <0x0 0x4>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* to be filled by loader */
+			next-level-cache = <&l2_cache_0>;
+		};
+
+		cpu_m05: cpu@5 {
+			compatible = "apple,sotra";
+			device_type = "cpu";
+			reg = <0x0 0x5>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* to be filled by loader */
+			next-level-cache = <&l2_cache_0>;
+		};
+
+		cpu_m10: cpu@100 {
+			compatible = "apple,sotra";
+			device_type = "cpu";
+			reg = <0x0 0x100>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* to be filled by loader */
+			next-level-cache = <&l2_cache_1>;
+		};
+
+		cpu_m11: cpu@101 {
+			compatible = "apple,sotra";
+			device_type = "cpu";
+			reg = <0x0 0x101>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* to be filled by loader */
+			next-level-cache = <&l2_cache_1>;
+		};
+
+		cpu_m12: cpu@102 {
+			compatible = "apple,sotra";
+			device_type = "cpu";
+			reg = <0x0 0x102>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* to be filled by loader */
+			next-level-cache = <&l2_cache_1>;
+		};
+
+		cpu_m13: cpu@103 {
+			compatible = "apple,sotra";
+			device_type = "cpu";
+			reg = <0x0 0x103>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* to be filled by loader */
+			next-level-cache = <&l2_cache_1>;
+		};
+
+		cpu_m14: cpu@104 {
+			compatible = "apple,sotra";
+			device_type = "cpu";
+			reg = <0x0 0x104>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* to be filled by loader */
+			next-level-cache = <&l2_cache_1>;
+		};
+
+		cpu_m15: cpu@105 {
+			compatible = "apple,sotra";
+			device_type = "cpu";
+			reg = <0x0 0x105>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* to be filled by loader */
+			next-level-cache = <&l2_cache_1>;
+		};
+
+		cpu_p00: cpu@200 {
+			compatible = "apple,sotra";
+			device_type = "cpu";
+			reg = <0x0 0x200>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* to be filled by loader */
+			next-level-cache = <&l2_cache_2>;
+		};
+
+		cpu_p01: cpu@201 {
+			compatible = "apple,sotra";
+			device_type = "cpu";
+			reg = <0x0 0x201>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* to be filled by loader */
+			next-level-cache = <&l2_cache_2>;
+		};
+
+		cpu_p02: cpu@202 {
+			compatible = "apple,sotra";
+			device_type = "cpu";
+			reg = <0x0 0x202>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* to be filled by loader */
+			next-level-cache = <&l2_cache_2>;
+		};
+
+		cpu_p03: cpu@203 {
+			compatible = "apple,sotra";
+			device_type = "cpu";
+			reg = <0x0 0x203>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* to be filled by loader */
+			next-level-cache = <&l2_cache_2>;
+		};
+
+		cpu_p04: cpu@204 {
+			compatible = "apple,sotra";
+			device_type = "cpu";
+			reg = <0x0 0x204>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* to be filled by loader */
+			next-level-cache = <&l2_cache_2>;
+		};
+
+		cpu_p05: cpu@205 {
+			compatible = "apple,sotra";
+			device_type = "cpu";
+			reg = <0x0 0x205>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* to be filled by loader */
+			next-level-cache = <&l2_cache_2>;
+		};
+
+		l2_cache_0: l2-cache-0 {
+			compatible = "cache";
+			cache-level = <2>;
+			cache-unified;
+		};
+
+		l2_cache_1: l2-cache-1 {
+			compatible = "cache";
+			cache-level = <2>;
+			cache-unified;
+		};
+
+		l2_cache_2: l2-cache-2 {
+			compatible = "cache";
+			cache-level = <2>;
+			cache-unified;
+		};
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupt-parent = <&aic>;
+		interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
+		interrupts = <AIC_FIQ AIC_TMR_GUEST_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_GUEST_VIRT IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_HV_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	clkref: clock-ref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+		clock-output-names = "clkref";
+	};
+
+	clk_200m: clock-200m {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <200000000>;
+		clock-output-names = "clk_200m";
+	};
+
+	/*
+	 * This is a fabulated representation of the input clock
+	 * to NCO since we don't know the true clock tree.
+	 */
+	nco_clkref: clock-ref-nco {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-output-names = "nco_ref";
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+	};
+};
