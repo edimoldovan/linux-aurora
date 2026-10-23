@@ -10,6 +10,7 @@ ARM64 Architecture
     acpi_object_usage
     amu
     apple-j813
+    apple-j714c
     apple-m6-cpu
     arm-acpi
     arm-cca
