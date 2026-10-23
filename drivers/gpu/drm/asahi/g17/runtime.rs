@@ -1411,6 +1411,9 @@ impl Backend {
                 result?;
             }
         }
+        if !self.context.compute_binding_hint() {
+            return Err(render::FALLBACK);
+        }
         let mut state = self.shared.state.lock();
         let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
         if !lease.is_current()

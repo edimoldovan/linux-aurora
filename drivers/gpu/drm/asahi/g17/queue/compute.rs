@@ -557,6 +557,7 @@ impl Queue {
         let pool_alias = pool.map_client(context.vm())?;
         let binding = graph.bind(context.clone(), kick_alias, pool_alias)?;
         context.mark_published();
+        context.note_compute_binding(true);
         Ok(Self {
             owner: Some(owner),
             retained_owner: None,
@@ -1274,6 +1275,7 @@ impl Queue {
             self.retained_owner = None;
         }
         context.mark_published();
+        context.note_compute_binding(true);
         self.owner = Some(owner);
         self.unpublished_binding = true;
         self.released = false;
@@ -1284,6 +1286,9 @@ impl Queue {
     /// True allows the registry to cancel the never-published QID and drop this graph. An
     /// installed graph remains retained even after the logical owner exits without work.
     pub(crate) fn release_owner(&mut self) -> Result<bool> {
+        if let Some(binding) = &self.binding {
+            binding.context.note_compute_binding(false);
+        }
         if !self.installed && self.active.len == 0 && !self.quarantined && self.previous.is_none() {
             return Ok(true);
         }

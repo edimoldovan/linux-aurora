@@ -114,6 +114,11 @@ pub(crate) struct Context {
     scheduler: Arc<KernelObject>,
     scheduler_generation: u32,
     published: AtomicBool,
+    /// Advisory only: publication still checks the physical binding under the
+    /// device mutex. False skips an inline attempt known to need admission.
+    compute_binding_hint: AtomicBool,
+    /// Mixed-engine contexts keep the original inline publication path.
+    render_seen: AtomicBool,
     qos: QosLease,
     owner_pid: u32,
     states: WorkStates,
@@ -189,6 +194,8 @@ impl Context {
             scheduler,
             scheduler_generation,
             published: AtomicBool::new(false),
+            compute_binding_hint: AtomicBool::new(false),
+            render_seen: AtomicBool::new(false),
             qos,
             owner_pid,
             states: WorkStates::new(),
@@ -202,6 +209,18 @@ impl Context {
     }
     pub(crate) fn vm(&self) -> &Vm {
         self.execution.vm()
+    }
+    pub(crate) fn compute_binding_hint(&self) -> bool {
+        self.render_seen.load(Ordering::Acquire)
+            || self.compute_binding_hint.load(Ordering::Relaxed)
+    }
+    pub(crate) fn note_render(&self) {
+        if !self.render_seen.load(Ordering::Relaxed) {
+            self.render_seen.store(true, Ordering::Release);
+        }
+    }
+    pub(crate) fn note_compute_binding(&self, owned: bool) {
+        self.compute_binding_hint.store(owned, Ordering::Relaxed);
     }
     pub(crate) fn compute_timestamps(&self) -> &Arc<super::completion::ComputeTimestampCache> {
         &self.compute_timestamps
