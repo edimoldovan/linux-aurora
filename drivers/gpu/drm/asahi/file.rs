@@ -1231,6 +1231,13 @@ impl File {
             cls_pr_debug!(Errors, "queue_create: Invalid priority\n");
             return Err(EINVAL);
         }
+        // HIGH has only been run on G17; G13 and G14 keep refusing it.
+        if data.priority == uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_HIGH
+            && !reg_data.gpu.as_any().is::<crate::g17::Gpu>()
+        {
+            cls_pr_debug!(Errors, "queue_create: HIGH priority is not supported on this GPU\n");
+            return Err(EINVAL);
+        }
         // SAFETY: capable() only reads the calling task's credentials (ioctl process context).
         if data.priority == uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_HIGH
             && !unsafe { bindings::capable(bindings::CAP_SYS_NICE as _) }
