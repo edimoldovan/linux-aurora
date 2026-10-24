@@ -371,6 +371,9 @@ impl Port {
         self.generation.store(generation, Ordering::Release);
     }
 
+    /// Unique reservation order shared by both engines. Concurrent publishers may expose
+    /// their work in a different order; queue serialization and visibility use other locks.
+    /// The watchdog uses this number only to choose bounded cross-VM timeout grace.
     pub(super) fn next_publication(&self) -> u64 {
         self.publications.fetch_add(1, Ordering::Relaxed) + 1
     }

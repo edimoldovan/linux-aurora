@@ -308,6 +308,41 @@ mod accounting_tests {
     }
 
     #[test]
+    fn dynamic_compute_growth_preserves_render_headroom_above_firmware_floor() {
+        for floor in [0, 4] {
+            let mut ids = KBox::init(QueueIds::new(floor), GFP_KERNEL).unwrap();
+            let queues = 2;
+            let mut owner = 1;
+            while ids.compute_fits(queues) {
+                let id = ids.reserve_for(owner, DataMaster::Compute, None, queues).unwrap();
+                assert!(usize::from(id.qid()) >= floor);
+                ids.publish(id).unwrap();
+                owner += 1;
+            }
+            assert_eq!(ids.leased, QID_COUNT - floor - render_reserve(queues));
+            assert_eq!(ids.reserve_for(owner, DataMaster::Compute, None, queues), Err(ENOSPC));
+            assert!(ids.render_fits(queues + RENDER_HEADROOM));
+            assert!(!ids.render_fits(queues + RENDER_HEADROOM + 1));
+        }
+    }
+
+    #[test]
+    fn full_logical_queue_budget_keeps_compute_floor_and_excludes_firmware_ids() {
+        for floor in [0, 4] {
+            let mut ids = KBox::init(QueueIds::new(floor), GFP_KERNEL).unwrap();
+            let queues = queue_limit(floor) as usize;
+            for owner in 1..=COMPUTE_FLOOR as u64 {
+                let id = ids.reserve_for(owner, DataMaster::Compute, None, queues).unwrap();
+                assert!(usize::from(id.qid()) >= floor);
+                ids.publish(id).unwrap();
+            }
+            assert!(!ids.compute_fits(queues));
+            assert!(ids.render_fits(queues));
+            assert!(!ids.render_fits(queues + 1));
+        }
+    }
+
+    #[test]
     fn initial_reservations_yield_but_published_ids_do_not() {
         let mut ids = table();
         ids.reserve_initial_render().unwrap();
