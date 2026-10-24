@@ -27,7 +27,6 @@ use kernel::{
     xarray,
 };
 
-const EARLY_DEPTH: usize = 2;
 static FENCE_KEY: Pin<&LockClassKey> = kernel::static_lock_class!();
 
 pub(crate) mod admission;
@@ -324,8 +323,10 @@ impl<B: Backend> Queue<B> {
                 checked_inputs.push(ready.clone(), GFP_KERNEL)?;
             }
         }
-        let early = dependencies.is_empty()
-            && self.frontiers[index].len() < EARLY_DEPTH;
+        // Publish from the ioctl whenever nothing has to wait, at any depth.
+        // The backend falls back to the scheduler behind any backlog or on any
+        // capacity miss, so submission order is preserved.
+        let early = dependencies.is_empty();
         let packet = Packet::new(
             id,
             self.context.clone(),
