@@ -612,6 +612,9 @@ impl crate::g17::queue::render::Host for Host<'_> {
     /// Pipe 0 (tiling) in bits 1:0, priority class in bits 3:2.
     fn notify_render(&mut self, priority: u8) -> Result {
         self.release_registration();
+        crate::g17::trace::doorbell(crate::g17::trace::RENDER, || {
+            self.firmware.bridge.regs.g17_core_power()
+        });
         let result = self
             .firmware
             .primary

@@ -12,6 +12,8 @@ unsafe extern "C" {
     fn asahi_g17_trace_complete(engine: u8, qid: u8, ordinal: u32, ctx: u32, seq: u64,
         gpu_start: u64, gpu_end: u64);
     fn asahi_g17_trace_bind(engine: u8, qid: u8, ctx: u32, kind: u8);
+    fn asahi_g17_trace_doorbell_enabled() -> bool;
+    fn asahi_g17_trace_doorbell(engine: u8, power: u32);
     fn asahi_g17_trace_event(phase: u8);
 }
 
@@ -47,6 +49,17 @@ pub(super) fn complete(engine: u8, qid: u8, ordinal: u32, packet: &super::job::P
 pub(super) fn bind(engine: u8, qid: u8, ctx: u32, kind: u8) {
     // SAFETY: Plain values only.
     unsafe { asahi_g17_trace_bind(engine, qid, ctx, kind) };
+}
+
+/// A work doorbell is about to ring; `power` samples the core power state
+/// only while the event is enabled.
+pub(super) fn doorbell(engine: u8, power: impl FnOnce() -> u32) {
+    // SAFETY: Pure static-key query.
+    if !unsafe { asahi_g17_trace_doorbell_enabled() } {
+        return;
+    }
+    // SAFETY: Plain values only.
+    unsafe { asahi_g17_trace_doorbell(engine, power()) };
 }
 
 /// Event worker pass boundaries: 0 begin, 1 fences signalled, 2 end.

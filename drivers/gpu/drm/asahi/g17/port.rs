@@ -82,6 +82,8 @@ unsafe impl Sync for Views {}
 #[pin_data]
 pub(super) struct Port {
     views: SetOnce<Views>,
+    /// Register access for tracing the core power state at the doorbell.
+    regs: SetOnce<crate::regs::G17Resources>,
     /// Compute work-ring slots reserved by publishers that have not exposed them yet.
     #[pin]
     rings: SpinLock<[u32; PRIORITIES]>,
@@ -123,6 +125,7 @@ impl Port {
         Arc::pin_init(
             pin_init!(Self {
                 views: SetOnce::new(),
+                regs: SetOnce::new(),
                 rings <- new_spinlock!([0; PRIORITIES], "g17::Port::rings"),
                 qos <- new_spinlock!(qos::Accounting::new(), "g17::Port::qos"),
                 render <- new_mutex!((), "g17::Port::render"),
@@ -136,8 +139,8 @@ impl Port {
     }
 
     /// Called once while the session is built, before any publisher can see the port.
-    pub(super) fn attach(&self, views: Views) -> Result {
-        if self.views.populate(views) {
+    pub(super) fn attach(&self, views: Views, regs: crate::regs::G17Resources) -> Result {
+        if self.views.populate(views) && self.regs.populate(regs) {
             Ok(())
         } else {
             Err(EBUSY)
@@ -344,6 +347,9 @@ impl Port {
     pub(super) fn notify(&self, message: u64) -> Result {
         // SAFETY: The session's primary coprocessor owns the mailbox and outlives the port.
         let mailbox = unsafe { &*self.views()?.mailbox };
+        super::trace::doorbell(super::trace::COMPUTE, || {
+            self.regs.as_ref().map_or(0, |regs| regs.g17_core_power())
+        });
         mailbox.send(super::EP_DOORBELL, message)
     }
 

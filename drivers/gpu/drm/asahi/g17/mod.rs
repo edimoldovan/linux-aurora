@@ -1380,7 +1380,7 @@ impl Gpu {
             session.uat.confirm_firmware_root_entries(root_entries)?;
         }
         let mailbox: *const Mailbox = &*session.primary.rtkit;
-        session.port.attach(session.init.port_views(mailbox)?)?;
+        session.port.attach(session.init.port_views(mailbox)?, session.bridge.regs.clone())?;
         session.uat.mirror_secondary_root()?;
         if cfg.fabric_bridge {
             session.bridge.regs.enable_g17_gating()?;

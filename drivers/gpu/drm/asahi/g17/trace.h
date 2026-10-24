@@ -91,6 +91,23 @@ TRACE_EVENT(asahi_g17_bind,
 		  __entry->engine, __entry->qid, __entry->ctx, __entry->kind)
 );
 
+TRACE_EVENT(asahi_g17_doorbell,
+	TP_PROTO(u8 engine, u32 power, u64 counter),
+	TP_ARGS(engine, power, counter),
+	TP_STRUCT__entry(
+		__field(u8, engine)
+		__field(u32, power)
+		__field(u64, counter)
+	),
+	TP_fast_assign(
+		__entry->engine = engine;
+		__entry->power = power;
+		__entry->counter = counter;
+	),
+	TP_printk("engine=%u power=%#x counter=%llu", __entry->engine, __entry->power,
+		  __entry->counter)
+);
+
 TRACE_EVENT(asahi_g17_event,
 	TP_PROTO(u8 phase, u64 counter),
 	TP_ARGS(phase, counter),

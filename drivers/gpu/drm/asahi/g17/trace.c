@@ -31,6 +31,16 @@ void asahi_g17_trace_bind(u8 engine, u8 qid, u32 ctx, u8 kind)
 	trace_asahi_g17_bind(engine, qid, ctx, kind);
 }
 
+bool asahi_g17_trace_doorbell_enabled(void)
+{
+	return trace_asahi_g17_doorbell_enabled();
+}
+
+void asahi_g17_trace_doorbell(u8 engine, u32 power)
+{
+	trace_asahi_g17_doorbell(engine, power, __arch_counter_get_cntvct());
+}
+
 void asahi_g17_trace_event(u8 phase)
 {
 	if (trace_asahi_g17_event_enabled())
