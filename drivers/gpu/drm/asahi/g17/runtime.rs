@@ -185,11 +185,23 @@ pub(super) struct Registry {
 impl Registry {
     /// Initialize inside the firmware allocation instead of staging the whole
     /// registry on the probe stack. No additional allocation is required.
+    #[cfg(CONFIG_KUNIT)]
     pub(super) fn new(
         clusters: u32,
         deflake: crate::g17::fw::render::Deflake,
         descriptor_flags: [u32; 2],
         variant: &'static crate::g17::fw::Variant,
+    ) -> impl Init<Self, Error> {
+        Self::with_waiters(clusters, deflake, descriptor_flags, variant, None)
+    }
+
+    /// `queues` wakes logical-queue creation when a logical queue slot is returned.
+    pub(super) fn with_waiters(
+        clusters: u32,
+        deflake: crate::g17::fw::render::Deflake,
+        descriptor_flags: [u32; 2],
+        variant: &'static crate::g17::fw::Variant,
+        queues: Option<Arc<super::availability::Availability>>,
     ) -> impl Init<Self, Error> {
         kernel::try_init!(Self {
             qids <- kick::QueueIds::new(variant.qid_floor).chain(|qids| {
@@ -198,7 +210,7 @@ impl Registry {
             buffers <- BufferIds::new(),
             metrics: Arc::new(MetricsIds::new(), GFP_KERNEL)?,
             qos_ids: QosIds::new()?,
-            admission: admission::Pool::new(kick::queue_limit(variant.qid_floor))?,
+            admission: admission::Pool::with_waiters(kick::queue_limit(variant.qid_floor), queues)?,
             render: render::RenderState::new(clusters, deflake, descriptor_flags)?,
             identities: queue::Identities::new(),
             compute: {
@@ -621,6 +633,7 @@ impl Backend {
         const RETAINED_CONTEXT_WAIT_NS: u64 = 4 * WORK_RING_WAIT_NS;
         let started = now_ns();
         let (lease, uat, pool, qos, execution, slot) = loop {
+            let observed = shared.queues.observe();
             let lease = shared.preparations.enter(true)?;
             let mut state = shared.state.lock();
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
@@ -660,7 +673,10 @@ impl Backend {
                         return Err(ERESTARTSYS);
                     }
                     shared.queue_events();
-                    kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+                    // A closing queue returns its context when its release
+                    // is reclaimed; that reclaim wakes this creator.
+                    let left = RETAINED_CONTEXT_WAIT_NS.saturating_sub(now_ns().saturating_sub(started));
+                    shared.queues.block(observed, left.div_ceil(1_000_000) as u32, true)?;
                 }
                 Err(error) => return Err(error),
             }

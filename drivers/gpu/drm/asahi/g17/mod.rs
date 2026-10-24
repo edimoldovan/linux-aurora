@@ -17,6 +17,7 @@
 //! Completions are signalled after dropping it. Lock order: `Shared::state` -> UAT shared state
 //! -> VM exec lock -> GEM reservation. `RoleState::ack` nests inside nothing.
 
+mod availability;
 mod buffer;
 mod channel;
 mod command;
@@ -830,6 +831,8 @@ struct Shared {
     #[pin]
     feed_work: Work<Shared, FEED_WORK>,
     preparations: Arc<preparation::Gate>,
+    /// Logical-queue creation waiting for a returned queue slot or execution context.
+    queues: Arc<availability::Availability>,
     /// Unbound compute publishers which can reuse a retired channel.
     compute_demand: AtomicU32,
     #[pin]
@@ -1000,6 +1003,7 @@ impl Shared {
             // Context release returns its execution root off-lock. The next
             // device pass can now detach idle compute aliases and their QoS
             // leases, without depending on a new client's submission/event.
+            self.queues.notify();
             self.queue_events();
         }
     }
@@ -1112,6 +1116,7 @@ impl Gpu {
         };
         let max_frequency_khz = Self::max_frequency_khz(dev)?;
         let preparations = preparation::Gate::new()?;
+        let queues = availability::Availability::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new()?;
         let active_cores = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
@@ -1142,6 +1147,7 @@ impl Gpu {
                 feed,
                 feed_work <- new_work!("g17::Shared::feed_work"),
                 preparations,
+                queues,
                 compute_demand: AtomicU32::new(0),
                 work <- new_work!("g17::Shared::work"),
                 poll <- new_delayed_work!("g17::Shared::poll"),
@@ -1317,11 +1323,12 @@ impl Gpu {
                 hold: power::Hold::new(),
                 registration_power_release_pending: false,
                 variant: shared.variant,
-                queues <- runtime::Registry::new(
+                queues <- runtime::Registry::with_waiters(
                     shared.clusters,
                     shared.deflake,
                     shared.descriptor_flags,
                     shared.variant,
+                    Some(shared.queues.clone()),
                 ),
                 pool: object::Pool::new()?,
                 render_rings: kick::RenderRings::new()?,
@@ -1592,16 +1599,21 @@ impl gpu::Gpu for Gpu {
         let policy = scheduling_policy(priority)?;
         let admission_started = now_ns();
         let (backend, slot) = loop {
+            let observed = self.shared.queues.observe();
             match runtime::Backend::new(&self.shared, &vm, owner, policy) {
                 Err(error) if error == EAGAIN => continue,
                 Err(error) if error == ENOSPC => {
                     // Closed logical queues can still own execution/QoS IDs
                     // until the scheduler release is consumed and reclaimed.
                     // Backend construction has rolled back all temporary leases.
-                    if now_ns().saturating_sub(admission_started)
-                        >= job::TIMEOUT_MS as u64 * 1_000_000 { return Err(EBUSY); }
+                    let waited = now_ns().saturating_sub(admission_started);
+                    let limit = job::TIMEOUT_MS as u64 * 1_000_000;
+                    if waited >= limit { return Err(EBUSY); }
                     self.shared.queue_events();
-                    kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+                    // A returned queue slot or reclaimed context wakes this.
+                    self.shared
+                        .queues
+                        .block(observed, (limit - waited).div_ceil(1_000_000) as u32, true)?;
                 }
                 result => break result?,
             }

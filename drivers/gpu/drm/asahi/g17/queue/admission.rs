@@ -377,9 +377,18 @@ pub(crate) struct Pool {
     queues: AtomicU32,
     /// Logical queues admitted at most: each must be able to hold a render pair.
     max_queues: u32,
+    /// Logical-queue creation waiting for a returned slot.
+    waiters: Option<Arc<crate::g17::availability::Availability>>,
 }
 impl Pool {
+    #[cfg(CONFIG_KUNIT)]
     pub(crate) fn new(max_queues: u32) -> Result<Arc<Self>> {
+        Self::with_waiters(max_queues, None)
+    }
+    pub(crate) fn with_waiters(
+        max_queues: u32,
+        waiters: Option<Arc<crate::g17::availability::Availability>>,
+    ) -> Result<Arc<Self>> {
         if max_queues > MAX_EXECUTION_CONTEXTS {
             return Err(EINVAL);
         }
@@ -389,6 +398,7 @@ impl Pool {
                 released <- new_condvar!("G17 render pair release"),
                 queues: AtomicU32::new(0),
                 max_queues,
+                waiters,
             }),
             GFP_KERNEL,
         )
@@ -667,6 +677,9 @@ pub(crate) struct QueueSlot {
 impl Drop for QueueSlot {
     fn drop(&mut self) {
         self.pool.queues.fetch_sub(1, Ordering::AcqRel);
+        if let Some(waiters) = &self.pool.waiters {
+            waiters.notify();
+        }
     }
 }
 

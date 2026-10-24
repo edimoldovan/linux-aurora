@@ -55,18 +55,34 @@ pub(super) struct Gate {
     wait: Mutex<()>,
     #[pin]
     changed: CondVar,
+    /// Scheduler admission waiting for publication to reopen.
+    available: Option<Arc<super::availability::Availability>>,
 }
 
 impl Gate {
     pub(super) fn new() -> Result<Arc<Self>> {
+        Self::with_waiters(None)
+    }
+
+    /// A gate whose reopening, failure and removal also wake `available`.
+    pub(super) fn with_waiters(
+        available: Option<Arc<super::availability::Availability>>,
+    ) -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(Self {
                 state: AtomicU64::new(EPOCH),
                 wait <- new_mutex!((), "g17::Gate::wait"),
                 changed <- new_condvar!("g17::Gate::changed"),
+                available,
             }),
             GFP_KERNEL,
         )
+    }
+
+    fn wake_waiters(&self) {
+        if let Some(available) = &self.available {
+            available.notify();
+        }
     }
 
     pub(super) fn try_enter(self: &Arc<Self>) -> Result<Lease> {
@@ -168,14 +184,18 @@ impl Gate {
 
     pub(super) fn remove(&self) {
         self.invalidate(REMOVED);
-        let _wait = self.wait.lock();
+        let wait = self.wait.lock();
         self.changed.notify_all();
+        drop(wait);
+        self.wake_waiters();
     }
 
     pub(super) fn fail(&self) {
         self.invalidate(FAILED);
-        let _wait = self.wait.lock();
+        let wait = self.wait.lock();
         self.changed.notify_all();
+        drop(wait);
+        self.wake_waiters();
     }
 
     /// Runtime failure/recovery must not join an indefinitely stalled builder.
@@ -199,7 +219,7 @@ impl Gate {
 
     /// Reopen only an empty, temporary closure. Failed or removed devices remain closed.
     pub(super) fn reopen(&self) -> bool {
-        let _wait = self.wait.lock();
+        let wait = self.wait.lock();
         let mut previous = self.state.load(Ordering::Acquire);
         loop {
             if previous & (REMOVED | FAILED | COUNT_MASK) != 0 {
@@ -213,6 +233,8 @@ impl Gate {
             ) {
                 Ok(_) => {
                     self.changed.notify_all();
+                    drop(wait);
+                    self.wake_waiters();
                     return true;
                 }
                 Err(current) => previous = current,
