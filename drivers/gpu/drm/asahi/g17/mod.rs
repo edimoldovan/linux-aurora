@@ -23,6 +23,7 @@ mod command;
 pub(crate) use command::Attachments;
 mod completion;
 pub(crate) mod context;
+mod data_segment;
 mod dependency;
 mod event;
 mod feed;
@@ -59,7 +60,6 @@ use kernel::{
     device::{self, Core},
     drm::gem::shmem,
     io::{
-        self,
         IoBase,
         IoSysMap,
         Region, //
@@ -255,12 +255,8 @@ pub(crate) struct CrashLog {
 enum CrashLogMap {
     /// The driver's buffer ([`CrashBuffers::Fixed`]).
     Object(shmem::VMapOwned<AsahiObject>),
-    /// `size` bytes at `offset` of the firmware's data segment ([`CrashBuffers::FirmwareData`]).
-    FirmwareData {
-        mem: io::mem::Mem,
-        offset: usize,
-        size: usize,
-    },
+    /// A buffer in the firmware's data segment ([`CrashBuffers::FirmwareData`]).
+    FirmwareData(data_segment::DataSegmentLog),
 }
 
 impl rtkit::Buffer for CrashLog {
@@ -271,13 +267,7 @@ impl rtkit::Buffer for CrashLog {
     fn buf(&mut self) -> Result<IoSysMap<'_, Region>> {
         match &mut self.map {
             CrashLogMap::Object(map) => Ok(IoSysMap::from((&*map).as_view())),
-            CrashLogMap::FirmwareData { mem, offset, size } => {
-                // SAFETY: shmem_map() checked that the range lies inside the mapping.
-                let base = unsafe { mem.ptr().add(*offset) };
-                let ptr = Region::<0>::ptr_try_from_raw_parts_mut(base, *size)?;
-                // SAFETY: The range is mapped RAM for as long as this borrow of the mapping.
-                Ok(IoSysMap::Sys(unsafe { io::SysMem::new(ptr) }))
-            }
+            CrashLogMap::FirmwareData(log) => log.buf(),
         }
     }
 }
@@ -377,18 +367,13 @@ impl rtkit::Operations for RoleOps {
             });
         }
         // The firmware places its buffers in its data segment, at their physical address.
-        let node = data.shared.dev.of_node().ok_or(EINVAL)?;
-        let res = node.reserved_mem_region_to_resource_byname(c_str!("fw-data"))?;
-        let offset = iova.checked_sub(res.start().try_into()?).ok_or(EINVAL)?;
-        if offset.checked_add(size).ok_or(EINVAL)? > res.size().try_into()? {
-            return Err(EINVAL);
-        }
-        // SAFETY: The boot loader reserved this RAM for the loaded GPU firmware, which keeps
-        // it until reboot; only the requested subrange is exposed.
-        let mem = unsafe { io::mem::Mem::try_new(res, io::mem::MemFlag::WB.into())? };
         Ok(CrashLog {
             iova,
-            map: CrashLogMap::FirmwareData { mem, offset, size },
+            map: CrashLogMap::FirmwareData(data_segment::DataSegmentLog::map(
+                &data.shared.dev,
+                iova,
+                size,
+            )?),
         })
     }
 }
