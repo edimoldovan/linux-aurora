@@ -122,6 +122,8 @@ pub(crate) struct Context {
     qos: QosLease,
     owner_pid: u32,
     states: WorkStates,
+    /// Signalled when a work state returns; publishers that found none wait on it.
+    state_returns: Arc<super::availability::Availability>,
     work: Arc<Mutex<WorkStorage>>,
     work_base: u64,
     render: Arc<Mutex<Option<Arc<RenderPool>>>>,
@@ -140,6 +142,7 @@ impl Context {
         execution: Arc<ExecutionContext>,
         owner_pid: u32,
         policy: Policy,
+        state_returns: Arc<super::availability::Availability>,
     ) -> Result<Self> {
         let status = execution.vm().status().ok_or(EINVAL)?.clone();
         let qos = qos.acquire()?;
@@ -199,6 +202,7 @@ impl Context {
             qos,
             owner_pid,
             states: WorkStates::new(),
+            state_returns,
             work,
             work_base,
             render,
@@ -378,8 +382,9 @@ impl WorkStateLease {
                 Err(EBUSY)
             };
         };
-        if let Err(error) = self.context.work.lock().initialize(candidate) {
-            self.context.states.release(candidate);
+        let initialized = self.context.work.lock().initialize(candidate);
+        if let Err(error) = initialized {
+            self.context.release_state(candidate);
             return Err(error);
         }
         match self
@@ -388,10 +393,14 @@ impl WorkStateLease {
         {
             Ok(_) => Ok(candidate),
             Err(installed) => {
-                self.context.states.release(candidate);
+                self.context.release_state(candidate);
                 Ok(installed)
             }
         }
+    }
+    /// The domain a publisher samples before acquire() and waits on after EBUSY.
+    pub(crate) fn returns(&self) -> &Arc<super::availability::Availability> {
+        &self.context.state_returns
     }
     pub(crate) fn word(&self) -> u32 {
         self.word.load(Ordering::Acquire)
@@ -433,7 +442,17 @@ impl Drop for WorkStateLease {
     fn drop(&mut self) {
         let word = self.word();
         if word != FREE {
-            self.context.states.release(word);
+            self.context.release_state(word);
+        }
+    }
+}
+
+impl Context {
+    /// Every return bumps the domain: a publisher that sampled it before its
+    /// failed acquire() then never sleeps through this node.
+    fn release_state(&self, word: u32) {
+        if self.states.release(word) {
+            self.state_returns.notify();
         }
     }
 }

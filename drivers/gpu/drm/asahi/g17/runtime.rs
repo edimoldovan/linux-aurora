@@ -192,16 +192,18 @@ impl Registry {
         descriptor_flags: [u32; 2],
         variant: &'static crate::g17::fw::Variant,
     ) -> impl Init<Self, Error> {
-        Self::with_waiters(clusters, deflake, descriptor_flags, variant, None)
+        Self::with_waiters(clusters, deflake, descriptor_flags, variant, None, None)
     }
 
-    /// `queues` wakes logical-queue creation when a logical queue slot is returned.
+    /// `queues` wakes logical-queue creation when a logical queue slot is returned;
+    /// `renders` wakes render publication when a render pair or lease returns.
     pub(super) fn with_waiters(
         clusters: u32,
         deflake: crate::g17::fw::render::Deflake,
         descriptor_flags: [u32; 2],
         variant: &'static crate::g17::fw::Variant,
         queues: Option<Arc<super::availability::Availability>>,
+        renders: Option<Arc<super::availability::Availability>>,
     ) -> impl Init<Self, Error> {
         kernel::try_init!(Self {
             qids <- kick::QueueIds::new(variant.qid_floor).chain(|qids| {
@@ -210,7 +212,7 @@ impl Registry {
             buffers <- BufferIds::new(),
             metrics: Arc::new(MetricsIds::new(), GFP_KERNEL)?,
             qos_ids: QosIds::new()?,
-            admission: admission::Pool::with_waiters(kick::queue_limit(variant.qid_floor), queues)?,
+            admission: admission::Pool::with_waiters(kick::queue_limit(variant.qid_floor), queues, renders)?,
             render: render::RenderState::new(clusters, deflake, descriptor_flags)?,
             identities: queue::Identities::new(),
             compute: {
@@ -735,7 +737,7 @@ impl Backend {
         let owner_pid =
             u32::try_from(kernel::current!().group_leader().pid()).map_err(|_| EOVERFLOW)?;
         let context = Arc::new(
-            Context::new(&alloc, &pool, &qos, execution, owner_pid, policy)?,
+            Context::new(&alloc, &pool, &qos, execution, owner_pid, policy, shared.renders.clone())?,
             GFP_KERNEL,
         )?;
         let state = shared.state.lock();
@@ -2346,12 +2348,6 @@ impl Registry {
 }
 
 impl Backend {
-    pub(super) fn wait_capacity(&self, started: u64) -> Result {
-        let check = || self.admission_open();
-        let admission = Admission::new(started.saturating_add(WORK_RING_WAIT_NS), &check);
-        self.wait_compute_capacity(&admission, true)
-    }
-
     fn wait_compute_capacity(&self, admission: &Admission<'_>, reclaim_backing: bool) -> Result {
         self.reclaim_capacity(admission, reclaim_backing)?;
         kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));

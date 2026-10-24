@@ -8,11 +8,7 @@ use crate::g17::{
     queue::admission::{RenderLease, Request},
 };
 use core::sync::atomic::Ordering;
-use kernel::{
-    prelude::*,
-    sync::Arc,
-    time::{delay::fsleep, Delta},
-};
+use kernel::{prelude::*, sync::Arc};
 
 /// Internal result of a publication attempted from the submitting ioctl that
 /// met contention before anything became visible: the scheduler publishes the
@@ -60,6 +56,9 @@ impl Backend {
         };
         let started = super::super::now_ns();
         let deadline_ns = started.saturating_add(u64::from(crate::g17::job::TIMEOUT_MS) * 1_000_000);
+        // A capacity refusal samples the render domain and retries once; only
+        // a refusal after that sample waits, so no release can be missed.
+        let mut observed = None;
         loop {
             self.admission_open()?;
             if super::super::now_ns() >= deadline_ns { return Err(EBUSY); }
@@ -97,7 +96,7 @@ impl Backend {
                                 .reclaim_unused_render_spare(Some(self.owner), false)?
                         };
                         if reclaimed.is_none() {
-                            self.wait_render_capacity(started, sleep)?;
+                            self.wait_render_capacity(&mut observed, started, sleep)?;
                         }
                         drop(reclaimed);
                         continue;
@@ -131,7 +130,7 @@ impl Backend {
                     let ready = firmware.queues.has_render_ids(self.owner);
                     drop(state);
                     if reclaimed.is_none() && !ready {
-                        self.wait_render_capacity(started, sleep)?;
+                        self.wait_render_capacity(&mut observed, started, sleep)?;
                     }
                     drop(reclaimed);
                 }
@@ -140,36 +139,129 @@ impl Backend {
         }
     }
 
-    /// A pair is borrowed, still settling, or waiting for the release of the
-    /// scheduler it last ran for to be consumed and the pair parked. The event
-    /// worker observes both, so kick it on every poll; time out only after the
-    /// same bound as a capacity wait.
-    fn wait_render_busy(&self, since: &mut Option<u64>, seen: u64, sleep: bool) -> Result {
-        if !sleep {
-            return Err(FALLBACK);
+    /// Conditions which end a publication that has not become visible yet.
+    fn publication_open(&self, packet: &Packet) -> Result {
+        self.admission_open()?;
+        if packet.cancel_requested() {
+            return Err(ECANCELED);
         }
-        let now = super::super::now_ns();
-        if now.saturating_sub(*since.get_or_insert(now)) >= super::super::WORK_RING_WAIT_NS {
-            return Err(ETIMEDOUT);
-        }
-        self.shared.queue_events();
-        // Every pair return notifies under the device mutex: wake on it rather
-        // than sleeping out a fixed interval behind a short observation loan.
-        let mut state = self.shared.state.lock();
-        if self.shared.changes() == seen {
-            let _ = self.shared.changed.wait_timeout(&mut state, kernel::time::msecs_to_jiffies(1));
+        if packet.completion.status().get() != 0 {
+            return Err(EIO);
         }
         Ok(())
     }
 
-    /// A closing owner may still hold its pair until exact retirement. Wait
-    /// outside both the device mutex and preparation gate so the event worker
-    /// and recovery can return capacity. No packet is firmware-visible here.
-    fn wait_render_capacity(&self, started: u64, sleep: bool) -> Result {
+    /// Blocks on `domain` until a notification after `observed`, or the
+    /// deadline, which only bounds the wait. Slices of at most 10 ms let the
+    /// publisher observe cancellation, which has no notification here.
+    fn wait_domain(
+        &self,
+        domain: &crate::g17::availability::Availability,
+        observed: u64,
+        deadline_ns: u64,
+        packet: &Packet,
+    ) -> Result {
+        self.publication_open(packet)?;
+        let remaining = deadline_ns.saturating_sub(super::super::now_ns());
+        if remaining == 0 {
+            return Err(ETIMEDOUT);
+        }
+        domain.block(observed, remaining.div_ceil(1_000_000).min(10) as u32, false)
+    }
+
+    /// A pair is borrowed, still settling, waiting for firmware room or for the
+    /// release of the scheduler it last ran for. Every pair return, retirement
+    /// and teardown step signals the render domain, and each event pass does
+    /// while a publisher waits; the deadline is only the failure bound.
+    fn wait_render_busy(
+        &self,
+        since: &mut Option<u64>,
+        observed: &mut Option<u64>,
+        sleep: bool,
+        packet: &Packet,
+    ) -> Result {
         if !sleep {
             return Err(FALLBACK);
         }
-        self.wait_capacity(started)
+        let now = super::super::now_ns();
+        let deadline = since.get_or_insert(now).saturating_add(super::super::WORK_RING_WAIT_NS);
+        // Sample, then retry once: only a refusal after the sample waits.
+        let Some(sample) = observed.take() else {
+            *observed = Some(self.shared.renders.observe());
+            return Ok(());
+        };
+        self.shared.queue_events();
+        self.wait_domain(&self.shared.renders, sample, deadline, packet)
+    }
+
+    /// Render capacity is short: return what idle owners hold, then block until
+    /// a pair, lease or owner returns. No packet is firmware-visible here, and
+    /// neither the device mutex nor a preparation lease is held while waiting.
+    fn wait_render_capacity(&self, observed: &mut Option<u64>, started: u64, sleep: bool) -> Result {
+        if !sleep {
+            return Err(FALLBACK);
+        }
+        if self.reclaim_render_capacity()? {
+            *observed = None;
+            return Ok(());
+        }
+        let Some(sample) = observed.take() else {
+            *observed = Some(self.shared.renders.observe());
+            return Ok(());
+        };
+        self.shared.queue_events();
+        self.admission_open()?;
+        let remaining = started
+            .saturating_add(super::super::WORK_RING_WAIT_NS)
+            .saturating_sub(super::super::now_ns());
+        if remaining == 0 {
+            return Err(EBUSY);
+        }
+        self.shared
+            .renders
+            .block(sample, remaining.div_ceil(1_000_000).min(10) as u32, false)
+    }
+
+    /// Gives idle render backing back under capacity pressure. Returns whether
+    /// anything was returned, in which case the caller retries at once.
+    fn reclaim_render_capacity(&self) -> Result<bool> {
+        let mut deferred = DeferredBatch::publication()?;
+        let result: Result<bool> = (|| {
+            let lease = self.shared.preparations.try_enter()?;
+            let mut state = self.shared.state.lock();
+            let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+            if !lease.is_current() || self.shared.crashed.load(Ordering::Acquire) {
+                return Err(EAGAIN);
+            }
+            if firmware.recovery.pending()
+                || crate::g17::recovery::Memory::recovery_state(&firmware.init)? != 0
+            {
+                return Ok(false);
+            }
+            firmware.queues.observe_pool_releases(&firmware.init, &mut deferred)?;
+            firmware.queues.reclaim_idle_render_pools(&firmware.init, &mut deferred)?;
+            let mut published = 0;
+            if !firmware.render_control_backpressured() {
+                (published, _) = firmware.queues.vacate_idle_pools(
+                    &firmware.init,
+                    0,
+                    super::super::now_ns(),
+                    0,
+                )?;
+                if published != 0 {
+                    firmware.primary.notify(crate::g17::MSG_CONTROL_NOTIFY)?;
+                }
+            }
+            Ok(published != 0
+                || !deferred.render.is_empty()
+                || !deferred.vacated.is_empty()
+                || !deferred.bindings.is_empty())
+        })();
+        deferred.finish();
+        match result {
+            Err(error) if error == EAGAIN => Ok(false),
+            result => result,
+        }
     }
 
     fn render_with_lease(
@@ -193,13 +285,12 @@ impl Backend {
         let admission = self.acquire_render_with_ids(packet, early, sleep)?;
         let slot = admission.slot();
         packet.completion.attach_render_lease(admission)?;
-        let mut state_polls = 0;
-        let mut state_delay = 20i64;
         let mut busy_since = None;
-        let mut recovery_polls = 0;
         let capacity_started = super::super::now_ns();
+        let deadline_ns = capacity_started.saturating_add(super::super::WORK_RING_WAIT_NS);
+        let mut seen = None;
+        let mut states = None;
         loop {
-            let seen = self.shared.changes();
             if packet.cancel_requested() {
                 return Err(ECANCELED);
             }
@@ -229,12 +320,15 @@ impl Backend {
                     if !sleep {
                         return Err(FALLBACK);
                     }
-                    if state_polls == 1000 {
-                        return Err(ETIMEDOUT);
+                    // Every node of this context belongs to unretired work:
+                    // sample, retry once, then wait for the next returned one.
+                    let work = packet.completion.work_state()?;
+                    match states.take() {
+                        None => states = Some(work.returns().observe()),
+                        Some(sample) => {
+                            self.wait_domain(work.returns(), sample, deadline_ns, packet)?
+                        }
                     }
-                    state_polls += 1;
-                    fsleep(Delta::from_micros(state_delay));
-                    state_delay = (state_delay * 2).min(1000);
                     continue;
                 }
                 result => {
@@ -243,40 +337,42 @@ impl Backend {
             }
             match self.ensure_render(packet, slot, sleep) {
                 Err(error) if error == ENOSPC => {
-                    self.wait_render_capacity(capacity_started, sleep)?;
+                    self.wait_render_capacity(&mut seen, capacity_started, sleep)?;
                     continue;
                 }
                 Err(error) if error == EAGAIN => continue,
                 Err(error) if error == EBUSY => {
-                    self.wait_render_busy(&mut busy_since, seen, sleep)?;
+                    self.wait_render_busy(&mut busy_since, &mut seen, sleep, packet)?;
                     continue;
                 }
                 result => result?,
             }
             match self.prepare_render(slot, packet, deferred, sleep) {
                 Err(error) if !packet.is_published() && error == ENOSPC => {
-                    self.wait_render_capacity(capacity_started, sleep)?;
+                    self.wait_render_capacity(&mut seen, capacity_started, sleep)?;
                     continue;
                 }
                 Err(error) if !packet.is_published() && [EAGAIN, EBUSY].contains(&error) => {
-                    let recovering = {
+                    let (recovering, gate) = {
                         let state = self.shared.state.lock();
                         let firmware = (*state).as_deref().ok_or(ENODEV)?;
-                        firmware.recovery.pending()
-                            || crate::g17::recovery::Memory::recovery_state(&firmware.init)? != 0
+                        (
+                            firmware.recovery.pending()
+                                || crate::g17::recovery::Memory::recovery_state(&firmware.init)? != 0,
+                            self.shared.preparations.snapshot(),
+                        )
                     };
                     if recovering {
                         if !sleep {
                             return Err(FALLBACK);
                         }
-                        if recovery_polls == super::super::RECOVERY_SETTLE_POLLS {
-                            return Err(ETIMEDOUT);
-                        }
-                        recovery_polls += 1;
+                        // Recovery closes the preparation gate before touching
+                        // any queue; the next pass blocks in enter() until it
+                        // reopens. The worker raises the closure.
                         self.shared.queue_events();
-                        fsleep(Delta::from_millis(1));
+                        self.shared.preparations.wait_closure(gate, deadline_ns)?;
                     } else if error == EBUSY {
-                        self.wait_render_busy(&mut busy_since, seen, sleep)?;
+                        self.wait_render_busy(&mut busy_since, &mut seen, sleep, packet)?;
                     } else if !sleep {
                         return Err(FALLBACK);
                     }

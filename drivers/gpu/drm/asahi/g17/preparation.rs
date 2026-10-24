@@ -179,8 +179,39 @@ impl Gate {
         }
     }
 
+    /// Also wakes publishers in wait_closure(); they then block in enter().
     pub(super) fn close(&self) {
         self.invalidate(0);
+        let _wait = self.wait.lock();
+        self.changed.notify_all();
+    }
+
+    /// Opaque snapshot for wait_closure(), taken where recovery was observed.
+    pub(super) fn snapshot(&self) -> u64 {
+        self.state.load(Ordering::Acquire)
+    }
+
+    /// A publisher that observed recovery (host pending, or the firmware's state
+    /// ahead of the event worker, which always follows with a restart and the
+    /// closure) sleeps until this gate has closed since `seen`. enter() then
+    /// blocks until recovery reopens it. The deadline is only a failure bound.
+    pub(super) fn wait_closure(&self, seen: u64, deadline: u64) -> Result {
+        let mut wait = self.wait.lock();
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if state & (REMOVED | FAILED) != 0 {
+                return Err(ENODEV);
+            }
+            if state & CLOSED != 0 || state & !COUNT_MASK != seen & !COUNT_MASK {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_sub(super::now_ns());
+            if remaining == 0 {
+                return Err(ETIMEDOUT);
+            }
+            let ms = u32::try_from(remaining.div_ceil(1_000_000)).unwrap_or(u32::MAX);
+            let _ = self.changed.wait_timeout(&mut wait, kernel::time::msecs_to_jiffies(ms));
+        }
     }
 
     pub(super) fn remove(&self) {

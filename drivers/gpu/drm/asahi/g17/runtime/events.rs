@@ -467,6 +467,11 @@ impl crate::g17::Shared {
         if grow_ready {
             self.queue_grow();
         }
+        // Firmware ring room, consumed releases and teardown steps have no
+        // event of their own: recheck render publishers' conditions every pass.
+        if self.renders.has_waiters() {
+            self.renders.notify();
+        }
         Ok(())
     }
 }

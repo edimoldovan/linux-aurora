@@ -62,7 +62,6 @@ use core::ops::Range;
 use core::sync::atomic::{
     AtomicBool,
     AtomicU32,
-    AtomicU64,
     Ordering, //
 };
 
@@ -844,6 +843,11 @@ struct Shared {
     progress: Arc<availability::Availability>,
     /// Logical-queue creation waiting for a returned queue slot or execution context.
     queues: Arc<availability::Availability>,
+    /// Render publication waiting for render capacity, a pair on loan, a work
+    /// state or firmware room: signalled when a pair, lease or work state
+    /// returns, an owner closes, a teardown parks, and on every event pass
+    /// while a render publisher waits (firmware consumption has no event).
+    renders: Arc<availability::Availability>,
     /// Unbound compute publishers which can reuse a retired channel.
     compute_demand: AtomicU32,
     #[pin]
@@ -868,9 +872,6 @@ struct Shared {
     state: Mutex<Option<KBox<Firmware>>>,
     #[pin]
     changed: CondVar,
-    /// Counts `changed` notifications, so that a waiter which checked under
-    /// the device mutex can tell whether it already missed one.
-    changes: AtomicU64,
     /// The port of the session in `state`; null before boot and once detachment begins.
     port: core::sync::atomic::AtomicPtr<port::Port>,
 }
@@ -964,13 +965,10 @@ impl Shared {
 
     /// Wakes the waiters for a returned pair, binding or capacity change.
     fn note_changed(&self) {
-        self.changes.fetch_add(1, Ordering::AcqRel);
         self.changed.notify_all();
+        self.renders.notify();
     }
 
-    fn changes(&self) -> u64 {
-        self.changes.load(Ordering::Acquire)
-    }
 
     /// The session's port, valid while `lease` is held: shutdown and device loss join every
     /// lease before they detach the session.
@@ -1130,6 +1128,7 @@ impl Gpu {
         let progress = availability::Availability::new()?;
         let queues = availability::Availability::new()?;
         let preparations = preparation::Gate::with_waiters(Some(progress.clone()))?;
+        let renders = availability::Availability::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new()?;
         let active_cores = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
@@ -1163,6 +1162,7 @@ impl Gpu {
                 channels,
                 progress,
                 queues,
+                renders,
                 compute_demand: AtomicU32::new(0),
                 work <- new_work!("g17::Shared::work"),
                 poll <- new_delayed_work!("g17::Shared::poll"),
@@ -1173,7 +1173,6 @@ impl Gpu {
                 stop <- new_mutex!((), "g17::Shared::stop"),
                 state <- new_mutex!(None, "g17::Shared::state"),
                 changed <- new_condvar!("g17::Shared::changed"),
-                changes: AtomicU64::new(0),
                 port: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             }),
             GFP_KERNEL,
@@ -1344,6 +1343,7 @@ impl Gpu {
                     shared.descriptor_flags,
                     shared.variant,
                     Some(shared.queues.clone()),
+                    Some(shared.renders.clone()),
                 ),
                 pool: object::Pool::new()?,
                 render_rings: kick::RenderRings::new()?,

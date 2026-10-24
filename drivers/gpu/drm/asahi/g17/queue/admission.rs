@@ -379,15 +379,19 @@ pub(crate) struct Pool {
     max_queues: u32,
     /// Logical-queue creation waiting for a returned slot.
     waiters: Option<Arc<crate::g17::availability::Availability>>,
+    /// Render publication waiting for render capacity: woken with every
+    /// release event above.
+    renders: Option<Arc<crate::g17::availability::Availability>>,
 }
 impl Pool {
     #[cfg(CONFIG_KUNIT)]
     pub(crate) fn new(max_queues: u32) -> Result<Arc<Self>> {
-        Self::with_waiters(max_queues, None)
+        Self::with_waiters(max_queues, None, None)
     }
     pub(crate) fn with_waiters(
         max_queues: u32,
         waiters: Option<Arc<crate::g17::availability::Availability>>,
+        renders: Option<Arc<crate::g17::availability::Availability>>,
     ) -> Result<Arc<Self>> {
         if max_queues > MAX_EXECUTION_CONTEXTS {
             return Err(EINVAL);
@@ -399,9 +403,17 @@ impl Pool {
                 queues: AtomicU32::new(0),
                 max_queues,
                 waiters,
+                renders,
             }),
             GFP_KERNEL,
         )
+    }
+    /// Every pair or lease return, owner close and quarantine change.
+    fn returned(&self) {
+        self.released.notify_all();
+        if let Some(renders) = &self.renders {
+            renders.notify();
+        }
     }
     /// Logical queues currently counted, including one being created.
     pub(crate) fn queues(&self) -> u32 {
@@ -579,7 +591,7 @@ impl Pool {
             }
         }
         drop(state);
-        self.released.notify_all();
+        self.returned();
     }
     /// Active leases survive this transition. Their later drop is still the
     /// event which releases capacity, so a stopped owner is never double-freed.
@@ -597,7 +609,7 @@ impl Pool {
         state.spared &= !released;
         state.kill_hold = 0;
         drop(state);
-        self.released.notify_all();
+        self.returned();
     }
 }
 
@@ -715,7 +727,7 @@ impl RenderLease {
         }
         state.quarantined |= bit;
         drop(state);
-        self.pool.released.notify_all();
+        self.pool.returned();
     }
     /// The VM pin must be retired first. Keep this lease until after clearing
     /// quarantine; its drop is what permits waiting publications to proceed.
@@ -800,7 +812,7 @@ impl Drop for RenderLease {
         }
         state.release(self.slot);
         drop(state);
-        self.pool.released.notify_all();
+        self.pool.returned();
     }
 }
 
@@ -839,7 +851,7 @@ impl Pool {
             return;
         }
         self.state.lock().kill_hold &= !slots;
-        self.released.notify_all();
+        self.returned();
     }
 }
 
