@@ -659,7 +659,7 @@ impl Memory {
             tiling_kick,
             ta.qid,
             ta.stamp_value,
-            fragment_id as u32,
+            fragment_id,
         );
         self.graph.config.write(CONFIG[1] + slot, barrier)?;
         if init_manager {

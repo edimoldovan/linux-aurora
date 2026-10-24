@@ -609,7 +609,7 @@ impl FragmentBarrier {
         tiling_kick: KickTimestamp,
         tiling_qid: u32,
         stamp_value: u32,
-        fragment_id: u32,
+        fragment_id: u64,
     ) -> Self {
         Self {
             tag: CommandTag::FragmentBarrier as u32,
@@ -620,7 +620,7 @@ impl FragmentBarrier {
             unk_1c: [0; 8],
             event: tiling_qid,
             stamp_self: stamp_value,
-            fragment_id: fragment_id.into(),
+            fragment_id,
             unk_34: 1,
             unk_38: [0; 0x10],
         }
