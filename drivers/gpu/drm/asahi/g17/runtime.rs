@@ -86,6 +86,8 @@ pub(super) struct Registry {
     compute_scheduler_building: bool,
     replay_outer_wait: Option<u64>,
     pub(super) observations: compute::retirement::Batch,
+    /// Completion-ring slot where the next compute scan starts.
+    completion_cursor: usize,
     worker_deferred: Option<DeferredBatch>,
     teardown: super::teardown::Pending,
 }
@@ -121,6 +123,7 @@ impl Registry {
             compute_scheduler_building: false,
             replay_outer_wait: None,
             observations: compute::retirement::Batch::new()?,
+            completion_cursor: 0,
             worker_deferred: Some(DeferredBatch::worker()?),
             teardown: super::teardown::Pending::new()?,
         })
@@ -1403,9 +1406,17 @@ impl super::Firmware {
         {
             requested |= queue.request_observations(&mut registry.observations, masks)?;
         }
+        // Completion records are appended in order: resume after the last
+        // record a previous scan needed and stop once every request is found.
         if requested {
-            self.init
-                .scan_compute_completions(|record| registry.observations.fold(record))?;
+            let observations = &mut registry.observations;
+            registry.completion_cursor = self.init.scan_compute_completions(
+                registry.completion_cursor,
+                |record| {
+                    observations.fold(record)?;
+                    Ok(observations.complete())
+                },
+            )?;
         }
         let view = qos::View::new(self.init.qos()?)?;
         for queue in registry

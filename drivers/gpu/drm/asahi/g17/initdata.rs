@@ -679,19 +679,28 @@ impl InitData {
 
     /// Snapshot the shared compute completion ring once per service transaction. The queue
     /// scanner latches exact identities; firmware retains sole ownership of these slots.
+    /// Visits ring slots from `start`, wrapping once, until `record` reports
+    /// that nothing more is wanted. Returns the slot after the last one visited
+    /// when the scan stopped early, or `start` after a complete wrap.
     pub(super) fn scan_compute_completions(
         &self,
-        mut record: impl FnMut(ComputeCompletion<'_>) -> Result,
-    ) -> Result {
+        start: usize,
+        mut record: impl FnMut(ComputeCompletion<'_>) -> Result<bool>,
+    ) -> Result<usize> {
         let object = self.object(self.completion_rings[0])?;
+        let slots = (abi::COMPLETION_RING_SIZE / 0x40).min(0x800);
+        let start = start % slots;
         fence(Ordering::Acquire);
-        for slot in 0..(abi::COMPLETION_RING_SIZE / 0x40).min(0x800) {
-            record(ComputeCompletion {
+        for step in 0..slots {
+            let slot = (start + step) % slots;
+            if record(ComputeCompletion {
                 object,
                 offset: slot * 0x40,
-            })?;
+            })? {
+                return Ok((slot + 1) % slots);
+            }
         }
-        Ok(())
+        Ok(start)
     }
 
     fn object(&self, index: usize) -> Result<&KernelObject> {

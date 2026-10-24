@@ -174,6 +174,8 @@ pub(crate) struct Batch {
     requests: KVVec<Request>,
     slots: [(usize, usize); QIDS],
     open: Option<u8>,
+    /// Requests with no observation yet; the scan stops when this reaches zero.
+    unobserved: usize,
 }
 
 impl Batch {
@@ -182,12 +184,18 @@ impl Batch {
             requests: KVVec::with_capacity(QIDS * IN_FLIGHT, GFP_KERNEL)?,
             slots: [(0, 0); QIDS],
             open: None,
+            unobserved: 0,
         })
     }
     pub(crate) fn clear(&mut self) {
         self.requests.clear();
         self.slots.fill((0, 0));
         self.open = None;
+        self.unobserved = 0;
+    }
+    /// True once every requested identity has an observation.
+    pub(crate) fn complete(&self) -> bool {
+        self.unobserved == 0
     }
     pub(crate) fn request(&mut self, ticket: &Ticket) -> Result {
         if ticket.descriptor == 0 || ticket.kick == 0 {
@@ -214,6 +222,7 @@ impl Batch {
             .map_err(|_| ENOSPC)?;
         *slot = (start, slot.1 + 1);
         self.open = Some(ticket.qid);
+        self.unobserved += 1;
         Ok(())
     }
     /// Capture the control word once, then read only a requested identity's payload.
@@ -246,6 +255,9 @@ impl Batch {
                 .is_some_and(|old| old.timestamps[1] >= timestamps[1])
         {
             return Ok(());
+        }
+        if request.observed.is_none() {
+            self.unobserved -= 1;
         }
         request.observed = Some(Observation { timestamps });
         Ok(())
