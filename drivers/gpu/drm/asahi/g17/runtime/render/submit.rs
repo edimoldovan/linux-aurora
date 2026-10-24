@@ -287,6 +287,11 @@ impl Backend {
         let (admission, mut ready) = self.acquire_render_with_ids(packet, early, sleep)?;
         let slot = admission.slot();
         packet.completion.attach_render_lease(admission)?;
+        if ready {
+            if let Some(result) = self.render_direct(packet, slot, deferred) {
+                return result;
+            }
+        }
         let mut busy_since = None;
         let capacity_started = super::super::now_ns();
         let deadline_ns = capacity_started.saturating_add(super::super::WORK_RING_WAIT_NS);
@@ -549,15 +554,20 @@ impl crate::g17::Firmware {
         if packet.completion.status().get() != 0 {
             return Err(EIO);
         }
+        let mut dependencies = self.queues.render_dependencies(owner, packet, state)?;
+        // Every render publication, with or without the device mutex, holds the
+        // port's render lock: the render work rings have one host producer at a
+        // time and attachment overlaps are ordered by publication order.
+        let port = self.port.clone();
+        let _render = port.render_lock();
         // Both outer destinations must have room before pool accounting or
-        // either inner queue becomes visible. All host producers share this lock.
+        // either inner queue becomes visible.
         let priority = packet.context.policy().priority();
         if !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Fragment)?
             || !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Tiling)?
         {
             return Err(EBUSY);
         }
-        let mut dependencies = self.queues.render_dependencies(owner, packet, state)?;
         if let Some(footprint) = packet.footprint.as_ref() {
             dependencies.hazard_count = self.queues.admission.publication_barriers(
                 owner,

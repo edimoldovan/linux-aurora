@@ -6,6 +6,7 @@
 
 mod exit;
 mod dependencies;
+mod direct;
 mod grow;
 mod observe;
 mod pools;

@@ -7,7 +7,9 @@
 //! through a preparation lease ([`super::Shared::port`]): shutdown and device loss join every
 //! lease before they detach the session. Each piece below is atomic or has its own lock.
 //!
-//! Lock order: device mutex -> compute queue cell -> the locks of this port.
+//! Lock order: device mutex -> compute queue cell -> the locks of this port. The render
+//! publication lock comes first among the port's locks: device mutex -> render publication
+//! lock -> admission pool, QoS, mailbox. Its holder never takes the device mutex.
 
 use super::{
     fw::{
@@ -18,9 +20,9 @@ use super::{
 };
 use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
 use kernel::{
-    new_spinlock,
+    new_mutex, new_spinlock,
     prelude::*,
-    sync::{Arc, SetOnce, SpinLock},
+    sync::{Arc, Mutex, MutexGuard, SetOnce, SpinLock},
 };
 
 const PRIORITIES: usize = Policy::PRIORITIES as usize;
@@ -62,6 +64,10 @@ impl RingView {
 /// Raw views of the session's firmware-shared memory, fixed once the firmware is built.
 pub(super) struct Views {
     pub(super) compute: [RingView; PRIORITIES],
+    pub(super) tiling: [RingView; PRIORITIES],
+    pub(super) fragment: [RingView; PRIORITIES],
+    /// Completion stamp page A: one word per QID, written by the firmware.
+    pub(super) stamps: *const AtomicU32,
     pub(super) qos: *mut u8,
     pub(super) recovery: *const AtomicU32,
     pub(super) mailbox: *const super::Mailbox,
@@ -81,6 +87,11 @@ pub(super) struct Port {
     rings: SpinLock<[u32; PRIORITIES]>,
     #[pin]
     qos: SpinLock<qos::Accounting>,
+    /// Serializes every render publication, with or without the device mutex: the tiling
+    /// and fragment work rings have one host producer at a time, and same-VM attachment
+    /// overlaps are ordered by publication order (see hazard.rs).
+    #[pin]
+    render: Mutex<()>,
     /// The accepted recovery generation, mirrored for publishers without the device mutex.
     generation: AtomicU64,
     /// Device publication order shared by compute and render commands.
@@ -114,6 +125,7 @@ impl Port {
                 views: SetOnce::new(),
                 rings <- new_spinlock!([0; PRIORITIES], "g17::Port::rings"),
                 qos <- new_spinlock!(qos::Accounting::new(), "g17::Port::qos"),
+                render <- new_mutex!((), "g17::Port::render"),
                 generation: AtomicU64::new(0),
                 publications: AtomicU64::new(0),
                 effort_full: AtomicBool::new(false),
@@ -194,6 +206,113 @@ impl Port {
         reserved[claim.priority] = reserved[claim.priority].saturating_sub(1);
         claim.armed = false;
         Ok(next)
+    }
+
+    /// Taken around every render publication; see `render`.
+    pub(super) fn render_lock(&self) -> MutexGuard<'_, ()> {
+        self.render.lock()
+    }
+
+    fn render_rings(&self, priority: u8) -> Result<(RingView, RingView)> {
+        let views = self.views()?;
+        let index = usize::from(priority);
+        Ok((
+            *views.fragment.get(index).ok_or(EINVAL)?,
+            *views.tiling.get(index).ok_or(EINVAL)?,
+        ))
+    }
+
+    /// Both render work rings of `priority` have a free slot. Only firmware consumption,
+    /// never a publisher without the render lock, changes this.
+    pub(super) fn render_room(&self, _guard: &MutexGuard<'_, ()>, priority: u8) -> Result<bool> {
+        let (fragment, tiling) = self.render_rings(priority)?;
+        Ok(fragment.free()? > 0 && tiling.free()? > 0)
+    }
+
+    /// Copies a render pair's fragment, then tiling record into the slots after each
+    /// producer without exposing them, as `InitData::publish_work_pair` does for a deferred
+    /// pair. Returns the producers that expose them.
+    pub(super) fn write_render_pair(
+        &self,
+        _guard: &MutexGuard<'_, ()>,
+        priority: u8,
+        fragment: &WorkSlot,
+        tiling: &WorkSlot,
+        commit_accounting: impl FnOnce() -> Result,
+        publish_late_tiling: impl FnOnce(),
+    ) -> Result<[u32; 2]> {
+        if fragment.data_master != DataMaster::Fragment as u32
+            || tiling.data_master != DataMaster::Tiling as u32
+        {
+            return Err(EINVAL);
+        }
+        let (fragment_ring, tiling_ring) = self.render_rings(priority)?;
+        let slot = |ring: &RingView| -> Result<(*mut u8, u32)> {
+            let [first, second, producer] = ring.cursors()?;
+            let next = (producer + 1) % WORK_RING_SLOTS;
+            if next == first || next == second {
+                return Err(EINVAL);
+            }
+            // SAFETY: The ring view spans WORK_RING_SLOTS records; `producer` is in range.
+            Ok((unsafe { ring.slots.add(producer as usize * core::mem::size_of::<WorkSlot>()) }, next))
+        };
+        let (fragment_slot, fragment_next) = slot(&fragment_ring)?;
+        let (tiling_slot, tiling_next) = slot(&tiling_ring)?;
+        let copy = |record: &WorkSlot, destination: *mut u8| {
+            // SAFETY: The slot after the producer is host-owned until the producer moves past
+            // it, and the render lock excludes every other host writer of this ring.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    core::ptr::from_ref(record).cast::<u8>(),
+                    destination,
+                    core::mem::size_of::<WorkSlot>(),
+                )
+            }
+        };
+        copy(fragment, fragment_slot);
+        commit_accounting()?;
+        fence(Ordering::SeqCst);
+        publish_late_tiling();
+        copy(tiling, tiling_slot);
+        fence(Ordering::SeqCst);
+        Ok([fragment_next, tiling_next])
+    }
+
+    /// Exposes a pair written by `write_render_pair`, fragment first, as
+    /// `InitData::publish_retained_work_pair` does: the producers must still precede `next`.
+    pub(super) fn expose_render_pair(
+        &self,
+        _guard: &MutexGuard<'_, ()>,
+        priority: u8,
+        next: [u32; 2],
+    ) -> Result {
+        let (fragment_ring, tiling_ring) = self.render_rings(priority)?;
+        for (ring, next) in [(&fragment_ring, next[0]), (&tiling_ring, next[1])] {
+            let [_, _, producer] = ring.cursors()?;
+            if next != (producer + 1) % WORK_RING_SLOTS {
+                return Err(EBUSY);
+            }
+        }
+        fence(Ordering::SeqCst);
+        // SAFETY: As for `RingView::cursors`.
+        unsafe { (*fragment_ring.producer).store(next[0], Ordering::Relaxed) };
+        fence(Ordering::SeqCst);
+        // SAFETY: As above.
+        unsafe { (*tiling_ring.producer).store(next[1], Ordering::Relaxed) };
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// The completion stamp of `qid` in page A.
+    pub(super) fn stamp(&self, qid: u8) -> Result<u32> {
+        if qid > super::fw::kick::QID_MAX {
+            return Err(EINVAL);
+        }
+        let base = self.views()?.stamps;
+        // SAFETY: Page A holds one word per QID up to QID_MAX; the session retains it.
+        let value = unsafe { (*base.add(usize::from(qid))).load(Ordering::Relaxed) };
+        fence(Ordering::Acquire);
+        Ok(value)
     }
 
     fn qos_view(&self) -> Result<qos::View<'_>> {

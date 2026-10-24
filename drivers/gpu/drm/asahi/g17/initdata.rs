@@ -659,15 +659,16 @@ impl InitData {
         Ok(())
     }
 
-    /// Raw views of the memory publishers share without the device mutex: every compute work
-    /// ring, the QoS table and the recovery state word. They stay valid for this session.
+    /// Raw views of the memory publishers share without the device mutex: every work ring,
+    /// the completion stamps, the QoS table and the recovery state word. They stay valid for
+    /// this session.
     pub(super) fn port_views(
         &self,
         mailbox: *const super::Mailbox,
     ) -> Result<super::port::Views> {
         use super::fw::{channels, queue::{DataMaster, Policy}};
-        let ring = |priority: u8| -> Result<super::port::RingView> {
-            let channel = channels::work_ring_index(priority, DataMaster::Compute).ok_or(EINVAL)?;
+        let ring_of = |priority: u8, engine: DataMaster| -> Result<super::port::RingView> {
+            let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
             let base = self.state_offset(Role::Primary) + abi::work_state_offset(channel);
             let state = self.object(self.cluster)?;
             let word = |offset: usize| -> Result<*const AtomicU32> {
@@ -686,12 +687,18 @@ impl InitData {
                 producer: word(abi::ChannelState::PRODUCER)?,
             })
         };
-        let mut compute = [ring(0)?; Policy::PRIORITIES as usize];
-        for (priority, view) in compute.iter_mut().enumerate().skip(1) {
-            *view = ring(priority as u8)?;
-        }
+        let rings = |engine: DataMaster| -> Result<[super::port::RingView; Policy::PRIORITIES as usize]> {
+            let mut views = [ring_of(0, engine)?; Policy::PRIORITIES as usize];
+            for (priority, view) in views.iter_mut().enumerate().skip(1) {
+                *view = ring_of(priority as u8, engine)?;
+            }
+            Ok(views)
+        };
         Ok(super::port::Views {
-            compute,
+            compute: rings(DataMaster::Compute)?,
+            tiling: rings(DataMaster::Tiling)?,
+            fragment: rings(DataMaster::Fragment)?,
+            stamps: self.object(self.stamps[0])?.word(0)?,
             qos: self
                 .qos()?
                 .pointer(0, core::mem::size_of::<super::fw::qos::Qos>())?,

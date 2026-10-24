@@ -1787,6 +1787,55 @@ impl Pair {
     }
     /// The scheduler page these queues last ran a command for, when the next
     /// publication for `context` changes the queues' owner.
+    /// The steady state in which a command may publish without the device
+    /// mutex: the graph is installed and registered at `priority`, it last ran
+    /// `context`'s scheduler, and nothing is replayed, settled, aliased or
+    /// switched on it.
+    pub(crate) fn direct_ready(&self, context: &Context, priority: u8) -> bool {
+        self.graph_started
+            && self.installed == [true; 2]
+            && self.registered == Some(priority)
+            && priority < 8
+            && self.outer_started & (1u8 << priority) != 0
+            && self.executed == context.scheduler_va()
+            && self.switch.is_none()
+            && self.owner.is_some()
+            && !self.quarantined
+            && self.terminal.is_none()
+            && self.pending_aliases.is_none()
+            && self.kick_aliases.is_none()
+            && self.prepared.is_none()
+            && self.replay.len() == 0
+            && self.displaced.is_none()
+            && self.active.room()
+    }
+    /// The render prefix of `packet` on this pair, as the registry collects it
+    /// for an owner whose only pair this is.
+    pub(crate) fn own_dependencies(&self, owner: u64, packet: &Arc<Packet>) -> Result<RenderDependencies> {
+        let mut dependencies = RenderDependencies::EMPTY;
+        let mut frontier = crate::g17::dependency::Frontier::new();
+        self.collect_dependencies(owner, packet.completion.status(), packet.order.wait_through[0], &mut frontier)?;
+        for dependency in frontier.as_slice() {
+            *dependencies.render.get_mut(dependencies.render_count).ok_or(EOVERFLOW)? = *dependency;
+            dependencies.render_count += 1;
+        }
+        if dependencies.render_count != 0
+            && matches!(&packet.command, Validated::Render { pass, .. } if pass.fragment_barriers)
+        {
+            let mut tiling = crate::g17::dependency::Frontier::new();
+            self.collect_tiling_dependencies(
+                owner,
+                packet.completion.status(),
+                packet.order.wait_through[0],
+                &mut tiling,
+            )?;
+            for dependency in tiling.as_slice() {
+                *dependencies.tiling.get_mut(dependencies.tiling_count).ok_or(EOVERFLOW)? = *dependency;
+                dependencies.tiling_count += 1;
+            }
+        }
+        Ok(dependencies)
+    }
     pub(crate) fn owner_switch_from(&self, context: &Context) -> Option<u64> {
         (self.executed != 0 && self.executed != context.scheduler_va()).then_some(self.executed)
     }
