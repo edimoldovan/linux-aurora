@@ -638,7 +638,7 @@ impl Queue {
             return None;
         }
         self.active.front().map(|active| crate::g17::timeout::Head {
-            vm: Arc::as_ptr(active.packet.completion.status()) as usize,
+            vm: active.packet.context.vm().id(),
             published: active.published,
             finished: active.observed.is_some(),
             failed: self.quarantined,

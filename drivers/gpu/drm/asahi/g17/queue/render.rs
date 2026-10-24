@@ -1009,7 +1009,7 @@ impl Pair {
             .filter(|active| active.outer_published)
             .find(|active| active.drained_result.is_none())
             .map(|active| crate::g17::timeout::Head {
-                vm: Arc::as_ptr(active.packet.completion.status()) as usize,
+                vm: active.packet.context.vm().id(),
                 published: active.published,
                 finished: false,
                 failed: self.quarantined,

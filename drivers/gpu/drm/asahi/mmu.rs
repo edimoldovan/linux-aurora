@@ -2123,8 +2123,8 @@ impl Vm {
         Ok(self)
     }
 
-    /// The identifier this VM was created with (G15 keeps per-VM state keyed by it).
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    /// The identifier this VM was created with (G15 keeps per-VM state keyed by it; G17 timeout
+    /// attribution compares and logs VMs by it).
     pub(crate) fn id(&self) -> u64 {
         self.id
     }

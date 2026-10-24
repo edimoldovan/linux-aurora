@@ -55,7 +55,8 @@ pub(crate) fn renew_execution(published: bool, enabled: bool, renewals: &mut u8)
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Head {
-    pub(crate) vm: usize,
+    /// The owning VM's [`crate::mmu::Vm::id`], one per VM status; the watchdog lines print it.
+    pub(crate) vm: u64,
     pub(crate) published: u64,
     pub(crate) finished: bool,
     /// Its queue already failed (quarantined) and holds the GPU only until the firmware drains
@@ -94,8 +95,28 @@ pub(crate) fn decide(own: Head, renewals: u8, blocker: Option<Head>) -> Decision
     }
 }
 
-pub(crate) fn classify(own: Head, renewals: u8, others: impl Iterator<Item = Head>) -> Decision {
-    decide(own, renewals, blocker(own, others))
+/// A watchdog's decision with the heads it rests on, for its log line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Verdict {
+    pub(crate) decision: Decision,
+    pub(crate) own: Head,
+    pub(crate) blocker: Option<Head>,
+}
+
+impl Verdict {
+    /// The blocker a watchdog line names: at the first deferral and once the grace has run out.
+    pub(crate) fn reported_blocker(&self, renewals: u8) -> Option<Head> {
+        self.blocker.filter(|_| renewals == 0 || self.decision != Decision::Defer)
+    }
+}
+
+pub(crate) fn attribute(own: Head, renewals: u8, others: impl Iterator<Item = Head>) -> Verdict {
+    let blocker = blocker(own, others);
+    Verdict {
+        decision: decide(own, renewals, blocker),
+        own,
+        blocker,
+    }
 }
 
 #[cfg_attr(not(test), kernel::macros::kunit_tests(asahi_g17_execution_allowance))]
@@ -150,10 +171,13 @@ mod tests {
         }
         assert!(background_stalled(Some(since), u64::MAX));
     }
-    fn head(vm: usize, published: u64, finished: bool) -> Head {
+    fn classify(own: Head, renewals: u8, others: impl Iterator<Item = Head>) -> Decision {
+        attribute(own, renewals, others).decision
+    }
+    fn head(vm: u64, published: u64, finished: bool) -> Head {
         Head { vm, published, finished, failed: false }
     }
-    fn failed(vm: usize, published: u64) -> Head {
+    fn failed(vm: u64, published: u64) -> Head {
         Head { vm, published, finished: false, failed: true }
     }
     #[test]
@@ -240,6 +264,23 @@ mod tests {
         // Among failed blockers the oldest is reported.
         let both_failed = [failed(8, 102), failed(5, 100)];
         assert_eq!(blocker(own, both_failed.into_iter()), Some(failed(5, 100)));
+    }
+    #[test]
+    fn the_watchdog_line_names_the_blocker_at_the_first_deferral_and_the_end() {
+        let own = head(9, 103, false);
+        let verdict = attribute(own, 0, [failed(5, 100)].into_iter());
+        let expected = Verdict { decision: Decision::Defer, own, blocker: Some(failed(5, 100)) };
+        assert_eq!(verdict, expected);
+        assert_eq!(verdict.reported_blocker(0), Some(failed(5, 100)));
+        assert_eq!(attribute(own, 1, [failed(5, 100)].into_iter()).reported_blocker(1), None);
+        let last = attribute(own, MAX_RENEWALS, [failed(5, 100)].into_iter());
+        assert_eq!(last.decision, Decision::Own);
+        assert_eq!(last.reported_blocker(MAX_RENEWALS), Some(failed(5, 100)));
+        let spared = attribute(own, MAX_RENEWALS, [head(5, 100, false)].into_iter());
+        assert_eq!(spared.decision, Decision::Spare);
+        assert_eq!(spared.reported_blocker(MAX_RENEWALS), Some(head(5, 100, false)));
+        // Nothing blocks: nothing to report.
+        assert_eq!(attribute(own, 0, [].into_iter()).reported_blocker(0), None);
     }
     #[test]
     fn same_vm_finished_and_later_work_do_not_block() {

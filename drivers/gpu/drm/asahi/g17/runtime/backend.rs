@@ -241,17 +241,21 @@ impl job::Backend for Backend {
         {
             return true;
         }
-        let decision = firmware.queues.render_timeout_decision(packet, renewals);
+        let verdict = firmware.queues.render_timeout_decision(packet, renewals);
+        let decision = verdict.map_or(Decision::Own, |verdict| verdict.decision);
         // As compute does: work still blocked behind another VM's older unfinished work after the
         // whole grace is innocent, so its failure must stay non-sticky. The pair's quarantine
         // extends the class to the pair's other groups.
         if decision == Decision::Spare {
             packet.completion.classify(crate::g17::recovery::Class::Spared);
         }
-        if decision != Decision::Own && (renewals == 0 || decision == Decision::Spare) {
-            dev_warn!(self.shared.dev.as_ref(),
-                "Render watchdog owner={} renewals={} decision={:?} behind earlier work of another VM\n",
-                self.owner, renewals, decision);
+        if let Some(verdict) = verdict {
+            if let Some(blocker) = verdict.reported_blocker(renewals) {
+                dev_warn!(self.shared.dev.as_ref(),
+                    "Render watchdog owner={} vm={} publication={} renewals={} decision={:?} behind earlier work of another VM: blocker_vm={} blocker_publication={} blocker_failed={}\n",
+                    self.owner, verdict.own.vm, verdict.own.published, renewals, decision,
+                    blocker.vm, blocker.published, u8::from(blocker.failed));
+            }
         }
         decision == Decision::Defer
     }

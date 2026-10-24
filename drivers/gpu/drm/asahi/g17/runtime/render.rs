@@ -989,7 +989,7 @@ impl Registry {
         &self,
         packet: &Arc<Packet>,
         renewals: u8,
-    ) -> crate::g17::timeout::Decision {
+    ) -> Option<crate::g17::timeout::Verdict> {
         let own = self
             .render
             .entries
@@ -1004,14 +1004,14 @@ impl Registry {
             .flatten()
             .filter_map(|entry| entry.queue.as_deref())
             .filter_map(|queue| queue.timeout_head());
-        match own {
-            Some(own) => crate::g17::timeout::classify(
+        // Without a head of its own the timeout is its own.
+        own.map(|own| {
+            crate::g17::timeout::attribute(
                 own,
                 renewals,
                 Iterator::chain(self.render_timeout_heads(), computes),
-            ),
-            None => crate::g17::timeout::Decision::Own,
-        }
+            )
+        })
     }
 }
 
