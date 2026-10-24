@@ -123,7 +123,11 @@ struct Graph {
     graph: KernelObject,
     context_low: KernelObject,
     context_high: KernelObject,
+    /// Announcements, which stay uncached for the firmware.
     records: KernelObject,
+    /// Configuration, predecessor and completion-wait records at the same
+    /// offsets, which the firmware reads through a cached mapping.
+    cached_records: PooledObject,
     record_ends: [Option<u32>; RECORD_SLOTS],
     reclaimed: u32,
     /// Host words of the pointer block in this firmware build.
@@ -171,6 +175,14 @@ impl Graph {
         let context_low = alloc.lower(CONTEXT_SIZE, page, prot, cpu)?;
         let context_high = alloc.kernel(CONTEXT_SIZE, page, prot, cpu)?;
         let records = alloc.kernel(RECORD_SLOTS * RECORD_STRIDE, page, prot, cpu)?;
+        let cached_records = objects.allocate(
+            alloc,
+            Family::QueueConfig,
+            RECORD_SLOTS * RECORD_STRIDE,
+            RECORD_SLOTS * RECORD_STRIDE,
+            prot,
+            cpu,
+        )?;
         Ok(Self {
             ring: Some(ring),
             preempt,
@@ -181,6 +193,7 @@ impl Graph {
             context_low,
             context_high,
             records,
+            cached_records,
             record_ends: [None; RECORD_SLOTS],
             reclaimed: 0,
             pointers,
@@ -1729,7 +1742,12 @@ impl Graph {
             if slot >= RECORD_SLOTS {
                 return Err(EINVAL);
             }
-            (&mut self.records, slot * RECORD_STRIDE + offset)
+            let object: &mut KernelObject = if offset == ANNOUNCE {
+                &mut self.records
+            } else {
+                &mut self.cached_records
+            };
+            (object, slot * RECORD_STRIDE + offset)
         } else {
             (&mut self.graph, 0x6800 + offset)
         };
