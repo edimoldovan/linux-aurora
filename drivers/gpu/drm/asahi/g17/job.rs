@@ -14,7 +14,10 @@ use kernel::{
 };
 
 pub(super) const TIMEOUT_MS: kernel::time::Msecs = super::timeout::POLL_MS;
-const RENDER_CREDITS: u32 = 32;
+/// One logical render queue owns one physical pair, whose active ring holds
+/// `RENDER_DEPTH` commands. A deeper scheduler would only park run_job in
+/// admission until a retirement; the scheduler waits for the credit instead.
+const RENDER_CREDITS: u32 = crate::hw::t8140::queues::RENDER_DEPTH as u32;
 const COMPUTE_CREDITS: u32 = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
