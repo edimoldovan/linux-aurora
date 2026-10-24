@@ -121,6 +121,10 @@ pub(crate) struct Submission {
     /// Live Member objects, plus the enqueue guard, independently of signalling.
     owners: AtomicU8,
     firmware_source: bool,
+    /// Set under the device mutex when the only member's successful retirement
+    /// is queued, before its fence is signalled off-lock: a consumer published
+    /// in between needs no wait on it.
+    retired: AtomicBool,
 }
 
 impl Submission {
@@ -135,10 +139,12 @@ impl Submission {
             error: AtomicI32::new(0),
             owners: AtomicU8::new(1),
             firmware_source,
+            retired: AtomicBool::new(false),
         }), GFP_KERNEL)
     }
     pub(super) fn source_status(&self) -> Result<bool> {
-        let complete = self.remaining.load(Ordering::Acquire) == 0;
+        let complete = self.remaining.load(Ordering::Acquire) == 0
+            || self.retired.load(Ordering::Acquire);
         let error = self.error.load(Ordering::Acquire);
         if error != 0 { return Err(super::dependency::inherited_error(Error::from_errno(error))); }
         Ok(complete)
@@ -212,6 +218,10 @@ impl Member {
     }
     pub(super) fn set_source_ready(&self, ready: Fence) { self.aggregate.source().set_ready(ready); }
     pub(super) fn note_error(&self, error: Error) -> bool { self.aggregate.source().note_error(error) }
+    pub(super) fn note_retired(&self) {
+        let source = self.aggregate.source();
+        if source.firmware_source { source.retired.store(true, Ordering::Release); }
+    }
     pub(crate) fn complete(&self, result: Result) {
         if !self.complete.swap(true, Ordering::AcqRel) {
             self.aggregate.source().member_done(&self.aggregate.0, result);

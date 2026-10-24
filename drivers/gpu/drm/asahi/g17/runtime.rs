@@ -1057,6 +1057,8 @@ impl DeferredBatch {
             Deferred::Retired(completion, Err(error)) | Deferred::Drained(completion, Err(error))
             | Deferred::FailedOwned(completion, error) | Deferred::Unpublished(completion, error) =>
                 { completion.note_input_error(*error); },
+            Deferred::Retired(completion, Ok(_)) | Deferred::Drained(completion, Ok(_)) =>
+                completion.note_source_retired(),
             _ => {},
         }
         self.values.push_within_capacity(value).map_err(|_| EIO)?;

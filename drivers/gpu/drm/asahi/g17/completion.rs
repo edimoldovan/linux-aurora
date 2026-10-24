@@ -377,6 +377,13 @@ impl Completion {
     pub(super) fn note_input_error(&self, error: Error) -> bool {
         self.output.output().member.note_error(error)
     }
+    /// Called under the device mutex as a successful retirement is queued.
+    pub(super) fn note_source_retired(&self) {
+        match self.check_source_inputs() {
+            Ok(()) => self.output.output().member.note_retired(),
+            Err(error) => { self.note_input_error(error); }
+        }
+    }
     pub(super) fn check_source_inputs(&self) -> Result {
         if let Some(sources) = &self.sources { sources.check()?; }
         Ok(())
