@@ -1000,9 +1000,9 @@ impl Pair {
                 .all(|qid| masks[usize::from(qid) / 64] & (1u64 << (qid % 64)) != 0)
         })
     }
-    /// The oldest published group, for cross-VM timeout attribution (crate::g17::timeout).
-    /// The oldest published group still running. A quarantined pair's work holds the GPU until
-    /// the firmware drains it, so it stays visible to other VMs' watchdogs, as compute does.
+    /// The oldest published group still running, for cross-VM timeout attribution
+    /// (crate::g17::timeout). A quarantined pair's work holds the GPU until the firmware drains
+    /// it, so it stays visible to other VMs' watchdogs, as compute does.
     pub(crate) fn timeout_head(&self) -> Option<crate::g17::timeout::Head> {
         self.active
             .iter()
@@ -1233,13 +1233,16 @@ impl Pair {
 
     /// Every retained group was retired and unlinked by firmware without
     /// executing (job list empty, stamps cover it, no recovery, fragment end
-    /// never written): after another VM's recovery the 25G83 firmware drops an
-    /// innocent pair's queued groups this way. Nothing of them reached their
-    /// attachments, so the same commands are published again, in order, instead
-    /// of failing their owners. Only the whole set is replayed; a replayed prefix
-    /// would run after a live successor. `grace` asks for the strict witness
-    /// twice ABANDON_GRACE_NS apart (worker polling); the render timeout, long
-    /// after publication, takes it once as its retirement does.
+    /// never written): after another VM's recovery the firmware drops an
+    /// innocent pair's queued groups this way (seen on 25G83 and 26A428).
+    /// Nothing of them reached their attachments, so the same commands are
+    /// published again, in order, instead of failing their owners. Only the
+    /// whole set is replayed; a replayed prefix would run after a live
+    /// successor. `grace` asks for the strict witness twice ABANDON_GRACE_NS
+    /// apart (worker polling); the render timeout, long after publication,
+    /// takes it once as its retirement does. A single sample can still
+    /// straddle a firmware update of the fragment end record; the cost is
+    /// that a group which did execute runs a second time (blending twice).
     fn replay_abandoned(
         &mut self,
         host: &mut impl Host,
