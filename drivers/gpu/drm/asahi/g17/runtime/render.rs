@@ -514,21 +514,10 @@ impl crate::g17::queue::render::Host for Host<'_> {
         scheduler: u64,
         policy: crate::g17::fw::queue::Policy,
     ) -> Result<crate::g17::qos::Publication> {
-        use crate::g17::qos;
-        self.firmware.queues.accounting.publish(
-            &qos::View::new(self.firmware.init.qos()?)?,
-            owner,
-            scheduler,
-            policy,
-            qos::clock,
-        )
+        self.firmware.port.qos_publish(owner, scheduler, policy)
     }
     fn qos_cancel(&mut self, publication: crate::g17::qos::Publication) -> Result {
-        use crate::g17::qos;
-        self.firmware
-            .queues
-            .accounting
-            .cancel(&qos::View::new(self.firmware.init.qos()?)?, publication)
+        self.firmware.port.qos_cancel(publication)
     }
     /// Idle descent is held for the whole first install. A point-in-time power
     /// check let the firmware gate the cores between the host's configuration
@@ -559,7 +548,7 @@ impl crate::g17::queue::render::Host for Host<'_> {
         self.firmware.queues.qids.publish(id)
     }
     fn next_publication(&mut self) -> Result<u64> {
-        self.firmware.queues.qids.next_publication()
+        Ok(self.firmware.port.next_publication())
     }
     fn publish_outer_pair(
         &mut self,
@@ -619,13 +608,11 @@ impl crate::g17::queue::render::Host for Host<'_> {
         generation: u64,
         buffer_id: u8,
     ) -> Result {
-        use crate::g17::qos;
         let queues = &mut self.firmware.queues;
         let next = queues.render.pools.completed(pool_id, generation)?;
         queues.buffers.can_release(buffer_id)?;
-        let view = qos::View::new(self.firmware.init.qos()?)?;
         if let Some(owners) = owners {
-            queues.accounting.complete(&view, &owners)?;
+            self.firmware.port.qos_complete(&owners)?;
         }
         queues.render.pools.commit_completed(pool_id, next);
         queues.buffers.release(buffer_id)

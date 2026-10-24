@@ -214,6 +214,10 @@ impl Context {
         self.render_seen.load(Ordering::Acquire)
             || self.compute_binding_hint.load(Ordering::Relaxed)
     }
+    /// This logical queue has submitted render work, so its compute may have a render prefix.
+    pub(crate) fn render_seen(&self) -> bool {
+        self.render_seen.load(Ordering::Acquire)
+    }
     pub(crate) fn note_render(&self) {
         if !self.render_seen.load(Ordering::Relaxed) {
             self.render_seen.store(true, Ordering::Release);

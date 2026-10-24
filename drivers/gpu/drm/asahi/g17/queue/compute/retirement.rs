@@ -262,16 +262,17 @@ impl Batch {
         request.observed = Some(Observation { timestamps });
         Ok(())
     }
+    /// A command published after this batch staged its queue's requests was not part of the
+    /// ring snapshot: it stays unobserved until a later batch.
     pub(crate) fn take(&mut self, ticket: &Ticket) -> Result<Option<Observation>> {
         let &(start, count) = self.slots.get(ticket.qid as usize).ok_or(EINVAL)?;
-        let request = self
+        Ok(self
             .requests
             .get_mut(start..start + count)
             .ok_or(EIO)?
             .iter_mut()
             .find(|r| r.descriptor == ticket.descriptor && r.kick == ticket.kick)
-            .ok_or(EIO)?;
-        Ok(request.observed.take())
+            .and_then(|request| request.observed.take()))
     }
 }
 

@@ -225,9 +225,9 @@ impl recovery::Queues for Service<'_> {
 impl Firmware {
     fn release_compute_witnesses(&mut self, deferred: &mut DeferredBatch) -> Result {
         let state = recovery::Memory::recovery_state(&self.init)?;
-        let view = crate::g17::qos::View::new(self.init.qos()?)?;
+        let port = &self.port;
         let registry = &mut self.queues;
-        for queue in registry
+        for mut queue in registry
             .compute
             .iter_mut()
             .flatten()
@@ -235,7 +235,7 @@ impl Firmware {
         {
             queue.release_witnessed(
                 state,
-                |owner| registry.accounting.complete(&view, &[owner]),
+                |owner| port.qos_complete(&[owner]),
                 &mut |event| deferred.push(event),
             )?;
         }
@@ -276,7 +276,11 @@ impl Firmware {
         };
         let result = recovery::service(&mut service, || {
             shared.crashed.load(core::sync::atomic::Ordering::Acquire)
-        })?;
+        });
+        // Publishers without the device mutex stamp their tickets with this
+        // mirror; they rejoin only after preparation admission reopens.
+        service.firmware.port.set_generation(service.firmware.recovery.generation());
+        let result = result?;
         if let Some(error) = result.target_error {
             dev_warn!(
                 shared.dev.as_ref(),

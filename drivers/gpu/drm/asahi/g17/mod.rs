@@ -38,6 +38,7 @@ mod job;
 mod capacity;
 mod kick;
 mod object;
+mod port;
 pub(crate) mod power;
 mod preparation;
 mod qos;
@@ -395,13 +396,48 @@ impl rtkit::Operations for RoleOps {
     }
 }
 
+/// The RTKit of one coprocessor. The mailbox driver serializes its own register writes; this
+/// lock only serializes the exclusive borrows the RTKit API takes, so that publishers holding
+/// different locks can ring the same doorbell.
+#[pin_data]
+struct Mailbox {
+    #[pin]
+    lock: Mutex<()>,
+    rtkit: core::cell::UnsafeCell<rtkit::RtKit<RoleOps>>,
+}
+
+// SAFETY: Every access to the RTKit goes through `with`, which holds the lock.
+unsafe impl Sync for Mailbox {}
+
+impl Mailbox {
+    fn new(rtkit: rtkit::RtKit<RoleOps>) -> Result<Pin<KBox<Self>>> {
+        KBox::pin_init(
+            pin_init!(Self {
+                lock <- new_mutex!((), "g17::Mailbox::lock"),
+                rtkit: core::cell::UnsafeCell::new(rtkit),
+            }),
+            GFP_KERNEL,
+        )
+    }
+
+    fn with<R>(&self, f: impl FnOnce(Pin<&mut rtkit::RtKit<RoleOps>>) -> R) -> R {
+        let _guard = self.lock.lock();
+        // SAFETY: The lock excludes every other borrow of the RTKit.
+        f(Pin::new(unsafe { &mut *self.rtkit.get() }))
+    }
+
+    fn send(&self, endpoint: u8, message: u64) -> Result {
+        self.with(|rtkit| rtkit.send_message(endpoint, message))
+    }
+}
+
 /// A running firmware coprocessor.
 ///
 /// Dropping it stops the CPU before RTKit and the crash log buffer go away.
 struct Coprocessor {
     cpu: regs::CpuControl,
     running: bool,
-    rtkit: rtkit::RtKit<RoleOps>,
+    rtkit: Pin<KBox<Mailbox>>,
     state: Arc<RoleState>,
     _crash_buffer: Option<KernelObject>,
 }
@@ -456,7 +492,7 @@ impl Coprocessor {
         Ok(Coprocessor {
             cpu: regs::CpuControl::new(pdev, index)?,
             running: false,
-            rtkit: Self::receiver(dev, index, &state)?,
+            rtkit: Mailbox::new(Self::receiver(dev, index, &state)?)?,
             state,
             _crash_buffer: crash_buffer,
         })
@@ -485,19 +521,20 @@ impl Coprocessor {
     fn boot(&mut self) -> Result {
         self.cpu.start()?;
         self.running = true;
-        Pin::new(&mut self.rtkit).boot()
+        self.rtkit.with(|rtkit| rtkit.boot())
     }
 
     /// Starts the firmware endpoints and hands the firmware its initialization root. An
     /// acknowledgment message is awaited here; one in status A is the caller's to poll.
     fn init(&mut self, root_va: u64, ack: fw::variant::InitAck) -> Result {
-        let mut rtkit = Pin::new(&mut self.rtkit);
-        rtkit.as_mut().start_endpoint(EP_FIRMWARE)?;
-        rtkit.as_mut().start_endpoint(EP_DOORBELL)?;
-        rtkit.send_message(
-            EP_FIRMWARE,
-            MSG_INITDATA | (root_va & MSG_INITDATA_ADDR_MASK),
-        )?;
+        self.rtkit.with(|mut rtkit| {
+            rtkit.as_mut().start_endpoint(EP_FIRMWARE)?;
+            rtkit.as_mut().start_endpoint(EP_DOORBELL)?;
+            rtkit.send_message(
+                EP_FIRMWARE,
+                MSG_INITDATA | (root_va & MSG_INITDATA_ADDR_MASK),
+            )
+        })?;
         match ack {
             fw::variant::InitAck::Message => self.state.wait_for_ack(),
             fw::variant::InitAck::Status => Ok(()),
@@ -505,8 +542,8 @@ impl Coprocessor {
     }
 
     /// Sends a host notification to the firmware.
-    fn notify(&mut self, msg: u64) -> Result {
-        Pin::new(&mut self.rtkit).send_message(EP_DOORBELL, msg)
+    fn notify(&self, msg: u64) -> Result {
+        self.rtkit.send(EP_DOORBELL, msg)
     }
 
     /// Stops the CPU. The firmware keeps its state, but no longer runs.
@@ -573,6 +610,10 @@ struct Firmware {
     secondary: Option<Coprocessor>,
     primary: Coprocessor,
     bridge: Bridge,
+    /// Publication state shared with publishers that do not hold the device mutex.
+    port: Arc<port::Port>,
+    /// Fast-path submissions already accounted by the idle check.
+    seen_submissions: u64,
     rings: channel::Rings,
     recovery: recovery::State,
     effort: power::Effort,
@@ -647,12 +688,13 @@ impl Firmware {
     }
 
     fn apply_effort(&mut self, effort: u32) -> Result {
-        Self::apply_shared_effort(&self.init, &mut self.effort, effort)
+        Self::apply_shared_effort(&self.init, &mut self.effort, &self.port, effort)
     }
 
     fn apply_shared_effort(
         init: &initdata::InitData,
         state: &mut power::Effort,
+        port: &port::Port,
         effort: u32,
     ) -> Result {
         if state.applied() == effort && init.effort()? == effort {
@@ -660,21 +702,35 @@ impl Firmware {
         }
         init.publish_effort(effort)?;
         state.did_apply(effort);
+        port.set_effort_full(effort == power::FULL_EFFORT);
         Ok(())
     }
 
     /// Returns the delay in ns for a follow-up idle check. Queue owners report only submitted,
-    /// unretired work; quarantined work retaining mappings is excluded.
+    /// unretired work; quarantined work retaining mappings is excluded. Submissions published
+    /// without the device mutex count as activity, and a clear that races one is abandoned.
     fn idle_check(&mut self, now_ns: u64, in_flight: bool) -> Result<Option<u64>> {
-        let effort = match self.effort.idle(now_ns, in_flight) {
+        let submissions = self.port.submissions();
+        let submitted = submissions != self.seen_submissions;
+        self.seen_submissions = submissions;
+        if submitted {
+            self.effort.submit();
+        }
+        let effort = match self.effort.idle(now_ns, in_flight || submitted) {
             power::IdleAction::None => None,
             power::IdleAction::Clear => {
+                self.port.set_effort_full(false);
+                if self.port.submissions() != submissions {
+                    self.port.set_effort_full(true);
+                    self.effort.submit();
+                    return Ok(Some(power::IDLE_HOLD_NS));
+                }
                 self.apply_effort(0)?;
                 None
             }
             power::IdleAction::Recheck(delay) => Some(delay),
         };
-        Ok(match (effort, self.idle_hold(now_ns, in_flight)) {
+        Ok(match (effort, self.idle_hold(now_ns, in_flight || submitted)) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         })
@@ -801,6 +857,8 @@ struct Shared {
     /// Counts `changed` notifications, so that a waiter which checked under
     /// the device mutex can tell whether it already missed one.
     changes: AtomicU64,
+    /// The port of the session in `state`; null before boot and once detachment begins.
+    port: core::sync::atomic::AtomicPtr<port::Port>,
 }
 
 impl_has_work! {
@@ -898,6 +956,20 @@ impl Shared {
 
     fn changes(&self) -> u64 {
         self.changes.load(Ordering::Acquire)
+    }
+
+    /// The session's port, valid while `lease` is held: shutdown and device loss join every
+    /// lease before they detach the session.
+    fn port<'a>(&self, lease: &'a preparation::Lease) -> Option<&'a port::Port> {
+        let _ = lease;
+        // SAFETY: The pointer is published before the session becomes reachable and cleared
+        // only after every lease has been joined, so it names a live port for 'a.
+        unsafe { self.port.load(Ordering::Acquire).as_ref() }
+    }
+
+    /// Called after joining every preparation lease, before the session is detached.
+    fn forget_port(&self) {
+        self.port.store(core::ptr::null_mut(), Ordering::Release);
     }
 
     /// Queues the event worker. Callable from any context.
@@ -1081,6 +1153,7 @@ impl Gpu {
                 state <- new_mutex!(None, "g17::Shared::state"),
                 changed <- new_condvar!("g17::Shared::changed"),
                 changes: AtomicU64::new(0),
+                port: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             }),
             GFP_KERNEL,
         )?;
@@ -1103,6 +1176,9 @@ impl Gpu {
             GFP_KERNEL,
         )?;
         let firmware = Self::boot(pdev, dev, cfg, regs, geometry, &gpu.shared)?;
+        gpu.shared
+            .port
+            .store(Arc::as_ptr(&firmware.port).cast_mut(), Ordering::Release);
         *gpu.shared.state.lock() = Some(firmware);
         gpu.shared.queue_events();
         Ok(gpu)
@@ -1233,6 +1309,8 @@ impl Gpu {
                 secondary,
                 primary,
                 bridge,
+                port: port::Port::new()?,
+                seen_submissions: 0,
                 rings: channel::Rings::new(),
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
@@ -1279,6 +1357,8 @@ impl Gpu {
         if let Some(root_entries) = root_entries {
             session.uat.confirm_firmware_root_entries(root_entries)?;
         }
+        let mailbox: *const Mailbox = &*session.primary.rtkit;
+        session.port.attach(session.init.port_views(mailbox)?)?;
         session.uat.mirror_secondary_root()?;
         if cfg.fabric_bridge {
             session.bridge.regs.enable_g17_gating()?;

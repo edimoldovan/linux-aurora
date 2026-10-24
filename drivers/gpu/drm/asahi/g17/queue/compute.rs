@@ -2351,6 +2351,11 @@ impl Queue {
         Ok(self.reusable())
     }
 
+    /// The queue's first command has been published: its identity and configuration exist.
+    pub(crate) fn installed(&self) -> bool {
+        self.installed
+    }
+
     /// An open client's idle channel that [`Self::share_idle`] can hand over.
     pub(crate) fn shareable(&self) -> bool {
         self.installed && self.owner.is_some() && self.retirement_ready

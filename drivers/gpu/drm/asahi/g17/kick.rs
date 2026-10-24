@@ -87,7 +87,6 @@ struct Identity {
 pub(crate) struct QueueIds {
     entries: [Option<Identity>; QID_COUNT],
     initial_render: [Option<Id>; 2],
-    publication: u64,
     leased: usize,
     /// First QID the host may use ([`crate::g17::fw::Variant::qid_floor`]).
     floor: usize,
@@ -98,7 +97,6 @@ impl QueueIds {
         kernel::try_init!(Self {
             entries <- pin_init::init_array_from_fn(|_| None),
             initial_render: [None; 2],
-            publication: 0,
             leased: 0,
             // The reserve must keep render capacity above the floor.
             floor: if floor < FULL_RENDER_RESERVE { floor } else { return Err(EINVAL) },
@@ -237,13 +235,6 @@ impl QueueIds {
             self.leased += 1;
         }
         Ok(id)
-    }
-
-    /// Ordered under the device mutex; no atomic operation on the submission path. Compute and
-    /// render publications share it, so a watchdog can order work across both engines.
-    pub(crate) fn next_publication(&mut self) -> Result<u64> {
-        self.publication = self.publication.checked_add(1).ok_or(EOVERFLOW)?;
-        Ok(self.publication)
     }
 
     /// Call after preflighting the complete installation, before any address

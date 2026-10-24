@@ -129,14 +129,6 @@ impl WorkPublication<'_> {
             );
         }
     }
-
-    fn commit(self) -> u32 {
-        self.copy_record();
-        fence(Ordering::SeqCst);
-        self.producer.store(self.next, Ordering::Relaxed);
-        fence(Ordering::SeqCst);
-        self.next
-    }
 }
 
 /// Session-long storage and mappings. Aliases are released before their backing objects.
@@ -516,7 +508,7 @@ impl InitData {
         let engine = match record.data_master {
             0 => DataMaster::Tiling,
             1 => DataMaster::Fragment,
-            2 => DataMaster::Compute,
+            // Compute publications reserve their slots through the port.
             _ => return Err(EINVAL),
         };
         let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
@@ -567,16 +559,6 @@ impl InitData {
             return Err(EINVAL);
         }
         Ok(values)
-    }
-
-    /// Inner queue records must be visible before this outer publication. The returned
-    /// producer is the retained consumer witness for this slot.
-    pub(super) fn publish_work(
-        &self,
-        priority: u8,
-        record: &super::fw::channels::WorkSlot,
-    ) -> Result<u32> {
-        Ok(self.work_publication(priority, record)?.commit())
     }
 
     /// Validate both destinations before exposing fragment, then tiling. The accounting token
@@ -675,6 +657,49 @@ impl InitData {
         tiling.producer.store(tiling.next, Ordering::Relaxed);
         fence(Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Raw views of the memory publishers share without the device mutex: every compute work
+    /// ring, the QoS table and the recovery state word. They stay valid for this session.
+    pub(super) fn port_views(
+        &self,
+        mailbox: *const super::Mailbox,
+    ) -> Result<super::port::Views> {
+        use super::fw::{channels, queue::{DataMaster, Policy}};
+        let ring = |priority: u8| -> Result<super::port::RingView> {
+            let channel = channels::work_ring_index(priority, DataMaster::Compute).ok_or(EINVAL)?;
+            let base = self.state_offset(Role::Primary) + abi::work_state_offset(channel);
+            let state = self.object(self.cluster)?;
+            let word = |offset: usize| -> Result<*const AtomicU32> {
+                Ok(state.word(base + offset)?)
+            };
+            Ok(super::port::RingView {
+                slots: self.object(self.bundle)?.pointer(
+                    abi::work_ring_offset(channel),
+                    channels::WORK_RING_SLOTS as usize
+                        * core::mem::size_of::<channels::WorkSlot>(),
+                )?,
+                consumers: [
+                    word(abi::ChannelState::CONSUMER)?,
+                    word(abi::ChannelState::UNK_10)?,
+                ],
+                producer: word(abi::ChannelState::PRODUCER)?,
+            })
+        };
+        let mut compute = [ring(0)?; Policy::PRIORITIES as usize];
+        for (priority, view) in compute.iter_mut().enumerate().skip(1) {
+            *view = ring(priority as u8)?;
+        }
+        Ok(super::port::Views {
+            compute,
+            qos: self
+                .qos()?
+                .pointer(0, core::mem::size_of::<super::fw::qos::Qos>())?,
+            recovery: self
+                .object(self.cluster)?
+                .word(abi::private::STATUS_B + abi::PrimaryStatusB::RECOVERY_STATE)?,
+            mailbox,
+        })
     }
 
     /// Snapshot the shared compute completion ring once per service transaction. The queue

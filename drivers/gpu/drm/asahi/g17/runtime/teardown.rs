@@ -115,7 +115,7 @@ impl Host for Service<'_> {
         self.compute
             .iter()
             .flatten()
-            .filter_map(|entry| entry.queue.as_ref())
+            .filter_map(|entry| entry.queue.as_deref())
             .all(|queue| queue.idle_for_context(context) && !queue.switching_from(context))
     }
     fn flists_released(&self, context: &Arc<Context>) -> bool {
