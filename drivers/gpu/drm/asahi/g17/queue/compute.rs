@@ -30,6 +30,12 @@ const DESCRIPTORS: usize = 32;
 const GRAPH_SIZE: usize = 0x8000;
 const CONTEXT_SIZE: usize = 0x20000;
 const RECORD_STRIDE: usize = 0x1000;
+const NATIVE_WAIT_OFFSET: usize = 0x900;
+const NATIVE_WAIT_STRIDE: usize = 0x60;
+// A submission can name every physical compute channel. Keep the complete
+// wait list inside its own cached slot, including the last retained slot.
+const CACHED_RECORD_STRIDE: usize = (NATIVE_WAIT_OFFSET
+    + crate::g17::kick::COMPUTE_CHANNELS * NATIVE_WAIT_STRIDE).next_power_of_two();
 const CONFIG: usize = 0;
 const ANNOUNCE: usize = 0x800;
 const PREDECESSOR: usize = 0x400;
@@ -193,8 +199,8 @@ impl Graph {
         let cached_records = objects.allocate(
             alloc,
             Family::QueueConfig,
-            RECORD_SLOTS * RECORD_STRIDE,
-            RECORD_SLOTS * RECORD_STRIDE,
+            RECORD_SLOTS * CACHED_RECORD_STRIDE,
+            RECORD_SLOTS * CACHED_RECORD_STRIDE,
             prot,
             cpu,
         )?;
@@ -1197,6 +1203,32 @@ mod admission_tests {
     use super::*;
 
     #[test]
+    fn complete_native_wait_list_fits_every_cached_slot() {
+        let waits = crate::g17::kick::COMPUTE_CHANNELS;
+        for slot in 0..RECORD_SLOTS {
+            for index in 0..waits {
+                let start = record_start(slot, NATIVE_WAIT_OFFSET + index * NATIVE_WAIT_STRIDE,
+                    NATIVE_WAIT_STRIDE, CACHED_RECORD_STRIDE).unwrap();
+                assert!(start >= slot * CACHED_RECORD_STRIDE);
+                assert!(start + NATIVE_WAIT_STRIDE <= (slot + 1) * CACHED_RECORD_STRIDE);
+            }
+        }
+    }
+
+    #[test]
+    fn record_window_cannot_overwrite_the_next_slot() {
+        // The nineteenth wait used to cross the old slot boundary silently.
+        let offset = NATIVE_WAIT_OFFSET + 18 * NATIVE_WAIT_STRIDE;
+        assert_eq!(record_start(0, offset, NATIVE_WAIT_STRIDE, RECORD_STRIDE), Err(EINVAL));
+        assert!(record_start(0, offset, NATIVE_WAIT_STRIDE, CACHED_RECORD_STRIDE).is_ok());
+        assert_eq!(record_start(RECORD_SLOTS, 0, 1, CACHED_RECORD_STRIDE), Err(EINVAL));
+        assert_eq!(record_start(0, usize::MAX, 1, CACHED_RECORD_STRIDE), Err(EINVAL));
+        assert_eq!(record_start(0, CACHED_RECORD_STRIDE, 1, CACHED_RECORD_STRIDE), Err(EINVAL));
+        assert_eq!(record_start(0, CACHED_RECORD_STRIDE - 1, 1, CACHED_RECORD_STRIDE),
+            Ok(CACHED_RECORD_STRIDE - 1));
+    }
+
+    #[test]
     fn retained_ring_pressure_waits_without_discarding_work() {
         let mut active = Fifo::new();
         for sequence in 0..IN_FLIGHT {
@@ -1760,6 +1792,15 @@ impl Queue {
     }
 }
 
+/// Validate the individual slot before deriving an offset into its allocation.
+/// Allocation-wide checks cannot detect a write into the following live slot.
+fn record_start(slot: usize, offset: usize, window: usize, stride: usize) -> Result<usize> {
+    if slot >= RECORD_SLOTS || offset > stride || window > stride - offset {
+        return Err(EINVAL);
+    }
+    slot.checked_mul(stride).and_then(|start| start.checked_add(offset)).ok_or(EINVAL)
+}
+
 impl Graph {
     fn record<T: Copy>(
         &mut self,
@@ -1769,17 +1810,15 @@ impl Graph {
         value: T,
     ) -> Result<u64> {
         let (object, start) = if let Some(slot) = slot {
-            if slot >= RECORD_SLOTS {
-                return Err(EINVAL);
-            }
-            let object: &mut KernelObject = if offset == ANNOUNCE {
-                &mut self.records
+            let (object, stride): (&mut KernelObject, usize) = if offset == ANNOUNCE {
+                (&mut self.records, RECORD_STRIDE)
             } else {
-                &mut self.cached_records
+                (&mut self.cached_records, CACHED_RECORD_STRIDE)
             };
-            (object, slot * RECORD_STRIDE + offset)
+            (object, record_start(slot, offset, window, stride)?)
         } else {
-            (&mut *self.graph, 0x6800 + offset)
+            let start = record_start(0, offset, window, GRAPH_SIZE - 0x6800)?;
+            (&mut *self.graph, 0x6800 + start)
         };
         if core::mem::size_of::<T>() > window {
             return Err(EINVAL);
@@ -2031,7 +2070,8 @@ impl Queue {
             for (index, wait) in native.iter().enumerate() {
                 let record = wait.bytes(crate::g17::fw::stamp_value(kick_timestamp.get() as u32),
                     packet.order.sequence);
-                let address = self.graph.record(record_slot, 0x900 + index * 0x60, 0x60, record)?;
+                let address = self.graph.record(record_slot, NATIVE_WAIT_OFFSET + index * NATIVE_WAIT_STRIDE,
+                    NATIVE_WAIT_STRIDE, record)?;
                 wait_vas.push(address, GFP_KERNEL)?;
             }
             let prepared_kick = self.kick.prepare_entry(&kick_args)?;
