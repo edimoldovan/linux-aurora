@@ -1461,7 +1461,9 @@ impl super::Firmware {
             let Some((sequence, dependency, stamp_va, event_slot, hold)) = found else {
                 return Err(EAGAIN);
             };
-            merged.insert(sequence, dependency)?;
+            // The completion-wait record orders the consumer behind its
+            // source; naming the source in the kick entry as well only adds
+            // a second, slower wait and a predecessor record.
             let wait = super::sync_input::NativeWait { sequence, dependency, stamp_va, event_slot };
             if let Some(old) = native.iter_mut().find(|old|
                 old.dependency.qid() == dependency.qid()) {
