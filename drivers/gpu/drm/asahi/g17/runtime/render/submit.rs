@@ -462,7 +462,15 @@ impl crate::g17::Firmware {
         {
             return Err(EBUSY);
         }
-        let dependencies = self.queues.render_dependencies(owner, packet, state)?;
+        let mut dependencies = self.queues.render_dependencies(owner, packet, state)?;
+        if let Some(footprint) = packet.footprint.as_ref() {
+            dependencies.hazard_count = self.queues.admission.publication_barriers(
+                owner,
+                slot,
+                footprint,
+                &mut dependencies.hazards,
+            )?;
+        }
         let pair = self.queues.render.entry(slot)?.pair.as_ref().ok_or(EIO)?;
         // An owner change taken from a live owner which closed meanwhile: its
         // first command waits until that scheduler's release has been consumed.

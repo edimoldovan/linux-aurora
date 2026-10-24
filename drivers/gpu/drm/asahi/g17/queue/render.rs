@@ -46,6 +46,9 @@ pub(crate) struct RenderDependencies {
     pub(crate) tiling: [KickDependency; 2],
     pub(crate) tiling_count: usize,
     pub(crate) compute: Option<KickDependency>,
+    /// Fragment kicks of other pairs' overlapping same-VM renders.
+    pub(crate) hazards: [KickDependency; crate::g17::hazard::PUBLICATION_BARRIERS],
+    pub(crate) hazard_count: usize,
 }
 
 impl RenderDependencies {
@@ -55,6 +58,8 @@ impl RenderDependencies {
         tiling: [KickDependency::ZERO; 2],
         tiling_count: 0,
         compute: None,
+        hazards: [KickDependency::ZERO; crate::g17::hazard::PUBLICATION_BARRIERS],
+        hazard_count: 0,
     };
     pub(crate) fn render(&self) -> &[KickDependency] {
         &self.render[..self.render_count]
@@ -484,7 +489,7 @@ impl Pair {
 struct RenderBarriers {
     tiling: [KickDependency; 3],
     tiling_count: usize,
-    fragment: [KickDependency; 3],
+    fragment: [KickDependency; 3 + crate::g17::hazard::PUBLICATION_BARRIERS],
     fragment_count: usize,
 }
 
@@ -495,7 +500,7 @@ fn render_barriers(
 ) -> RenderBarriers {
     let mut tiling_barriers = [KickDependency::ZERO; 3];
     let mut tiling_count = 0;
-    let mut fragment_barriers = [own_tiling; 3];
+    let mut fragment_barriers = [own_tiling; 3 + crate::g17::hazard::PUBLICATION_BARRIERS];
     let mut fragment_count = 1;
     for dependency in dependencies.render() {
         if fragment_stage {
@@ -520,6 +525,11 @@ fn render_barriers(
     if let Some(compute) = dependencies.compute {
         tiling_barriers[tiling_count] = compute;
         tiling_count += 1;
+    }
+    // Only tile stores overlap: the tiling kick stays concurrent.
+    for hazard in &dependencies.hazards[..dependencies.hazard_count] {
+        fragment_barriers[fragment_count] = *hazard;
+        fragment_count += 1;
     }
     RenderBarriers {
         tiling: tiling_barriers,
@@ -840,6 +850,9 @@ impl Pair {
             }
         };
         self.ordinal = next_ordinal;
+        if let Some(fragment) = KickDependency::new(qids[1], kicks[1]) {
+            packet.completion.note_render_publication(fragment);
+        }
         self.cursors = windows.map(|window| window.target());
         for stage in 0..2 {
             if present[stage] {

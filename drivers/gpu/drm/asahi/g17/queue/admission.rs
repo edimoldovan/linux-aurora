@@ -9,6 +9,7 @@
 //! a graph or waiting for GPU work. Capacity waiters sleep on the release event.
 
 use crate::g17::{
+    fw::kick::KickDependency,
     hazard::{self, Footprint, Plan},
     job::Packet,
 };
@@ -43,6 +44,9 @@ struct InFlight {
     slot: Option<u8>,
     ticket: u64,
     footprint: Arc<Footprint>,
+    /// Fragment kick of the published render; a later same-VM overlap of
+    /// another pair waits for it in firmware.
+    fragment: Option<KickDependency>,
 }
 
 const QUARANTINE_WAIT_MS: u32 = 1000;
@@ -332,11 +336,18 @@ impl State {
                     slot,
                     ticket,
                     footprint: request.footprint.clone(),
+                    fragment: None,
                 },
                 GFP_KERNEL,
             )
             .ok()?;
         Some((owner, request.sequence))
+    }
+
+    fn position(&self, slot: u8, (owner, sequence): (u64, u64)) -> Option<usize> {
+        self.footprints.iter().position(|entry| {
+            entry.slot == Some(slot) && entry.owner == owner && entry.sequence == sequence
+        })
     }
 
     fn forget_waiter(&mut self, ticket: Option<u64>) {
@@ -705,13 +716,72 @@ impl RenderLease {
         self.rehabilitate_after_processor_stop();
     }
 }
+impl RenderLease {
+    /// Called under the device mutex once the render's kicks are committed,
+    /// including a replay, which supersedes the earlier kick.
+    pub(crate) fn note_publication(&self, fragment: KickDependency) {
+        let Some(record) = self.record else {
+            return;
+        };
+        let mut state = self.pool.state.lock();
+        if let Some(index) = state.position(self.slot, record) {
+            state.footprints[index].fragment = Some(fragment);
+        }
+    }
+}
+
+impl Pool {
+    /// Under the device mutex, which orders every publication: the newest
+    /// published fragment kick of each other pair whose live same-VM render
+    /// overlaps `footprint`. Quarantined pairs are skipped as in admission.
+    pub(crate) fn publication_barriers(
+        &self,
+        owner: u64,
+        slot: u8,
+        footprint: &Footprint,
+        barriers: &mut [KickDependency; hazard::PUBLICATION_BARRIERS],
+    ) -> Result<usize> {
+        let state = self.state.lock();
+        let mut slots = [0u8; hazard::PUBLICATION_BARRIERS];
+        let mut count = 0;
+        for entry in state.footprints.iter() {
+            let (Some(other), Some(fragment)) = (entry.slot, entry.fragment) else {
+                continue;
+            };
+            if other == slot
+                || entry.owner == owner
+                || state.quarantined & (1u64 << other) != 0
+                || !footprint.same_vm(&entry.footprint)
+                || !footprint.overlaps(&entry.footprint)
+            {
+                continue;
+            }
+            match slots[..count].iter().position(|known| *known == other) {
+                // One fragment ring completes in kick order; same QID, so the
+                // word orders by timestamp.
+                Some(index) => {
+                    if fragment.word() > barriers[index].word() {
+                        barriers[index] = fragment;
+                    }
+                }
+                // Admission bounds the pairs; see hazard::plan.
+                None if count == hazard::PUBLICATION_BARRIERS => return Err(EBUSY),
+                None => {
+                    slots[count] = other;
+                    barriers[count] = fragment;
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+}
+
 impl Drop for RenderLease {
     fn drop(&mut self) {
         let mut state = self.pool.state.lock();
-        if let Some((owner, sequence)) = self.record {
-            if let Some(index) = state.footprints.iter().position(|entry| {
-                entry.slot == Some(self.slot) && entry.owner == owner && entry.sequence == sequence
-            }) {
+        if let Some(record) = self.record {
+            if let Some(index) = state.position(self.slot, record) {
                 state.footprints.swap_remove(index);
             }
         }

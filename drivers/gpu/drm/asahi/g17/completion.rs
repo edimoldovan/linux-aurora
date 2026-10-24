@@ -547,6 +547,13 @@ impl Completion {
             .map(super::queue::admission::RenderLease::slot)
     }
 
+    /// Called under the device mutex once the render's kicks are committed.
+    pub(crate) fn note_render_publication(&self, fragment: super::fw::kick::KickDependency) {
+        if let Some(lease) = self.render.lock().as_ref() {
+            lease.note_publication(fragment);
+        }
+    }
+
     /// Called under the device mutex before deferring the error signal.
     pub(crate) fn quarantine_render(&self) {
         if let Some(lease) = self.render.lock().as_ref() {
