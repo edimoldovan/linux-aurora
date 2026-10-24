@@ -19,6 +19,16 @@ use kernel::{
 
 pub(crate) struct CompletionFence;
 
+unsafe extern "C" {
+    fn asahi_g17_signal_fence(fence: *mut bindings::dma_fence);
+}
+
+fn signal_exported(fence: &dyn RawDmaFence) {
+    // SAFETY: The borrowed fence remains owned throughout synchronous signaling.
+    // Ready completion scopes are drained iteratively after its lock is released.
+    unsafe { asahi_g17_signal_fence(fence.raw()) };
+}
+
 #[vtable]
 impl FenceOps for CompletionFence {
     fn get_driver_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
@@ -52,6 +62,7 @@ pub(crate) fn allocation_failure(contexts: &FenceContexts) -> Result<Fence> {
 /// Submission never owns this fence, so exported references cannot form a cycle.
 pub(crate) struct ExportFence {
     source: Option<Arc<Submission>>,
+    scoped: bool,
 }
 static EXPORT_OPS: AtomicUsize = AtomicUsize::new(0);
 
@@ -65,7 +76,7 @@ impl FenceOps for ExportFence {
 
 #[inline(never)]
 fn export_fallback(contexts: &FenceContexts) -> Result<UniqueFence<ExportFence>> {
-    let fence = contexts.new_fence(0, ExportFence { source: None })?;
+    let fence = contexts.new_fence(0, ExportFence { source: None, scoped: false })?;
     // SAFETY: Unique, initialized and still private. Only this constructor
     // publishes ExportFence objects; its payload is immutable after sharing.
     let ops = unsafe {
@@ -179,7 +190,7 @@ impl Submission {
             let error = self.error.load(Ordering::Acquire);
             if error != 0 { fence.set_error(Error::from_errno(error)); }
             else { self.release_state(); }
-            fence.signal();
+            if fence.scoped { signal_exported(fence); } else { fence.signal(); }
         }
     }
 }
@@ -332,30 +343,42 @@ pub(crate) struct Outputs {
     input_count: usize,
     submission: Option<Aggregate>,
     result: Result,
+    cumulative: Option<super::sync_output::SignalBundle>,
 }
 impl Outputs {
     pub(crate) fn new(contexts: &FenceContexts, mut syncs: KVec<SyncItem>,
         input_count: usize, allocation_failure: &Fence) -> Result<Self>
     {
         if input_count > syncs.len() { return Err(EINVAL); }
+        let mut cumulative = syncs.iter_mut().find_map(|sync| sync.cumulative.take());
         let fallback = match export_fallback(contexts) {
             Ok(fence) => fence,
             Err(error) => {
-                install(syncs.drain(input_count..), allocation_failure);
+                if let Some(bundle) = &mut cumulative {
+                    bundle.fail(allocation_failure);
+                } else {
+                    install(syncs.drain(input_count..), allocation_failure);
+                }
                 return Err(error);
             }
         };
         Ok(Self { fallback: Some(fallback), syncs, input_count,
-            submission: None, result: Err(ECANCELED) })
+            submission: None, result: Err(ECANCELED), cumulative })
     }
     pub(crate) fn inputs(&self) -> &[SyncItem] { &self.syncs[..self.input_count] }
     pub(crate) fn publish(&mut self, context: Arc<Context>, firmware_source: bool) -> Result<Aggregate> {
         let source = Submission::new(context, firmware_source)?;
         let mut fence = self.fallback.take().ok_or(EINVAL)?;
         fence.source = Some(source);
+        fence.scoped = self.cumulative.is_some();
         let submission = Aggregate(fence.into());
-        install(self.syncs.drain(self.input_count..), &submission.fence());
         self.submission = Some(submission.clone());
+        if let Some(bundle) = &mut self.cumulative {
+            bundle.publish(&submission.fence())?;
+            self.syncs.truncate(self.input_count);
+        } else {
+            install(self.syncs.drain(self.input_count..), &submission.fence());
+        }
         Ok(submission)
     }
     pub(crate) fn finish(mut self, result: Result) -> Result { self.result = result; result }
@@ -363,12 +386,19 @@ impl Outputs {
 impl Drop for Outputs {
     fn drop(&mut self) {
         if let Some(submission) = self.submission.take() {
+            if let Some(bundle) = &mut self.cumulative {
+                bundle.fail(&submission.fence());
+            }
             submission.finish_enqueue(self.result);
             return;
         }
         if let Some(fallback) = self.fallback.take() {
             if let Err(error) = self.result { fallback.set_error(error); }
-            install(self.syncs.drain(self.input_count..), &Fence::from_fence(&fallback));
+            if let Some(bundle) = &mut self.cumulative {
+                bundle.fail(&Fence::from_fence(&fallback));
+            } else {
+                install(self.syncs.drain(self.input_count..), &Fence::from_fence(&fallback));
+            }
             fallback.signal();
         }
     }

@@ -31,6 +31,7 @@ pub(crate) mod context;
 mod data_segment;
 mod dependency;
 mod sync_input;
+pub(crate) mod sync_output;
 mod trace;
 mod event;
 mod feed;
@@ -1518,7 +1519,8 @@ impl gpu::Gpu for Gpu {
             u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
-                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD);
+                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD)
+                | sync_output::FEATURE_CUMULATIVE_SIGNALS;
         let variant = self.shared.variant;
         if variant.few_primitives {
             params.features |=
