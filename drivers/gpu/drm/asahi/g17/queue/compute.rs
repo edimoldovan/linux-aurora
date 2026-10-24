@@ -34,6 +34,10 @@ const CONFIG: usize = 0;
 const ANNOUNCE: usize = 0x800;
 const PREDECESSOR: usize = 0x400;
 const POINTERS: usize = 0x100;
+/// Producer/consumer words live on their own uncached page after the graph,
+/// which the firmware reads through a cached mapping (queue record, job-list
+/// head and item ring), as native does.
+const CURSORS: usize = GRAPH_SIZE;
 const ITEMS: usize = 0x4000;
 const STAMP: usize = 0x300;
 
@@ -120,7 +124,7 @@ struct Graph {
     usage: KernelObject,
     operand: KernelObject,
     support: KernelObject,
-    graph: KernelObject,
+    graph: PooledObject,
     context_low: KernelObject,
     context_high: KernelObject,
     /// Announcements, which stay uncached for the firmware.
@@ -157,11 +161,18 @@ impl Graph {
         support.write(0x100, support_va + page + 4)?;
         support.write(0x110, 0x50u32)?;
         support.write(mmu::UAT_PGSZ + 4, 1u32)?;
-        let mut graph = alloc.kernel(GRAPH_SIZE, page, prot, cpu)?;
+        let mut graph = objects.allocate(
+            alloc,
+            Family::QueueState,
+            GRAPH_SIZE + mmu::UAT_PGSZ,
+            GRAPH_SIZE,
+            prot,
+            cpu,
+        )?;
         let graph_va = graph.gpu_va();
         graph.initialize::<GraphLayout>(0, |view| {
             view.queue = QueueRecord::new(&QueueRecordArgs {
-                pointers_va: graph_va + POINTERS as u64,
+                pointers_va: graph_va + CURSORS as u64,
                 items_va: graph_va + ITEMS as u64,
                 job_list_va: context.work_head_va(),
                 scheduler_va: context.scheduler_va(),
@@ -170,6 +181,10 @@ impl Graph {
             });
             view.pointers = PointerBlock::new(&pointers)?;
             view.jobs = JobListHead::new(graph_va + 0x200);
+            Ok(())
+        })?;
+        graph.initialize::<PointerBlock>(CURSORS, |view| {
+            *view = PointerBlock::new(&pointers)?;
             Ok(())
         })?;
         let context_low = alloc.lower(CONTEXT_SIZE, page, prot, cpu)?;
@@ -259,9 +274,9 @@ impl Graph {
 
     fn cursors(&self) -> Result<Cursors> {
         Ok(Cursors {
-            producer: self.graph.word(POINTERS + self.pointers.producer)?.load(Ordering::Relaxed),
-            consumer: self.graph.word(POINTERS)?.load(Ordering::Relaxed),
-            count: self.graph.word(POINTERS + 0x60)?.load(Ordering::Relaxed),
+            producer: self.graph.word(CURSORS + self.pointers.producer)?.load(Ordering::Relaxed),
+            consumer: self.graph.word(CURSORS)?.load(Ordering::Relaxed),
+            count: self.graph.word(CURSORS + 0x60)?.load(Ordering::Relaxed),
         })
     }
     fn stamp(&self) -> Result<u32> {
@@ -315,7 +330,7 @@ impl Graph {
         }
         fence(Ordering::SeqCst);
         self.graph
-            .word(POINTERS + self.pointers.producer)?
+            .word(CURSORS + self.pointers.producer)?
             .store(cursors.consumer, Ordering::Relaxed);
         self.reclaimed = cursors.consumer;
         fence(Ordering::SeqCst);
@@ -1689,11 +1704,11 @@ impl Queue {
         let producer = self
             .graph
             .graph
-            .word(POINTERS + self.graph.pointers.producer)?
+            .word(CURSORS + self.graph.pointers.producer)?
             .load(Ordering::Relaxed);
         self.graph
             .graph
-            .word(POINTERS + target)?
+            .word(CURSORS + target)?
             .store(producer, Ordering::Relaxed);
         Ok(())
     }
@@ -1764,7 +1779,7 @@ impl Graph {
             };
             (object, slot * RECORD_STRIDE + offset)
         } else {
-            (&mut self.graph, 0x6800 + offset)
+            (&mut *self.graph, 0x6800 + offset)
         };
         if core::mem::size_of::<T>() > window {
             return Err(EINVAL);
@@ -1790,7 +1805,7 @@ impl Graph {
             return Err(EBUSY);
         }
         let slot = self.graph.dword(ITEMS + expected as usize * 8)?;
-        let producer = self.graph.word(POINTERS + self.pointers.producer)?;
+        let producer = self.graph.word(CURSORS + self.pointers.producer)?;
         if slot.load(Ordering::Relaxed) != 0 {
             return Err(EBUSY);
         }
@@ -2262,7 +2277,7 @@ impl Graph {
         let first = self.graph.dword(ITEMS)?;
         let second = self.graph.dword(ITEMS + 8)?;
         let third = self.graph.dword(ITEMS + 16)?;
-        let producer = self.graph.word(POINTERS + self.pointers.producer)?;
+        let producer = self.graph.word(CURSORS + self.pointers.producer)?;
         first.store(address, Ordering::Relaxed);
         second.store(0, Ordering::Relaxed);
         third.store(0, Ordering::Relaxed);
