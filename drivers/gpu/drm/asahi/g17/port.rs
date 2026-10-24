@@ -350,6 +350,7 @@ impl Port {
         super::trace::doorbell(super::trace::COMPUTE, || {
             self.regs.as_ref().map_or(0, |regs| regs.g17_core_power())
         });
+        super::trace::message(super::trace::MAILBOX, message);
         mailbox.send(super::EP_DOORBELL, message)
     }
 

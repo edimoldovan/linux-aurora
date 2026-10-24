@@ -548,6 +548,7 @@ impl Coprocessor {
 
     /// Sends a host notification to the firmware.
     fn notify(&self, msg: u64) -> Result {
+        trace::message(trace::MAILBOX, msg);
         self.rtkit.send(EP_DOORBELL, msg)
     }
 
@@ -706,6 +707,7 @@ impl Firmware {
             return Ok(());
         }
         init.publish_effort(effort)?;
+        trace::message(trace::EFFORT, u64::from(effort));
         state.did_apply(effort);
         port.set_effort_full(effort == power::FULL_EFFORT);
         Ok(())

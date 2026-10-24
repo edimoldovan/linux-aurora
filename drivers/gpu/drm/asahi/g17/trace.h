@@ -108,6 +108,23 @@ TRACE_EVENT(asahi_g17_doorbell,
 		  __entry->counter)
 );
 
+TRACE_EVENT(asahi_g17_message,
+	TP_PROTO(u8 kind, u64 value, u64 counter),
+	TP_ARGS(kind, value, counter),
+	TP_STRUCT__entry(
+		__field(u8, kind)
+		__field(u64, value)
+		__field(u64, counter)
+	),
+	TP_fast_assign(
+		__entry->kind = kind;
+		__entry->value = value;
+		__entry->counter = counter;
+	),
+	TP_printk("kind=%u value=%#llx counter=%llu", __entry->kind, __entry->value,
+		  __entry->counter)
+);
+
 TRACE_EVENT(asahi_g17_event,
 	TP_PROTO(u8 phase, u64 counter),
 	TP_ARGS(phase, counter),
