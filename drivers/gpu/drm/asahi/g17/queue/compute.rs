@@ -534,6 +534,7 @@ pub(crate) struct Queue {
     published_config: Option<ConfigIdentity>,
     ordinal: u32,
     submitted: u32,
+    last_published: u64,
     last_end: u64,
     released: bool,
     retirement_ready: bool,
@@ -597,6 +598,7 @@ impl Queue {
             published_config: None,
             ordinal: 0,
             submitted: 0,
+            last_published: 0,
             last_end: 0,
             released: false,
             retirement_ready: false,
@@ -1926,6 +1928,7 @@ impl Queue {
             priority: policy.priority(),
         };
         let published = host.next_compute_publication()?;
+        self.last_published = published;
         self.active
             .push(Active {
                 packet: packet.clone(),
@@ -2323,15 +2326,26 @@ impl Queue {
     /// Logical queue/context ownership is unchanged. The existing binding is
     /// retained through the successor's exact replacement witness.
     pub(crate) fn share_idle(&mut self) -> Result<bool> {
-        if !self.installed || self.owner.is_none() || !self.retirement_ready
-            || self.growing || self.quarantined || self.awaiting_witness
-            || self.exit.is_some() || self.active.len != 0 || self.replays.len != 0
-            || self.previous.is_some() || self.pool_phase != PoolPhase::Populated
-        {
+        if !self.shareable() {
             return Ok(false);
         }
         self.release_owner()?;
         Ok(self.reusable())
+    }
+
+    /// An open client's idle channel that [`Self::share_idle`] can hand over.
+    pub(crate) fn shareable(&self) -> bool {
+        self.installed && self.owner.is_some() && self.retirement_ready
+            && !self.growing && !self.quarantined && !self.awaiting_witness
+            && self.exit.is_none() && self.active.len == 0 && self.replays.len == 0
+            && self.previous.is_none() && self.pool_phase == PoolPhase::Populated
+            && !self.source_hint.has_readers(&self.source_readers)
+    }
+
+    /// Device publication order of this channel's newest command: lower is
+    /// idle longer.
+    pub(crate) fn last_published(&self) -> u64 {
+        self.last_published
     }
 }
 

@@ -155,12 +155,43 @@ impl Registry {
                 Rebind::Fresh
             });
         }
-        // Physical channels are a device budget, not a permanent entitlement
-        // of each open logical queue. Only exact idle retirement can yield one.
-        for queue in self.compute.iter_mut().flatten().filter_map(|entry| entry.queue.as_deref_mut()) {
-            admission.check()?;
-            queue.share_idle()?;
+        // A binding persists for its logical queue's lifetime while physical
+        // QIDs allow: take a channel of a closed owner, then a fresh QID, and
+        // only then the least recently idle channel of one open owner.
+        if let Some(rebind) = self.bind_reusable(owner, context, required, admission)? {
+            return Ok(rebind);
         }
+        if self.qids.compute_fits(self.admission.queues() as usize) {
+            return Ok(Rebind::Fresh);
+        }
+        let teardown = &self.teardown;
+        let idle = self
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .filter(|queue| queue.shareable())
+            .filter(|queue| !queue.context().is_some_and(|bound| teardown.releasing(bound)))
+            .min_by_key(|queue| (!queue.pool_fits(required), queue.last_published()))
+            .map(|queue| queue.qid());
+        let Some(qid) = idle else { return Err(ENOSPC); };
+        admission.check()?;
+        let queue = self
+            .compute
+            .iter_mut()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref_mut())
+            .find(|queue| queue.qid() == qid)
+            .ok_or(EIO)?;
+        if !queue.share_idle()? {
+            return Err(ENOSPC);
+        }
+        Ok(self.bind_reusable(owner, context, required, admission)?.unwrap_or(Rebind::Fresh))
+    }
+
+    /// Binds `owner` to a reusable channel whose last owner released it, or
+    /// names a vacant one to re-arm. None if no channel is reusable.
+    fn bind_reusable(&mut self, owner: u64, context: &Arc<Context>, required: usize, admission: &Admission<'_>) -> Result<Option<Rebind>> {
         let mut vacant = None;
         let teardown = &self.teardown;
         for queue in self
@@ -183,9 +214,9 @@ impl Registry {
             }
             if !queue.pool_fits(required) { continue; }
             queue.bind_owner(owner, context.clone())?;
-            return Ok(Rebind::Done);
+            return Ok(Some(Rebind::Done));
         }
-        Ok(vacant.map_or(Rebind::Fresh, Rebind::Rearm))
+        Ok(vacant.map(Rebind::Rearm))
     }
 
     /// Installs fresh USC backing into the vacant queue `qid`; the caller writes
@@ -352,9 +383,10 @@ impl Registry {
             .ok_or_else(|| self.compute_admission_error(
                 crate::g17::capacity::refused(crate::g17::capacity::Site::ComputeSlots)))?;
         let identity = self.identities.reserve(1)?.start;
+        let queues = self.admission.queues() as usize;
         let id = self
             .qids
-            .reserve(identity, DataMaster::Compute, Some(FIRST_COMPUTE_QID))
+            .reserve_for(identity, DataMaster::Compute, Some(FIRST_COMPUTE_QID), queues)
             .map_err(|error| self.compute_admission_error(error))?;
         let reservation = ComputeReservation { slot, id, owner };
         self.compute[slot] = Some(ComputeEntry {
@@ -491,6 +523,11 @@ impl Backend {
                 return Err(EIO);
             }
             let slot = firmware.queues.admission.reserve_queue()?;
+            // Installed compute channels narrow render's QIDs: every open
+            // logical queue keeps a dedicated render pair within reach.
+            if !firmware.queues.qids.render_fits(firmware.queues.admission.queues() as usize) {
+                return Err(super::capacity::refused(super::capacity::Site::LogicalQueues));
+            }
             match firmware.uat.new_execution_context(vm) {
                 Ok(execution) => {
                     break (
@@ -1861,8 +1898,9 @@ impl Registry {
                  self.compute.iter().flatten().count(), self.compute.len(),
                  self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()).filter(|queue| queue.reusable()).count(),
                  self.compute.iter().flatten().filter(|entry| entry.queue.is_none()).count())?;
-        writeln!(f, "compute_channels used={} total={}",
-                 self.compute.iter().flatten().count(), super::kick::COMPUTE_CHANNELS)?;
+        writeln!(f, "compute_channels used={} fresh_fits={}",
+                 self.compute.iter().flatten().count(),
+                 u8::from(self.qids.compute_fits(self.admission.queues() as usize)))?;
         writeln!(f, "scheduler_teardown pending={}", self.teardown.len())?;
         for queue in self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()) {
             queue.write_capacity(f)?;
@@ -1892,10 +1930,6 @@ impl Backend {
             }
             if firmware.recovery.pending() || super::recovery::Memory::recovery_state(&firmware.init)? != 0 {
                 return Ok(());
-            }
-            for queue in firmware.queues.compute.iter_mut().flatten().filter_map(|entry| entry.queue.as_deref_mut()) {
-                admission.check()?;
-                queue.share_idle()?;
             }
             // Consumption, not publication or an elapsed timeout, frees backing.
             firmware.queues.observe_pool_releases(&firmware.init, &mut deferred)?;
@@ -1937,12 +1971,17 @@ mod shared_capacity_tests {
         )
         .unwrap();
         let mut leases = KVec::with_capacity(crate::mmu::MAX_EXECUTION_CONTEXTS as usize, GFP_KERNEL).unwrap();
-        // Physical compute channels are device-owned and bounded independently
-        // of how many logical clients have queued unsignalled work.
-        for owner in 1..=super::super::kick::COMPUTE_CHANNELS as u64 {
+        let mut slots = KVec::with_capacity(crate::mmu::MAX_EXECUTION_CONTEXTS as usize, GFP_KERNEL).unwrap();
+        for _ in 0..crate::mmu::MAX_EXECUTION_CONTEXTS {
+            slots.push(registry.admission.reserve_queue().unwrap(), GFP_KERNEL).unwrap();
+        }
+        // With every execution context open, compute keeps only the channels
+        // that leave each logical queue a dedicated render pair.
+        for owner in 1..=super::super::kick::COMPUTE_FLOOR as u64 {
             registry.reserve_compute(owner).unwrap();
         }
         assert!(matches!(registry.reserve_compute(1000), Err(EAGAIN)));
+        assert!(registry.qids.render_fits(slots.len()));
         for owner in 1..=u64::from(crate::mmu::MAX_EXECUTION_CONTEXTS) {
             let lease = registry.admission.acquire_render(owner, None, u64::MAX, || Ok(())).unwrap();
             registry.ensure_render_ids(lease.slot(), owner).unwrap();
@@ -1994,10 +2033,30 @@ mod shared_capacity_tests {
                 leases.push(lease, GFP_KERNEL).unwrap();
             }
         }
-        for owner in 1..=super::super::kick::COMPUTE_CHANNELS as u64 {
+        for owner in 1..=super::super::kick::COMPUTE_FLOOR as u64 {
             registry.reserve_compute(owner).unwrap();
         }
         assert_eq!(leases.len(), 36);
+    }
+
+    #[test]
+    fn compute_grows_with_free_qids_and_narrows_queue_admission() {
+        let mut registry = KBox::init(Registry::new(1, [0; 2]), GFP_KERNEL).unwrap();
+        let mut slots = KVec::with_capacity(20, GFP_KERNEL).unwrap();
+        for _ in 0..20 {
+            slots.push(registry.admission.reserve_queue().unwrap(), GFP_KERNEL).unwrap();
+        }
+        // Sixteen open compute clients each keep their own channel.
+        for owner in 1..=16u64 {
+            registry.reserve_compute(owner).unwrap();
+        }
+        // Growth stops where open queues plus headroom would lose their pairs.
+        let mut owner = 17;
+        while registry.reserve_compute(owner).is_ok() {
+            owner += 1;
+        }
+        assert!(registry.qids.render_fits(slots.len() + 24));
+        assert!(!registry.qids.render_fits(crate::mmu::MAX_EXECUTION_CONTEXTS as usize));
     }
 }
 
