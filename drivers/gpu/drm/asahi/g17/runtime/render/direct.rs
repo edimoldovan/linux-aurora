@@ -360,7 +360,12 @@ impl Backend {
         }
         match result {
             Err(error) if (error == EAGAIN || error == EBUSY) && !packet.is_published() => None,
-            result => Some(result),
+            result => {
+                if result.is_ok() {
+                    self.direct_slot.store(u32::from(slot), Ordering::Relaxed);
+                }
+                Some(result)
+            }
         }
     }
 }

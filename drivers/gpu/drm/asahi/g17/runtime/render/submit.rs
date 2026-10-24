@@ -284,6 +284,31 @@ impl Backend {
         // A publication from the submitting ioctl (an early lease) never
         // sleeps for contention; it falls back to the scheduler instead.
         let sleep = early.is_none();
+        let mut early = early;
+        // The pair this owner last published to directly: a lease on it goes
+        // straight to the direct path, whose lend checks everything the
+        // identity check would.
+        let known = self.direct_slot.load(Ordering::Relaxed);
+        let lease = match early.take() {
+            Some(lease) => Some(lease),
+            None if known != 0 => self
+                .admission
+                .try_acquire_render(self.owner, Request::of(packet))
+                .ok()
+                .flatten(),
+            None => None,
+        };
+        let early = match lease {
+            Some(lease) if u32::from(lease.slot()) == known => {
+                let slot = lease.slot();
+                packet.completion.attach_render_lease(lease)?;
+                if let Some(result) = self.render_direct(packet, slot, deferred) {
+                    return result;
+                }
+                packet.completion.detach_render_lease()
+            }
+            lease => lease,
+        };
         let (admission, mut ready) = self.acquire_render_with_ids(packet, early, sleep)?;
         let slot = admission.slot();
         packet.completion.attach_render_lease(admission)?;

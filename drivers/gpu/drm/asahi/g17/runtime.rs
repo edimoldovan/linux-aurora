@@ -666,6 +666,9 @@ pub(super) struct Backend {
     claimed: kernel::sync::Mutex<Option<Arc<ComputeCell>>>,
     /// Render pair admission, shared by every logical queue of the session.
     admission: Arc<admission::Pool>,
+    /// The render pair this owner last published to without the device mutex
+    /// (zero for none): a hint, revalidated by every lend.
+    direct_slot: core::sync::atomic::AtomicU32,
 }
 
 impl Backend {
@@ -760,6 +763,7 @@ impl Backend {
                     direct <- kernel::new_mutex!(None, "g17::Backend::direct"),
                     claimed <- kernel::new_mutex!(None, "g17::Backend::claimed"),
                     admission,
+                    direct_slot: core::sync::atomic::AtomicU32::new(0),
                 }),
                 GFP_KERNEL,
             )?,
