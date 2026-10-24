@@ -24,6 +24,7 @@ use kernel::{prelude::*, sync::Arc};
 #[derive(Copy, Clone)]
 struct Config {
     clusters: u32,
+    deflake: crate::g17::fw::render::Deflake,
     descriptor_flags: [u32; 2],
 }
 
@@ -77,7 +78,11 @@ pub(super) struct RenderState {
 }
 
 impl RenderState {
-    pub(super) fn new(clusters: u32, descriptor_flags: [u32; 2]) -> Result<Self> {
+    pub(super) fn new(
+        clusters: u32,
+        deflake: crate::g17::fw::render::Deflake,
+        descriptor_flags: [u32; 2],
+    ) -> Result<Self> {
         if clusters == 0 {
             return Err(EINVAL);
         }
@@ -88,6 +93,7 @@ impl RenderState {
         Ok(Self {
             config: Config {
                 clusters,
+                deflake,
                 descriptor_flags,
             },
             entries,

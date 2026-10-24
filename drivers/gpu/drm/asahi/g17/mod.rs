@@ -183,6 +183,19 @@ pub(crate) struct Config {
     pub(crate) gpu_generation: hw::GpuGen,
     /// The firmware builds this SoC runs.
     pub(crate) firmware: fw::variant::Firmware,
+    /// Layouts of the command buffers that follow the GPU's core layout.
+    pub(crate) core_layout: CoreLayout,
+}
+
+/// Layouts of the firmware command buffers that follow a SoC's GPU core layout.
+pub(crate) struct CoreLayout {
+    /// The cluster and enabled core counts the layouts were measured on, which the GPU must
+    /// report at probe; `None` where the layouts hold for every configuration of the SoC.
+    pub(crate) cores: Option<(u32, u32)>,
+    /// A compute queue's operand-state buffer.
+    pub(crate) operand_state: fw::compute::OperandState,
+    /// A render's deflake buffer.
+    pub(crate) deflake: fw::render::Deflake,
 }
 
 /// Where a G17 target's crash log buffers live.
@@ -708,6 +721,8 @@ struct Shared {
     variant: &'static fw::Variant,
     /// Layout of compute queues' operand-state buffers for this GPU's cores.
     operand_state: &'static fw::compute::OperandState,
+    /// Layout of renders' deflake buffers for this GPU's cores.
+    deflake: fw::render::Deflake,
     descriptor_flags: [u32; 2],
     crashed: AtomicBool,
     feed: Arc<feed::Feed>,
@@ -968,7 +983,19 @@ impl Gpu {
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new()?;
         let active_cores = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
-        let operand_state = fw::compute::OperandState::new(id.num_clusters, active_cores)?;
+        if cfg
+            .core_layout
+            .cores
+            .is_some_and(|cores| cores != (id.num_clusters, active_cores))
+        {
+            dev_err!(
+                dev.as_ref(),
+                "Unsupported GPU core layout: {} clusters with {} cores\n",
+                id.num_clusters,
+                active_cores
+            );
+            return Err(ENODEV);
+        }
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 drm <- new_mutex!(Some(dev.into()), "g17::Shared::drm"),
@@ -976,7 +1003,8 @@ impl Gpu {
                 clusters: id.num_clusters,
                 active_cores,
                 variant,
-                operand_state,
+                operand_state: &cfg.core_layout.operand_state,
+                deflake: cfg.core_layout.deflake,
                 descriptor_flags: [id.perf_control, id.perf_map[0]],
                 crashed: AtomicBool::new(false),
                 feed,
@@ -1131,6 +1159,7 @@ impl Gpu {
                 variant: shared.variant,
                 queues <- runtime::Registry::new(
                     shared.clusters,
+                    shared.deflake,
                     shared.descriptor_flags,
                     shared.variant,
                 ),

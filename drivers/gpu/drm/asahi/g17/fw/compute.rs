@@ -167,8 +167,8 @@ pub(crate) struct OperandState {
 }
 
 impl OperandState {
-    /// One cluster (the A18 Pro's six cores).
-    const ONE_BY_SIX: OperandState = OperandState {
+    /// One cluster of six cores (A18 Pro).
+    pub(crate) const ONE_BY_SIX: OperandState = OperandState {
         r10229: 0x12800,
         r140a8: 0x13000,
         r10099: 0x9405,
@@ -178,7 +178,7 @@ impl OperandState {
         size: 0x14000,
     };
     /// Two clusters of ten cores (M4 Pro): bank stride 0x1e400, tails 0x1000.
-    const TWO_BY_TEN: OperandState = OperandState {
+    pub(crate) const TWO_BY_TEN: OperandState = OperandState {
         r10229: 0x3c800,
         r140a8: 0x3d800,
         r10099: 0x1e405,
@@ -187,16 +187,6 @@ impl OperandState {
         r0a5c9: 0x1e000,
         size: 0x44000,
     };
-
-    /// The layout for `clusters` clusters with `cores` enabled cores in all.
-    pub(crate) fn new(clusters: u32, cores: u32) -> Result<&'static OperandState> {
-        // shortcut: only the two measured layouts; add others when a GPU with them is supported.
-        match (clusters, cores) {
-            (1, _) => Ok(&Self::ONE_BY_SIX),
-            (2, 20) => Ok(&Self::TWO_BY_TEN),
-            _ => Err(ENODEV),
-        }
-    }
 }
 
 /// Checkpoints into the main register array, as entry counts: after the

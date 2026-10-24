@@ -9,7 +9,7 @@ use crate::g17::fw::{
     self,
     initdata::{v25g83, PerfConfig, RegionCConfig, RegisterWindow, PERF_STATES},
 };
-use crate::g17::{Config, CrashBuffers, FixedBuffer, Identity};
+use crate::g17::{Config, CoreLayout, CrashBuffers, FixedBuffer, Identity};
 use crate::hw::{GpuGen, GpuVariant};
 use crate::mmu::UatQuirks;
 
@@ -64,6 +64,12 @@ pub(crate) const CONFIG: Config = Config {
         name: "macOS 26.6.2 (25G83, iBoot mBoot-18000.161.10)",
         variant: &fw::variant::V25G83,
     }]),
+    // Measured on the 20-core M4 Pro; other core counts are refused at probe.
+    core_layout: CoreLayout {
+        cores: Some((2, 20)),
+        operand_state: fw::compute::OperandState::TWO_BY_TEN,
+        deflake: fw::render::Deflake::TWO_CLUSTERS,
+    },
 };
 
 /// Chip identifier written to the hardware data.

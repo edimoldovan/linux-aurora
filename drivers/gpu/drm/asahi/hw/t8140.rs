@@ -54,6 +54,12 @@ pub(crate) const CONFIG: Config = Config {
     adopt_root_entries: true,
     fabric_bridge: true,
     firmware: crate::g17::fw::variant::Firmware::Fixed(&crate::g17::fw::variant::V26A428),
+    // The layouts the A18 Pro has always run with.
+    core_layout: crate::g17::CoreLayout {
+        cores: None,
+        operand_state: crate::g17::fw::compute::OperandState::ONE_BY_SIX,
+        deflake: crate::g17::fw::render::Deflake::ONE_CLUSTER,
+    },
 };
 
 use crate::g17::fw::initdata::{PerfConfig, RegisterWindow, PERF_STATES};

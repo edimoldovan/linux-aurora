@@ -71,6 +71,7 @@ impl Registry {
     /// registry on the probe stack. No additional allocation is required.
     pub(super) fn new(
         clusters: u32,
+        deflake: crate::g17::fw::render::Deflake,
         descriptor_flags: [u32; 2],
         variant: &'static crate::g17::fw::Variant,
     ) -> impl Init<Self, Error> {
@@ -83,7 +84,7 @@ impl Registry {
             metrics: Arc::new(MetricsIds::new(), GFP_KERNEL)?,
             qos_ids: QosIds::new()?,
             admission: admission::Pool::new(kick::queue_limit(variant.qid_floor))?,
-            render: render::RenderState::new(clusters, descriptor_flags)?,
+            render: render::RenderState::new(clusters, deflake, descriptor_flags)?,
             identities: queue::Identities::new(),
             compute: {
                 let mut compute = KVec::with_capacity(QIDS, GFP_KERNEL)?;
@@ -411,10 +412,15 @@ pub(super) enum Rebind {
 #[kunit_tests(asahi_g17_uninstalled_cleanup)]
 mod uninstalled_cleanup_tests {
     use super::*;
+    use crate::g17::fw::render::Deflake;
     use crate::g17::fw::variant::V26A428;
     #[test]
     fn empty_reservation_prevents_reuse_until_explicit_cancellation() {
-        let mut registry = KBox::init(Registry::new(1, [0; 2], &V26A428), GFP_KERNEL).unwrap();
+        let mut registry = KBox::init(
+            Registry::new(1, Deflake::ONE_CLUSTER, [0; 2], &V26A428),
+            GFP_KERNEL,
+        )
+        .unwrap();
         let first = registry.reserve_compute(1).unwrap();
         assert!(registry.reserved(first).is_ok());
         assert!(registry.reserve_compute(1).is_err());
@@ -1652,11 +1658,16 @@ impl Backend {
 #[kunit_tests(asahi_g17_shared_capacity)]
 mod shared_capacity_tests {
     use super::*;
+    use crate::g17::fw::render::Deflake;
     use crate::g17::fw::variant::V26A428;
 
     #[test]
     fn all_logical_render_owners_fit_beside_shared_compute() {
-        let mut registry = KBox::init(Registry::new(1, [0; 2], &V26A428), GFP_KERNEL).unwrap();
+        let mut registry = KBox::init(
+            Registry::new(1, Deflake::ONE_CLUSTER, [0; 2], &V26A428),
+            GFP_KERNEL,
+        )
+        .unwrap();
         let mut leases = KVec::with_capacity(crate::mmu::MAX_EXECUTION_CONTEXTS as usize, GFP_KERNEL).unwrap();
         // Physical compute channels are device-owned and bounded independently
         // of how many logical clients have queued unsignalled work.
@@ -1679,7 +1690,11 @@ mod shared_capacity_tests {
         use crate::g17::fw::variant::V25G83;
         let limit = super::super::kick::queue_limit(V25G83.qid_floor);
         assert_eq!(limit, 42);
-        let mut registry = KBox::init(Registry::new(2, [0; 2], &V25G83), GFP_KERNEL).unwrap();
+        let mut registry = KBox::init(
+            Registry::new(2, Deflake::TWO_CLUSTERS, [0; 2], &V25G83),
+            GFP_KERNEL,
+        )
+        .unwrap();
         for owner in 1..=super::super::kick::COMPUTE_CHANNELS as u64 {
             registry.reserve_compute(owner).unwrap();
         }
@@ -1697,7 +1712,11 @@ mod shared_capacity_tests {
 
     #[test]
     fn four_clients_have_capacity_before_any_owner_closes() {
-        let mut registry = KBox::init(Registry::new(1, [0; 2], &V26A428), GFP_KERNEL).unwrap();
+        let mut registry = KBox::init(
+            Registry::new(1, Deflake::ONE_CLUSTER, [0; 2], &V26A428),
+            GFP_KERNEL,
+        )
+        .unwrap();
         let mut leases = KVec::with_capacity(36, GFP_KERNEL).unwrap();
         for client in 0..4u64 {
             for queue in 0..9u64 {

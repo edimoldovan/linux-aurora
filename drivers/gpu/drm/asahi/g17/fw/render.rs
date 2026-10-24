@@ -60,22 +60,16 @@ pub(crate) struct Deflake {
 }
 
 impl Deflake {
-    /// The layout for a GPU with `clusters` clusters.
-    pub(crate) fn new(clusters: u32) -> Result<Self> {
-        match clusters {
-            1 => Ok(Self {
-                sub: [0x20, 0x2a0],
-                viewport: true,
-            }),
-            // shortcut: only one and two clusters were measured; add other counts when a GPU
-            // with them is supported.
-            2 => Ok(Self {
-                sub: [0xa0, 0x820],
-                viewport: false,
-            }),
-            _ => Err(EINVAL),
-        }
-    }
+    /// One cluster (A18 Pro).
+    pub(crate) const ONE_CLUSTER: Deflake = Deflake {
+        sub: [0x20, 0x2a0],
+        viewport: true,
+    };
+    /// Two clusters (M4 Pro).
+    pub(crate) const TWO_CLUSTERS: Deflake = Deflake {
+        sub: [0xa0, 0x820],
+        viewport: false,
+    };
 }
 
 /// The register programs of a firmware build's render descriptors.

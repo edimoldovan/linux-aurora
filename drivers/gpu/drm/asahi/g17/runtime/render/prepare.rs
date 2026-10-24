@@ -274,6 +274,7 @@ impl super::super::Backend {
                 pm_generation,
                 first,
                 resources.config.clusters,
+                resources.config.deflake,
                 resources.config.descriptor_flags,
                 self.shared.variant,
             )

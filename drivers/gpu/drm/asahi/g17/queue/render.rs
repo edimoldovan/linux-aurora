@@ -154,6 +154,7 @@ pub(crate) struct Pair {
     initial_packet: u64,
     graph_started: bool,
     clusters: u32,
+    deflake: abi::Deflake,
     descriptor_flags: [u32; 2],
     variant: &'static crate::g17::fw::Variant,
     installed: [bool; 2],
@@ -200,6 +201,7 @@ impl Pair {
         pm_generation: u64,
         first: &Arc<Packet>,
         clusters: u32,
+        deflake: abi::Deflake,
         descriptor_flags: [u32; 2],
         variant: &'static crate::g17::fw::Variant,
     ) -> Result<KBox<Self>> {
@@ -258,6 +260,7 @@ impl Pair {
             initial_packet: first.id,
             graph_started: false,
             clusters,
+            deflake,
             descriptor_flags,
             variant,
             installed: [false; 2],
@@ -361,7 +364,7 @@ impl Pair {
         let node = work.node_va()?;
         let word = work.word();
         let layout = target::Layout::new(pass, self.clusters, self.variant.programs)?;
-        let deflake_layout = abi::Deflake::new(self.clusters)?;
+        let deflake_layout = self.deflake;
         let owners = self.memory.owners();
         self.memory
             .target
