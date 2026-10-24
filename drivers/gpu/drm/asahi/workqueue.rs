@@ -803,7 +803,7 @@ impl WorkQueue::ver {
         )?;
 
         let inner = WorkQueueInner::ver {
-            dev,
+            dev: dev.into(),
             event_manager,
             info: Some(KBox::new(info, GFP_KERNEL)?),
             gpu_context,
