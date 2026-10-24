@@ -25,8 +25,8 @@ fn aligned(value: usize, alignment: usize) -> Result<usize> {
         .ok_or(EOVERFLOW)
 }
 
-/// The 25G83 tiler parameter block (the 25G83 Metal driver's default parameter-buffer sizes):
-/// the TPC and seven sub-buffers the tiling registers name. Sizes are
+/// The 25G83 tiler parameter block: the TPC and seven sub-buffers the tiling registers name, at
+/// the default parameter-buffer sizes. Sizes are
 /// [TPC, tile map × 64, 0x4000 for layered targets, 0, 0xc00, 0xa00, 0x600, 0x80].
 const GTP_ALIGNMENTS: [usize; 8] = [0x40, 0x40, 0x100, 1, 0x20, 0x20, 0x80, 0x40];
 const GTP_FIXED_SIZES: [usize; 4] = [0xc00, 0xa00, 0x600, 0x80];

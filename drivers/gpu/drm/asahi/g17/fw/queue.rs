@@ -570,8 +570,7 @@ impl QueueConfig {
 }
 
 /// The 25G83 firmware's barrier before every fragment descriptor (tag 4): the fragment work
-/// waits for the paired tiling stamp, in addition to the kick-entry dependency, as the 25G83
-/// Metal driver writes it ("emitBarrierCommands").
+/// waits for the paired tiling stamp, in addition to the kick-entry dependency.
 #[repr(C, packed)]
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct FragmentBarrier {
