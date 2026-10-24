@@ -545,6 +545,9 @@ pub(crate) struct Queue {
     /// Bit `p` set once a work slot of priority class `p` named this queue.
     outer_started: u8,
     published_config: Option<ConfigIdentity>,
+    /// Last configuration record the firmware consumed, and its recovery
+    /// epoch. A command repeats the record only when it differs.
+    config_cache: Option<(QueueConfig, u64)>,
     ordinal: u32,
     submitted: u32,
     last_published: u64,
@@ -609,6 +612,7 @@ impl Queue {
             installed: false,
             outer_started: 0,
             published_config: None,
+            config_cache: None,
             ordinal: 0,
             submitted: 0,
             last_published: 0,
@@ -1436,6 +1440,7 @@ impl Queue {
     }
     fn recycle_settled(&mut self) -> Result {
         self.graph.reset_items()?;
+        self.config_cache = None;
         self.exit = None;
         self.quarantined = false;
         self.quarantine_error = None;
@@ -1925,6 +1930,8 @@ impl Queue {
         let policy = packet.context.policy();
         let ring = 1u8 << policy.priority();
         let config = self.queue_config(&identity, first, args.context_id, policy, &packet)?;
+        let cached = self.config_cache.and_then(|(config, at)| (at == epoch).then_some(config));
+        let send_config = first || super::render::publication::required(cached, config);
         let announce =
             KickAnnounce::new(qid, DataMaster::Compute, kick_timestamp, policy.priority())?;
         let predecessor = KickPredecessor::new(qid, kick_parent)?;
@@ -1989,7 +1996,11 @@ impl Queue {
                 let cursors = self.graph.cursors()?;
                 let _ = self.graph.recycle(cursors);
             }
-            let config_va = self.graph.record(record_slot, CONFIG, 0xc0, config)?;
+            let config_va = if send_config {
+                Some(self.graph.record(record_slot, CONFIG, 0xc0, config)?)
+            } else {
+                None
+            };
             let cursors = self.graph.cursors()?;
             let mut wait_vas = KVec::with_capacity(native.len(), GFP_KERNEL)?;
             for (index, wait) in native.iter().enumerate() {
@@ -2023,7 +2034,7 @@ impl Queue {
                 })?;
                 producer = self
                     .graph
-                    .append(producer, config_va, || {})
+                    .append(producer, config_va.ok_or(EINVAL)?, || {})
                     .or_else(|error| {
                         self.pool.cancel_unpublished(target)?;
                         host.qos_cancel(qos)?;
@@ -2060,14 +2071,16 @@ impl Queue {
                     policy,
                 )?;
                 self.active.back_mut().ok_or(EIO)?.qos_pending = true;
-                producer = self
-                    .graph
-                    .append(producer, config_va, || {})
-                    .or_else(|error| {
-                        host.qos_cancel(qos)?;
-                        self.active.back_mut().ok_or(EIO)?.qos_pending = false;
-                        Err(error)
-                    })?;
+                if let Some(config_va) = config_va {
+                    producer = self
+                        .graph
+                        .append(producer, config_va, || {})
+                        .or_else(|error| {
+                            host.qos_cancel(qos)?;
+                            self.active.back_mut().ok_or(EIO)?.qos_pending = false;
+                            Err(error)
+                        })?;
+                }
             }
             if first {
                 prepared_kick.prepare_compute_install()?;
@@ -2101,6 +2114,9 @@ impl Queue {
             self.outer_started |= ring;
             self.installed = true;
             self.published_config = Some(identity);
+            if send_config {
+                self.config_cache = Some((config, epoch));
+            }
             self.ordinal = ordinal;
             let (accepted, state) = host.epoch()?;
             if state != 0 || accepted != epoch {

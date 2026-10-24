@@ -7,7 +7,7 @@ pub(crate) use observation::Observed;
 mod dependencies;
 mod memory;
 pub(crate) mod parked;
-mod publication;
+pub(super) mod publication;
 pub(crate) mod retirement;
 mod warm;
 
