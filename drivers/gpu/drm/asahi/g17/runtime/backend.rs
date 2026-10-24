@@ -55,6 +55,7 @@ impl Backend {
         drop(state);
         drop(binding);
         self.finish_uninstalled_compute(retired)?;
+        self.shared.channels.notify();
         self.shared.queue_events();
         return Ok(());
         }
@@ -92,6 +93,7 @@ impl Backend {
         // A builder may own only an off-lock reservation when close arrives.
         // Record intent before scanning queues; every later install/rearm checks it.
         self.closed.store(true, Ordering::Release);
+        self.hold_claim(None);
         let mut state = self.shared.state.lock();
         let Some(firmware) = (*state).as_deref_mut() else {
             return Ok(());
@@ -106,6 +108,8 @@ impl Backend {
         firmware.queues.release_render(self.owner)?;
         firmware.queues.admission.release_owner(self.owner);
         drop(state);
+        // Its idle channel, or its slot and never-published QID, is free.
+        self.shared.channels.notify();
         self.shared.queue_events();
         Ok(())
     }
@@ -212,8 +216,12 @@ impl job::Backend for Backend {
 
     /// Firmware kick parents order the same engine. Explicit cross-engine and
     /// input dependencies were already attached to the DRM scheduled job.
-    fn prepare(&self, _packet: &Packet) -> Option<Fence> {
-        None
+    /// Compute admission waits for its shared capacity here, as a fence.
+    fn prepare(&self, packet: &Arc<Packet>) -> Option<Fence> {
+        match packet.engine() {
+            Engine::Compute => self.prepare_compute(packet),
+            Engine::Render => None,
+        }
     }
 
     fn publish(&self, packet: Arc<Packet>) -> Result<Fence> {
@@ -241,6 +249,9 @@ impl job::Backend for Backend {
                 Engine::Render => self.render_packet(&packet, &mut deferred),
             }
         };
+        if packet.engine() == Engine::Compute {
+            self.hold_claim(None);
+        }
         self.release_backlog(&packet);
         self.finish_publication(&packet, result, &mut deferred)
     }
@@ -269,6 +280,9 @@ impl job::Backend for Backend {
 
     fn cancel(&self, packet: Arc<Packet>) {
         self.release_backlog(&packet);
+        if packet.engine() == Engine::Compute {
+            self.hold_claim(None);
+        }
         if packet.request_cancel() {
             Deferred::Unpublished(packet.completion.clone(), ECANCELED).finish();
             return;

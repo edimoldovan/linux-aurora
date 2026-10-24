@@ -299,6 +299,38 @@ impl Registry {
         Ok(self.bind_reusable(owner, context, required, admission)?.unwrap_or(Rebind::Fresh))
     }
 
+    /// Whether `owner` can bind a channel now, without changing any binding. Owner 0 asks
+    /// only whether some channel is free for a new owner.
+    fn compute_readiness(&self, owner: u64, context: Option<&Arc<Context>>, required: usize) -> Readiness {
+        if let (Some(context), Some(queue)) = (context, self.compute(owner).filter(|_| owner != 0)) {
+            return if queue.spared_pending() {
+                Readiness::Progress
+            } else if !matches!(queue.matches(owner, queue.qid(), context), Ok(true)) {
+                // Publication reports the mismatch.
+                Readiness::Ready
+            } else if queue.pool_fits(required) || !queue.growing() {
+                Readiness::Ready
+            } else {
+                Readiness::Progress
+            };
+        }
+        let teardown = &self.teardown;
+        let available = self
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .any(|queue| {
+                (queue.reusable() || queue.shareable() || queue.can_rearm())
+                    && !queue.context().is_some_and(|bound| teardown.releasing(bound))
+            });
+        if available || self.qids.compute_fits(self.admission.queues() as usize) {
+            Readiness::Ready
+        } else {
+            Readiness::Channel
+        }
+    }
+
     /// Binds `owner` to a reusable channel whose last owner released it, or
     /// names a vacant one to re-arm. None if no channel is reusable.
     fn bind_reusable(&mut self, owner: u64, context: &Arc<Context>, required: usize, admission: &Admission<'_>) -> Result<Option<Rebind>> {
@@ -563,6 +595,16 @@ impl Registry {
     }
 }
 
+/// What a compute packet still lacks before publication.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(super) enum Readiness {
+    Ready,
+    /// A physical channel: every one is busy and no QID fits.
+    Channel,
+    /// Retirement-bound capacity or reopened publication.
+    Progress,
+}
+
 /// Outcome of offering an owner a retained compute queue.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum Rebind {
@@ -616,6 +658,10 @@ pub(super) struct Backend {
     /// binding under the cell lock; a stale cell only sends the packet back to that path.
     #[pin]
     direct: kernel::sync::Mutex<Option<Arc<ComputeCell>>>,
+    /// The channel a prepared packet is about to publish into. Its claim keeps the idle
+    /// channel from being shared away between prepare_job and run_job.
+    #[pin]
+    claimed: kernel::sync::Mutex<Option<Arc<ComputeCell>>>,
 }
 
 impl Backend {
@@ -707,6 +753,7 @@ impl Backend {
                     compute_backlog: core::sync::atomic::AtomicU32::new(0),
                     closed: core::sync::atomic::AtomicBool::new(false),
                     direct <- kernel::new_mutex!(None, "g17::Backend::direct"),
+                    claimed <- kernel::new_mutex!(None, "g17::Backend::claimed"),
                 }),
                 GFP_KERNEL,
             )?,
@@ -852,11 +899,14 @@ impl Backend {
         drop(queue);
         let mut state = self.shared.state.lock();
         let firmware = state.as_deref_mut().ok_or(ENODEV)?;
-        firmware.queues.cancel_compute(reservation)
+        firmware.queues.cancel_compute(reservation)?;
+        drop(state);
+        // The slot and its never-published QID are free again.
+        self.shared.channels.notify();
+        Ok(())
     }
 
     fn grow_compute(&self, required: usize, admission: &Admission<'_>) -> Result {
-        use kernel::time::{delay::fsleep, Delta};
         admission.check()?;
         {
             let state = self.shared.state.lock();
@@ -874,6 +924,9 @@ impl Backend {
         let mut deferred = DeferredBatch::publication()?;
         let mut growth = None;
         let result = (|| loop {
+            // Growth waits for this queue's retirement and for firmware to consume the pool
+            // release; both are progress the event worker reports.
+            let observed = self.shared.progress.observe();
             let result = (|| {
                 let mut state = self.shared.state.lock();
                 admission.check()?;
@@ -899,9 +952,9 @@ impl Backend {
             match result {
                 Ok(old) => { drop(old); return Ok(()); }
                 Err(error) if error == EAGAIN && lease.is_current() => {
-                        self.shared.queue_events();
-                        fsleep(Delta::from_millis(1));
-                    }
+                    self.shared.queue_events();
+                    self.wait_release(&self.shared.progress, observed, admission)?;
+                }
                 Err(error) => return Err(error),
             }
         })();
@@ -948,6 +1001,8 @@ impl Backend {
         }
         loop {
             admission.check()?;
+            // Sampled before any capacity check of this attempt.
+            let observed = self.shared.channels.observe();
             let lease = self.shared.preparations.enter_until(admission)?;
             let dev = self.shared.drm()?;
             let (uat, objects, reservation) = {
@@ -966,7 +1021,7 @@ impl Backend {
                     Err(error) if error == ENOSPC => {
                         drop(state);
                         drop(lease);
-                        self.wait_compute_capacity(admission, true)?;
+                        self.wait_channels(observed, admission, true)?;
                         continue;
                     }
                     result => result?,
@@ -984,7 +1039,7 @@ impl Backend {
                                 // it cannot create a QID and forces fresh allocation.
                                 drop(state);
                                 drop(lease);
-                                self.wait_compute_capacity(admission, false)?;
+                                self.wait_channels(observed, admission, false)?;
                                 continue;
                             }
                             Err(error) if error == ENOSPC => {
@@ -1018,7 +1073,7 @@ impl Backend {
                     let (pages, ring) = match built {
                         Err(error) if error == ENOSPC => {
                             drop(lease);
-                            self.wait_compute_capacity(admission, true)?;
+                            self.wait_channels(observed, admission, true)?;
                             continue;
                         }
                         result => result?,
@@ -1108,7 +1163,7 @@ impl Backend {
             }
             drop(lease);
             if result == Err(ENOSPC) {
-                self.wait_compute_capacity(admission, true)?;
+                self.wait_channels(observed, admission, true)?;
                 continue;
             }
             if result != Err(EAGAIN) { return result; }
@@ -1236,6 +1291,10 @@ impl DeferredBatch {
             self.has_source_completions |= completion.sources().is_some();
         }
         Ok(())
+    }
+    /// Completions collected so far.
+    pub(super) fn pending(&self) -> usize {
+        self.values.len()
     }
     /// Called only after releasing the device mutex.
     pub(super) fn finish(&mut self) {
@@ -1570,12 +1629,15 @@ impl super::Firmware {
             )?;
         }
         let port = &self.port;
+        let retired = deferred.pending();
+        let mut freed = false;
         for mut queue in registry
             .compute
             .iter_mut()
             .flatten()
             .filter_map(|entry| entry.queue.as_deref_mut())
         {
+            let busy = !queue.channel_free();
             queue.latch_observations(&mut registry.observations, masks)?;
             queue.retire(
                 masks,
@@ -1584,6 +1646,7 @@ impl super::Firmware {
                 |owner| port.qos_complete(&[owner]),
                 &mut |event| deferred.push(event),
             )?;
+            freed |= busy && queue.channel_free();
         }
         // All compute observations in this batch are latched before a VM
         // failure can settle its render peers. Exact successes win first.
@@ -1606,11 +1669,22 @@ impl super::Firmware {
             .flatten()
             .filter_map(|entry| entry.queue.as_deref_mut())
         {
+            let busy = !queue.channel_free();
             queue.release_witnessed(
                 state,
                 |owner| port.qos_complete(&[owner]),
                 &mut |event| deferred.push(event),
             )?;
+            freed |= busy && queue.channel_free();
+        }
+        // Wake only the admission waits this batch can end. The fences gate
+        // scheduler entities alone; their callbacks never take the device mutex.
+        let shared = &self.primary.state.shared;
+        if freed {
+            shared.channels.notify();
+        }
+        if deferred.pending() != retired {
+            shared.progress.notify();
         }
         Ok(())
     }
@@ -1620,11 +1694,10 @@ impl Backend {
     fn ensure_compute(&self, scs_pages: u16, admission: &Admission<'_>) -> Result {
         admission.check()?;
         let required = super::fw::compute_pool::required_blocks(self.shared.active_cores, scs_pages)?;
-        use kernel::time::{delay::fsleep, Delta};
-        const SPARED_WAIT_MS: usize = 200;
         let mut deferred = DeferredBatch::publication()?;
-        for _ in 0..SPARED_WAIT_MS {
+        loop {
             admission.check()?;
+            let observed = self.shared.progress.observe();
             let pending = (|| {
                 let mut state = self.shared.state.lock();
                 let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
@@ -1641,14 +1714,12 @@ impl Backend {
                     result => return result,
                 }
             }
-            // Other owners continue submitting while this owner gives its
-            // queue-local drain witness time to arrive.
-            fsleep(Delta::from_millis(1));
+            // Other owners continue submitting while this owner waits for its
+            // queue-local drain witness. No new command has been accepted: the
+            // spared queue and its retained work stay intact past the deadline.
+            self.shared.queue_events();
+            self.wait_release(&self.shared.progress, observed, admission)?;
         }
-        // No new command has been accepted. Keep the spared queue and its
-        // retained work intact until a later admission observes its witness.
-        admission.check()?;
-        Err(EBUSY)
     }
 
     /// Steady-state publication into this owner's bound channel without the device mutex: only
@@ -1703,6 +1774,98 @@ impl Backend {
         match queue.publish(packet.clone(), &[], &mut host, &mut |event| deferred.push(event)) {
             Err(error) if (error == EAGAIN || error == EBUSY) && !packet.is_published() => None,
             result => Some(result),
+        }
+    }
+
+    /// Scheduler admission of a compute packet. Shared capacity the packet lacks (a channel, a
+    /// work state, retirement-bound room, reopened publication) becomes a fence that the release
+    /// providing it signals, so publication finds it ready instead of sleeping for it. Errors
+    /// and anything prepare cannot judge are left to publication.
+    pub(super) fn prepare_compute(&self, packet: &Arc<super::job::Packet>) -> Option<kernel::dma_fence::Fence> {
+        if packet.early_result().is_some()
+            || packet.cancel_requested()
+            || packet.completion.status().get() != 0
+            || self.admission_open().is_err()
+        {
+            return None;
+        }
+        let super::command::Validated::Compute { scratch, .. } = &packet.command else { return None; };
+        let required = super::fw::compute_pool::required_blocks(self.shared.active_cores, scratch.pages()).ok()?;
+        loop {
+            let channels = self.shared.channels.observe();
+            let progress = self.shared.progress.observe();
+            let (domain, observed) = match self.compute_readiness(packet, required) {
+                Readiness::Ready => return None,
+                Readiness::Channel => (&self.shared.channels, channels),
+                Readiness::Progress => (&self.shared.progress, progress),
+            };
+            self.shared.queue_events();
+            match domain.wait(observed) {
+                Ok(Some(fence)) => return Some(fence),
+                Ok(None) => continue,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    fn compute_readiness(&self, packet: &Arc<super::job::Packet>, required: usize) -> Readiness {
+        match packet.completion.work_state().and_then(|work| work.acquire()) {
+            Err(error) if error == EBUSY => return Readiness::Progress,
+            Err(_) => return Readiness::Ready,
+            Ok(_) => {}
+        }
+        // The steady state: this owner's channel is bound and installed.
+        if packet.completion.sources().is_none() {
+            if let Some(cell) = self.direct.lock().clone() {
+                let bound = cell.lock().is_some_and(|mut queue| {
+                    let bound = queue.installed()
+                        && !queue.spared_pending()
+                        && queue.pool_fits(required)
+                        && matches!(queue.matches(self.owner, queue.qid(), &self.context), Ok(true));
+                    if bound {
+                        queue.claim();
+                    }
+                    bound
+                });
+                if bound {
+                    self.hold_claim(Some(cell));
+                    return Readiness::Ready;
+                }
+            }
+        }
+        match self.sources_published(packet) {
+            Ok(false) => return Readiness::Progress,
+            Err(_) => return Readiness::Ready,
+            Ok(true) => {}
+        }
+        let lease = match self.shared.preparations.try_enter() {
+            Ok(lease) => lease,
+            Err(error) if error == EAGAIN => return Readiness::Progress,
+            Err(_) => return Readiness::Ready,
+        };
+        let state = self.shared.state.lock();
+        let Some(firmware) = state.as_deref() else { return Readiness::Ready; };
+        if !lease.is_current()
+            || firmware.recovery.pending()
+            || super::recovery::Memory::recovery_state(&firmware.init).unwrap_or(0) != 0
+        {
+            return Readiness::Progress;
+        }
+        firmware.queues.compute_readiness(self.owner, Some(&self.context), required)
+    }
+
+    /// Replaces the prepared packet's channel claim; None releases it after publication,
+    /// cancellation or close.
+    pub(super) fn hold_claim(&self, cell: Option<Arc<ComputeCell>>) {
+        let old = core::mem::replace(&mut *self.claimed.lock(), cell);
+        let freed = old.as_ref().and_then(|old| old.lock()).is_some_and(|mut queue| {
+            let busy = !queue.channel_free();
+            queue.release_claim();
+            busy && queue.channel_free()
+        });
+        if freed {
+            // A channel nobody prepares into any more is shareable now.
+            self.shared.channels.notify();
         }
     }
 
@@ -1868,10 +2031,11 @@ impl Backend {
         }
         // A bound queue needs none of ensure_compute's admission passes. Try
         // without them; the publication section below checks the same state.
+        // Every retry blocks on the release that ends its wait: retirement
+        // progress (work states, ring room, replays) and the reopening of
+        // publication after recovery both signal `progress`.
         let mut bound = true;
         let mut demand = None;
-        let mut recovery_polls = 0;
-        let mut state_delay = 20i64;
         let deadline = now_ns().saturating_add(WORK_RING_WAIT_NS);
         let check = || {
             if packet.cancel_requested() { return Err(ECANCELED); }
@@ -1880,11 +2044,13 @@ impl Backend {
             Ok(())
         };
         let admission = Admission::new(deadline, &check);
+        let progress = &self.shared.progress;
         loop {
             admission.check()?;
+            let observed = progress.observe();
             if !self.sources_published(packet)? {
                 self.shared.queue_events();
-                kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+                self.wait_release(progress, observed, &admission)?;
                 continue;
             }
             // All DRM dependencies were satisfied before this scheduler callback.
@@ -1897,15 +2063,11 @@ impl Backend {
             }
             let lease = self.shared.preparations.enter_until(&admission)?;
             // Work states free as this context's earlier commands retire.
-            // Wait for one under the packet's admission deadline, as render
-            // publication does, instead of failing the packet.
             match packet.completion.work_state()?.acquire() {
                 Err(error) if error == EBUSY => {
                     drop(lease);
-                    admission.check()?;
                     self.shared.queue_events();
-                    kernel::time::delay::fsleep(kernel::time::Delta::from_micros(state_delay));
-                    state_delay = (state_delay * 2).min(1000);
+                    self.wait_release(progress, observed, &admission)?;
                     continue;
                 }
                 result => {
@@ -1928,14 +2090,10 @@ impl Backend {
             }
             let recovery_state = super::recovery::Memory::recovery_state(&firmware.init)?;
             if firmware.recovery.pending() || recovery_state != 0 {
-                if recovery_polls == RECOVERY_SETTLE_POLLS {
-                    return Err(EBUSY);
-                }
-                recovery_polls += 1;
                 drop(state);
                 drop(lease);
                 self.shared.queue_events();
-                kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+                self.wait_release(progress, observed, &admission)?;
                 continue;
             }
             firmware.replay_compute(deferred)?;
@@ -1955,28 +2113,18 @@ impl Backend {
                 dependencies.as_slice(),
                 deferred,
             );
-            if matches!(result, Err(EBUSY) | Err(EAGAIN))
-                && !packet.is_published()
-                && (firmware.recovery.pending()
-                    || super::recovery::Memory::recovery_state(&firmware.init)? != 0)
+            if !packet.is_published()
+                && (matches!(result, Err(EAGAIN))
+                    || (matches!(result, Err(EBUSY))
+                        && (firmware.recovery.pending()
+                            || super::recovery::Memory::recovery_state(&firmware.init)? != 0)))
             {
-                if recovery_polls == RECOVERY_SETTLE_POLLS {
-                    return Err(EBUSY);
-                }
-                recovery_polls += 1;
+                // Recovery or backpressure: nothing is firmware-visible. Other
+                // queues keep submitting and the event worker retires meanwhile.
                 drop(state);
                 drop(lease);
                 self.shared.queue_events();
-                kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
-                continue;
-            }
-            if matches!(result, Err(EAGAIN)) && !packet.is_published() {
-                // Backpressure owns no firmware-visible attempt. Other queues
-                // can submit and the event worker can retire while we sleep.
-                drop(state);
-                drop(lease);
-                self.shared.queue_events();
-                kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+                self.wait_release(progress, observed, &admission)?;
                 continue;
             }
             if result.is_ok() {
@@ -2103,6 +2251,8 @@ impl super::Firmware {
         deferred: &mut DeferredBatch,
         now: u64,
     ) -> Result<Option<u64>> {
+        let mut freed = false;
+        let mut releasing = false;
         for mut queue in self
             .queues
             .compute
@@ -2110,13 +2260,32 @@ impl super::Firmware {
             .flatten()
             .filter_map(|entry| entry.queue.as_deref_mut())
         {
+            let busy = !queue.channel_free();
             queue.recycle_killed()?;
             queue.recycle_quarantined_idle()?;
             if let Some(binding) = queue.detach_exited_owner() {
                 deferred.defer_binding(binding);
             }
+            freed |= busy && queue.channel_free();
+            releasing |= queue.pool_release_pending();
         }
-        self.queues.observe_pool_releases(&self.init, deferred)?;
+        freed |= self.queues.observe_pool_releases(&self.init, deferred)? != 0;
+        let shared = &self.primary.state.shared;
+        // Edge notifications cover the transitions this driver makes; every
+        // event pass also rechecks the level, so capacity that appeared through
+        // another engine (render QIDs, closed logical queues, render-held work
+        // states) still ends a scheduler wait that has no timeout of its own.
+        if freed
+            || (shared.channels.has_waiters()
+                && self.queues.compute_readiness(0, None, 0) == Readiness::Ready)
+        {
+            shared.channels.notify();
+        }
+        // A pool release has no completion event: each observation pass is
+        // the progress a growing owner waits for.
+        if releasing || shared.progress.has_waiters() {
+            shared.progress.notify();
+        }
         if self.queues.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref())
             .any(|queue| queue.pool_release_stalled(now)) {
             return Err(ETIMEDOUT);
@@ -2182,6 +2351,47 @@ impl Backend {
     }
 
     fn wait_compute_capacity(&self, admission: &Admission<'_>, reclaim_backing: bool) -> Result {
+        self.reclaim_capacity(admission, reclaim_backing)?;
+        kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+        admission.check()
+    }
+
+    /// Compute admission without a channel: give back what pressure allows, then block until a
+    /// channel is released after `observed` (sampled before the failed check).
+    fn wait_channels(&self, observed: u64, admission: &Admission<'_>, reclaim_backing: bool) -> Result {
+        self.reclaim_capacity(admission, reclaim_backing)?;
+        self.wait_release(&self.shared.channels, observed, admission)
+    }
+
+    /// Blocks until `domain` is signalled after `observed`, this packet's admission ends, or one
+    /// admission slice passes: cancellation and logical close have no release to wait for.
+    fn wait_release(
+        &self,
+        domain: &super::availability::Availability,
+        observed: u64,
+        admission: &Admission<'_>,
+    ) -> Result {
+        use kernel::dma_fence::RawDmaFence;
+        let slice = admission.slice_ms()?;
+        if let Some(fence) = domain.wait(observed)? {
+            // SAFETY: The owned fence keeps the raw DMA fence alive throughout the wait.
+            let waited = unsafe {
+                kernel::bindings::dma_fence_wait_timeout(
+                    fence.raw(),
+                    false,
+                    kernel::time::msecs_to_jiffies(slice) as isize,
+                )
+            };
+            if waited < 0 {
+                return Err(Error::from_errno(waited as i32));
+            }
+        }
+        admission.check()
+    }
+
+    /// Reclaim steps of a capacity wait that never sleep: observe consumed pool releases and,
+    /// under backing pressure, give idle pools back.
+    fn reclaim_capacity(&self, admission: &Admission<'_>, reclaim_backing: bool) -> Result {
         admission.check()?;
         let mut deferred = DeferredBatch::publication()?;
         let result: Result = (|| {
@@ -2216,8 +2426,6 @@ impl Backend {
             Err(error) if error == EAGAIN => {}
             result => result?,
         }
-        admission.check()?;
-        kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
         admission.check()
     }
 }

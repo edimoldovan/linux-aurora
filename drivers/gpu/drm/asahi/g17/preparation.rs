@@ -60,6 +60,7 @@ pub(super) struct Gate {
 }
 
 impl Gate {
+    #[cfg(CONFIG_KUNIT)]
     pub(super) fn new() -> Result<Arc<Self>> {
         Self::with_waiters(None)
     }

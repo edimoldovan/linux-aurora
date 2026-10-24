@@ -282,7 +282,9 @@ pub(crate) trait Backend: Send + Sync {
     fn fail_vm(&self, error: Error);
     /// Called after both scheduler entities have cancelled their queued jobs.
     fn release_owner(&self);
-    fn prepare(&self, packet: &Packet) -> Option<Fence>;
+    /// A fence to wait for before `publish`, signalled by the release of the capacity the
+    /// packet lacks. Called again once it signals.
+    fn prepare(&self, packet: &Arc<Packet>) -> Option<Fence>;
     fn publish(&self, packet: Arc<Packet>) -> Result<Fence>;
     fn timed_out(&self, packet: Arc<Packet>) -> sched::Status;
     fn cancel(&self, packet: Arc<Packet>);

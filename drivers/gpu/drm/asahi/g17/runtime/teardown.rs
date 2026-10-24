@@ -190,10 +190,17 @@ impl Firmware {
         teardown.publish_ready(&mut service, recovery, super::now_ns())?;
         let consumer = self.init.control_consumer()?.load(Ordering::Relaxed);
         let producer = self.init.control_producer()?.load(Ordering::Relaxed);
+        let mut consumed = false;
         while teardown
             .take_consumed(consumer, producer, &mut service)?
             .is_some()
-        {}
+        {
+            consumed = true;
+        }
+        if consumed {
+            // A channel whose last scheduler release is consumed can change owner.
+            self.primary.state.shared.channels.notify();
+        }
         Ok(())
     }
 }

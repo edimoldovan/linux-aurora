@@ -12,10 +12,14 @@
 //!
 //! # Locking
 //!
-//! `Shared::state` is the device lock. It serializes all firmware-visible publication and all
-//! firmware-shared state, including the bounded waits for the firmware that publication needs.
-//! Completions are signalled after dropping it. Lock order: `Shared::state` -> UAT shared state
-//! -> VM exec lock -> GEM reservation. `RoleState::ack` nests inside nothing.
+//! `Shared::state` is the device lock. It serializes binding, recovery, the event worker and all
+//! firmware-shared state that has no narrower owner. Steady-state compute publication into a
+//! bound queue takes only that queue's cell lock and the port's locks ([`port`]), reached under
+//! a preparation lease. Completions are signalled after dropping the device lock. Lock order:
+//! `Shared::state` -> compute queue cell (one at a time) -> port locks -> availability domains;
+//! `Shared::state` -> UAT shared state -> VM exec lock -> GEM reservation. `RoleState::ack`
+//! nests inside nothing. Capacity waits block on an availability domain signalled by the
+//! release that provides the capacity, never on a sleep.
 
 mod availability;
 mod buffer;
@@ -831,6 +835,12 @@ struct Shared {
     #[pin]
     feed_work: Work<Shared, FEED_WORK>,
     preparations: Arc<preparation::Gate>,
+    /// Compute admission waiting for a physical channel: signalled when a channel becomes
+    /// reusable or shareable, a QID or slot is returned, or a pool vacancy is witnessed.
+    channels: Arc<availability::Availability>,
+    /// Compute admission waiting for retirement-bound capacity (work states, ring and
+    /// in-flight room, drain witnesses, pool releases) or for publication to reopen.
+    progress: Arc<availability::Availability>,
     /// Logical-queue creation waiting for a returned queue slot or execution context.
     queues: Arc<availability::Availability>,
     /// Unbound compute publishers which can reuse a retired channel.
@@ -1115,8 +1125,10 @@ impl Gpu {
             oas: cfg.uat_oas,
         };
         let max_frequency_khz = Self::max_frequency_khz(dev)?;
-        let preparations = preparation::Gate::new()?;
+        let channels = availability::Availability::new()?;
+        let progress = availability::Availability::new()?;
         let queues = availability::Availability::new()?;
+        let preparations = preparation::Gate::with_waiters(Some(progress.clone()))?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new()?;
         let active_cores = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
@@ -1147,6 +1159,8 @@ impl Gpu {
                 feed,
                 feed_work <- new_work!("g17::Shared::feed_work"),
                 preparations,
+                channels,
+                progress,
                 queues,
                 compute_demand: AtomicU32::new(0),
                 work <- new_work!("g17::Shared::work"),

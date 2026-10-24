@@ -550,6 +550,8 @@ pub(crate) struct Queue {
     config_cache: Option<(QueueConfig, u64)>,
     ordinal: u32,
     submitted: u32,
+    /// Prepared packets of the bound owner about to publish (see [`Self::claim`]).
+    claims: u32,
     last_published: u64,
     last_end: u64,
     released: bool,
@@ -615,6 +617,7 @@ impl Queue {
             config_cache: None,
             ordinal: 0,
             submitted: 0,
+            claims: 0,
             last_published: 0,
             last_end: 0,
             released: false,
@@ -2367,14 +2370,33 @@ impl Queue {
         Ok(self.reusable())
     }
 
+    /// Another owner could take this channel now: idle and released, shareable, or vacant.
+    pub(crate) fn channel_free(&self) -> bool {
+        self.reusable() || self.shareable() || self.can_rearm()
+    }
+
+    /// A pool replacement is in flight for this queue.
+    pub(crate) fn growing(&self) -> bool {
+        self.growing
+    }
+
     /// The queue's first command has been published: its identity and configuration exist.
     pub(crate) fn installed(&self) -> bool {
         self.installed
     }
 
+    /// A packet of the bound owner passed prepare_job and will publish here.
+    pub(crate) fn claim(&mut self) {
+        self.claims = self.claims.saturating_add(1);
+    }
+
+    pub(crate) fn release_claim(&mut self) {
+        self.claims = self.claims.saturating_sub(1);
+    }
+
     /// An open client's idle channel that [`Self::share_idle`] can hand over.
     pub(crate) fn shareable(&self) -> bool {
-        self.installed && self.owner.is_some() && self.retirement_ready
+        self.claims == 0 && self.installed && self.owner.is_some() && self.retirement_ready
             && !self.growing && !self.quarantined && !self.awaiting_witness
             && self.exit.is_none() && self.active.len == 0 && self.replays.len == 0
             && self.previous.is_none() && self.pool_phase == PoolPhase::Populated

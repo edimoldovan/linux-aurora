@@ -51,6 +51,10 @@ impl Availability {
         self.state.lock().generation
     }
 
+    pub(crate) fn has_waiters(&self) -> bool {
+        self.state.lock().waiters.is_some()
+    }
+
     /// A fence the next notification signals. None means capacity changed after the sample:
     /// retry instead of waiting. Called with no resource lock held. The recheck after allocation
     /// closes both the failed-check/registration and the fence-allocation/release races. A

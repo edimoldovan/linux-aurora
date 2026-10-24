@@ -104,6 +104,8 @@ impl Firmware {
             }
         }
         self.queues.replay_outer_wait = None;
+        // Publication behind these replays may proceed.
+        self.primary.state.shared.progress.notify();
         Ok(())
     }
 }
