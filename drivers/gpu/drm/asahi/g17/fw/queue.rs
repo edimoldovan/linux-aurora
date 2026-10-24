@@ -160,8 +160,30 @@ static_assert!(core::mem::offset_of!(PointerBlock, entries) == 0x60);
 unsafe impl Zeroable for PointerBlock {}
 
 impl PointerBlock {
+    /// Offsets of the two host words a [`PointerLayout`] may name.
+    const WORD_40: usize = core::mem::offset_of!(Self, word_40);
+    const WORD_50: usize = core::mem::offset_of!(Self, word_50);
+
+    /// Whether `offset` is one of the host words a [`PointerLayout`] may name.
+    const fn is_host_word(offset: usize) -> bool {
+        offset == Self::WORD_40 || offset == Self::WORD_50
+    }
+
+    /// Whether `layout` names host words of the block, and two different ones when it has a
+    /// recovery target. Every firmware variant's layout is checked at build time.
+    pub(crate) const fn valid_layout(layout: &PointerLayout) -> bool {
+        match layout.recovery_target {
+            None => Self::is_host_word(layout.producer),
+            Some(target) => {
+                Self::is_host_word(layout.producer)
+                    && Self::is_host_word(target)
+                    && target != layout.producer
+            }
+        }
+    }
+
     /// Returns the cursors of an empty item ring.
-    pub(crate) fn new(layout: &PointerLayout) -> Self {
+    pub(crate) fn new(layout: &PointerLayout) -> Result<Self> {
         let block = Self {
             done: AtomicU32::new(0),
             unk_04: [0; 11],
@@ -175,17 +197,17 @@ impl PointerBlock {
             unk_64: [0; 7],
         };
         if let Some(target) = layout.recovery_target {
-            block.word(target).store(u32::MAX, Ordering::Relaxed);
+            block.word(target)?.store(u32::MAX, Ordering::Relaxed);
         }
-        block
+        Ok(block)
     }
 
-    /// The host word at `offset`, one of the two [`PointerLayout`] names.
-    fn word(&self, offset: usize) -> &AtomicU32 {
-        if offset == core::mem::offset_of!(Self, word_50) {
-            &self.word_50
-        } else {
-            &self.word_40
+    /// The host word at `offset`, which must be one a [`PointerLayout`] may name.
+    fn word(&self, offset: usize) -> Result<&AtomicU32> {
+        match offset {
+            Self::WORD_40 => Ok(&self.word_40),
+            Self::WORD_50 => Ok(&self.word_50),
+            _ => Err(EINVAL),
         }
     }
 
@@ -196,10 +218,12 @@ impl PointerBlock {
     /// queues. Only valid while the firmware does not run the queue, with all
     /// three cursors zero. Writes `done`, `unk_30` and the producer, in this
     /// order, with single stores; the caller issues a full barrier afterwards.
-    pub(crate) fn rebase(&self, layout: &PointerLayout, base: u32) {
+    pub(crate) fn rebase(&self, layout: &PointerLayout, base: u32) -> Result {
+        let producer = self.word(layout.producer)?;
         self.done.store(base, Ordering::Relaxed);
         self.unk_30.store(base, Ordering::Relaxed);
-        self.word(layout.producer).store(base, Ordering::Relaxed);
+        producer.store(base, Ordering::Relaxed);
+        Ok(())
     }
 }
 

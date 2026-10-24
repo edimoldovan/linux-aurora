@@ -160,7 +160,7 @@ impl Graph {
                 }),
             )?;
             queues.initialize::<queue::PointerBlock>(POINTERS[stage], |view| {
-                *view = queue::PointerBlock::new(&pointers);
+                *view = queue::PointerBlock::new(&pointers)?;
                 Ok(())
             })?;
         }

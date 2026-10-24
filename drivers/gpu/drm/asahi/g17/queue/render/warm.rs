@@ -40,7 +40,7 @@ impl Pair {
         for block in blocks {
             // SAFETY: Both complete pointer blocks were checked above. This fresh
             // graph is unpublished; only the live atomic cursors are accessed.
-            unsafe { &*block }.rebase(&layout, 0);
+            unsafe { &*block }.rebase(&layout, 0)?;
         }
         fence(Ordering::SeqCst);
         self.cursors = [0; 2];

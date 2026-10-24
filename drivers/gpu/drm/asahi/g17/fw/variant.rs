@@ -126,3 +126,8 @@ pub(crate) const V25G83: Variant = Variant {
     lead_commands: true,
     programs: super::render::RegisterPrograms::V25G83,
 };
+
+const _: () = {
+    assert!(super::queue::PointerBlock::valid_layout(&V26A428.pointers));
+    assert!(super::queue::PointerBlock::valid_layout(&V25G83.pointers));
+};

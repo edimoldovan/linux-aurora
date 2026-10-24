@@ -155,7 +155,7 @@ impl Graph {
                 owner_pid: context.owner_pid(),
                 policy: context.policy(),
             });
-            view.pointers = PointerBlock::new(&pointers);
+            view.pointers = PointerBlock::new(&pointers)?;
             view.jobs = JobListHead::new(graph_va + 0x200);
             Ok(())
         })?;
