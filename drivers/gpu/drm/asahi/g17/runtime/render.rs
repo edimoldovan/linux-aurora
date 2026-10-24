@@ -609,7 +609,16 @@ impl crate::g17::queue::render::Host for Host<'_> {
         buffer_id: u8,
     ) -> Result {
         let queues = &mut self.firmware.queues;
-        let next = queues.render.pools.completed(pool_id, generation)?;
+        // Each final release is a control record the firmware processes before
+        // it returns to the work rings. While other pairs keep it busy, a
+        // registration left idle lingers instead, and the owner's next render
+        // reuses it. On an otherwise idle device the release is cheaper than
+        // reusing a registration that went idle, so it is sent at once.
+        // The pair retiring here is lent out of its entry meanwhile.
+        let linger = queues.render.entries.iter().flatten().any(|entry| {
+            entry.pair.as_ref().is_some_and(|pair| pair.published_in_flight())
+        });
+        let next = queues.render.pools.completed(pool_id, generation, linger)?;
         queues.buffers.can_release(buffer_id)?;
         if let Some(owners) = owners {
             self.firmware.port.qos_complete(&owners)?;
@@ -643,6 +652,30 @@ impl crate::g17::Firmware {
         host.release_registration();
         self.queues.render.entries[slot].as_mut().ok_or(EIO)?.pair = Some(pair);
         result
+    }
+
+    /// Event-worker turn: ends free-list lingers that elapsed or whose owner
+    /// closed or moved on, publishes their releases, and returns the delay to
+    /// the next expiry, which the worker turns into a timed wake.
+    pub(in crate::g17) fn expire_render_lingers(&mut self, now: u64) -> Result<Option<u64>> {
+        let render = &mut self.queues.render;
+        let entries = &render.entries;
+        let (ended, next) = render.pools.expire_lingers(now, |owner| {
+            entries.iter().flatten().any(|entry| {
+                !entry.closed
+                    && entry
+                        .pool
+                        .as_ref()
+                        .is_some_and(|pool| pools::Pools::owner(pool) == *owner)
+            })
+        });
+        if ended {
+            match self.release_render_lists() {
+                Err(error) if error == EAGAIN => {}
+                result => result?,
+            }
+        }
+        Ok(next)
     }
 
     fn release_render_lists(&mut self) -> Result {

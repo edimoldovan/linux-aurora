@@ -399,6 +399,11 @@ impl crate::g17::Shared {
             .any(|queue| queue.in_flight());
         let in_flight = compute || firmware.queues.render_in_flight();
         let idle = firmware.idle_check(now, in_flight)?;
+        let lingers = if firmware.recovery.pending() {
+            None
+        } else {
+            firmware.expire_render_lingers(now)?
+        };
         firmware.reclaim_drained_renders(deferred)?;
         firmware.service_compute_exit(deferred)?;
         let pools = firmware.service_compute_pools(deferred, now)?;
@@ -441,11 +446,14 @@ impl crate::g17::Shared {
         } else {
             idle
         };
-        // A retained compute pool gives its backing back when it expires.
-        let idle = match (idle, pools) {
-            (Some(delay), Some(expiry)) => Some(delay.min(expiry)),
-            (delay, expiry) => delay.or(expiry),
-        };
+        // A retained compute pool gives its backing back when it expires, and
+        // so does an idle render free-list registration.
+        let idle = [pools, lingers]
+            .into_iter()
+            .fold(idle, |idle, expiry| match (idle, expiry) {
+                (Some(delay), Some(expiry)) => Some(delay.min(expiry)),
+                (delay, expiry) => delay.or(expiry),
+            });
         if let Some(delay) = idle {
             self.queue_idle(delay);
         }
