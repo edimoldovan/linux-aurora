@@ -264,6 +264,9 @@ pub(crate) struct Completion {
     timeout_error: AtomicI32,
     replays: AtomicU8,
     replay_timeout: AtomicBool,
+    /// A recovery blamed this command. Unlike `class`, which a later
+    /// classification can change, this never clears.
+    blamed: AtomicBool,
     firmware_consumer: AtomicBool,
     class: AtomicU8,
 }
@@ -318,6 +321,7 @@ impl Completion {
                 timeout_error: AtomicI32::new(0),
                 replays: AtomicU8::new(0),
                 replay_timeout: AtomicBool::new(false),
+                blamed: AtomicBool::new(false),
                 firmware_consumer: AtomicBool::new(false),
                 class: AtomicU8::new(0),
             }),
@@ -469,6 +473,16 @@ impl Completion {
 
     pub(crate) fn guilty(&self) -> bool {
         self.class.load(Ordering::Acquire) == 2
+    }
+
+    /// A recovery blamed this command, whatever class it keeps: it may have caused the fault,
+    /// so it is never published again.
+    pub(crate) fn note_blamed(&self) {
+        self.blamed.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn blamed(&self) -> bool {
+        self.blamed.load(Ordering::Acquire)
     }
 
     /// Installed before the first firmware-visible prefix. Cancellation takes

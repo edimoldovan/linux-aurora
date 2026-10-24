@@ -7,8 +7,11 @@
 /// One retained group, front first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Group {
-    /// Published, not failed and not blamed (guilty) by a recovery.
+    /// Published, not failed and not classified guilty by a recovery.
     pub(crate) innocent: bool,
+    /// A recovery blamed it, whatever class it kept (an earlier recovery may have spared it):
+    /// it may have caused the fault.
+    pub(crate) blamed: bool,
     /// Carries the strict abandonment witness.
     pub(crate) abandoned: bool,
     /// Already republished the maximum number of times.
@@ -31,7 +34,7 @@ pub(crate) fn decide(groups: impl Iterator<Item = Group>) -> Decision {
     let mut front_exhausted = None;
     let mut successor_exhausted = false;
     for group in groups {
-        if !group.innocent {
+        if !group.innocent || group.blamed {
             return Decision::Refuse;
         }
         if !group.abandoned {
@@ -53,9 +56,10 @@ pub(crate) fn decide(groups: impl Iterator<Item = Group>) -> Decision {
 mod tests {
     use super::*;
     fn group(innocent: bool, abandoned: bool, exhausted: bool) -> Group {
-        Group { innocent, abandoned, exhausted }
+        Group { innocent, blamed: false, abandoned, exhausted }
     }
-    const OK: Group = Group { innocent: true, abandoned: true, exhausted: false };
+    const OK: Group = Group { innocent: true, blamed: false, abandoned: true, exhausted: false };
+    const BLAMED: Group = Group { innocent: true, blamed: true, abandoned: true, exhausted: false };
     #[test]
     fn every_group_abandoned_and_innocent_is_replayed() {
         assert_eq!(decide([OK].into_iter()), Decision::Replay);
@@ -69,6 +73,16 @@ mod tests {
     fn guilty_work_is_never_replayed() {
         assert_eq!(decide([group(false, true, false)].into_iter()), Decision::Refuse);
         assert_eq!(decide([OK, group(false, true, false)].into_iter()), Decision::Refuse);
+    }
+    #[test]
+    fn blamed_work_is_never_replayed_even_when_spared() {
+        // An earlier recovery spared it, so it still counts as innocent; the blame refuses it.
+        assert_eq!(decide([BLAMED].into_iter()), Decision::Refuse);
+        assert_eq!(decide([BLAMED, OK].into_iter()), Decision::Refuse);
+        assert_eq!(decide([OK, BLAMED].into_iter()), Decision::Refuse);
+        // Also once the replay limit is reached, where an innocent front alone is replayed.
+        let exhausted = Group { exhausted: true, ..BLAMED };
+        assert_eq!(decide([exhausted].into_iter()), Decision::Refuse);
     }
     #[test]
     fn a_live_group_waits_and_stops_the_walk() {
