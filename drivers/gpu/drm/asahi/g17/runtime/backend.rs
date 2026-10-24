@@ -216,11 +216,12 @@ impl job::Backend for Backend {
 
     /// Firmware kick parents order the same engine. Explicit cross-engine and
     /// input dependencies were already attached to the DRM scheduled job.
-    /// Compute admission waits for its shared capacity here, as a fence.
+    /// Compute and render admission wait for their shared capacity here, as a
+    /// fence.
     fn prepare(&self, packet: &Arc<Packet>) -> Option<Fence> {
         match packet.engine() {
             Engine::Compute => self.prepare_compute(packet),
-            Engine::Render => None,
+            Engine::Render => self.admit_render(packet),
         }
     }
 

@@ -141,6 +141,55 @@ impl Backend {
         }
     }
 
+    /// Scheduler admission of a render packet. A work state of its context or
+    /// a pair admission it lacks becomes a fence that the return providing it
+    /// signals, so run_job finds both ready instead of waiting for them.
+    /// Errors, and anything else publication may wait for, are left to it.
+    pub(in crate::g17::runtime) fn admit_render(&self, packet: &Arc<Packet>) -> Option<kernel::dma_fence::Fence> {
+        if packet.early_result().is_some()
+            || packet.cancel_requested()
+            || packet.completion.status().get() != 0
+            || self.admission_open().is_err()
+        {
+            return None;
+        }
+        // Each check runs once more after sampling its domain, so the common
+        // case takes no domain lock and no return between check and wait is lost.
+        let work = packet.completion.work_state().ok()?;
+        loop {
+            match work.acquire() {
+                Err(error) if error == EBUSY => {
+                    let states = work.returns().observe();
+                    match work.acquire() {
+                        Err(error) if error == EBUSY => match work.returns().wait(states) {
+                            Ok(Some(fence)) => return Some(fence),
+                            Ok(None) => continue,
+                            Err(_) => return None,
+                        },
+                        Err(_) => return None,
+                        Ok(_) => {}
+                    }
+                }
+                Err(_) => return None,
+                Ok(_) => {}
+            }
+            let request = Request::of(packet);
+            if self.admission.admits_render(self.owner, request) {
+                return None;
+            }
+            let observed = self.shared.renders.observe();
+            if self.admission.admits_render(self.owner, request) {
+                return None;
+            }
+            self.shared.queue_events();
+            match self.shared.renders.wait(observed) {
+                Ok(Some(fence)) => return Some(fence),
+                Ok(None) => continue,
+                Err(_) => return None,
+            }
+        }
+    }
+
     /// Conditions which end a publication that has not become visible yet.
     fn publication_open(&self, packet: &Packet) -> Result {
         self.admission_open()?;

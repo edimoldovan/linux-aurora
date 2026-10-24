@@ -298,6 +298,28 @@ impl State {
         )
     }
 
+    /// Whether `pick` would return a slot, without taking it.
+    fn can_pick(&self, owner: u64, plan: Plan) -> bool {
+        let usable = |slot: usize| {
+            self.owners[slot] == owner
+                && (self.quarantined | self.kill_hold) & (1u64 << slot) == 0
+                && self.refs[slot] < cfg::RENDER_DEPTH
+        };
+        match plan {
+            Plan::Wait => false,
+            Plan::Pair(slot) => usize::from(slot) < cfg::RENDER_SLOTS && usable(usize::from(slot)),
+            Plan::Any if owner == 0 => false,
+            Plan::Any if self.owners.contains(&owner) => (0..cfg::RENDER_SLOTS).any(usable),
+            Plan::Any => {
+                let free = !self.active & Self::MASK & !self.quarantined & !self.kill_hold;
+                (0..cfg::RENDER_SLOTS).any(|slot| {
+                    free & (1u64 << slot) != 0
+                        && (self.released & (1u64 << slot) != 0 || self.owners[slot] == 0)
+                })
+            }
+        }
+    }
+
     fn pick(&mut self, owner: u64, plan: Plan) -> Option<u8> {
         match plan {
             Plan::Any => self.acquire(owner),
@@ -554,6 +576,24 @@ impl Pool {
             slot,
             record,
         }))
+    }
+    /// Whether `acquire_render` would admit this request now, without
+    /// admitting it: the scheduler's prepare step waits for this.
+    pub(crate) fn admits_render(&self, owner: u64, request: Option<Request<'_>>) -> bool {
+        let state = self.state.lock();
+        if owner == 0 || state.refusal(owner).is_err() {
+            return false;
+        }
+        if state
+            .owners
+            .iter()
+            .position(|id| *id == owner)
+            .is_some_and(|slot| state.quarantined & (1u64 << slot) != 0)
+        {
+            return false;
+        }
+        let plan = state.plan(owner, request, None);
+        state.can_pick(owner, plan)
     }
     pub(crate) fn warmable_sibling(
         self: &Arc<Self>,
