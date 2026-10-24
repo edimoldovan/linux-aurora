@@ -326,6 +326,28 @@ impl Registry {
         Ok(None)
     }
 
+    /// The installed pair in `slot` belongs to `owner` and its context, is
+    /// neither borrowed nor settling a failure, and its pool has backing: the
+    /// state in which building the pair would do nothing.
+    pub(super) fn render_ready(&self, slot: u8, owner: u64, context: &Arc<Context>) -> Result<bool> {
+        let Ok(entry) = self.render.entry(slot) else {
+            return Ok(false);
+        };
+        if entry.pending_error.is_some()
+            || entry.pending_timeout
+            || entry.constructing
+            || entry.preparing.is_some()
+            || entry.growing
+            || entry.parked.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(pair) = entry.pair.as_ref() else {
+            return Ok(false);
+        };
+        Ok(pair.matches(owner, context)? && !pair.pool().vacant())
+    }
+
     fn has_render_ids(&self, owner: u64) -> bool {
         self.render
             .entries

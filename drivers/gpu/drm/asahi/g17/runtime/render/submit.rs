@@ -44,16 +44,15 @@ impl Backend {
     /// Reserve identities before attaching a lease to the packet. An empty
     /// logical slot must not hide reusable physical channels when the shared
     /// queue-ID namespace is full.
+    /// Also reports whether the owner's installed pair is ready to take the
+    /// command, so that the publication skips graph construction.
     fn acquire_render_with_ids(
         &self,
         packet: &Arc<Packet>,
         mut next: Option<RenderLease>,
         sleep: bool,
-    ) -> Result<RenderLease> {
-        let pool = {
-            let state = self.shared.state.lock();
-            (*state).as_deref().ok_or(ENODEV)?.queues.admission.clone()
-        };
+    ) -> Result<(RenderLease, bool)> {
+        let pool = &self.admission;
         let started = super::super::now_ns();
         let deadline_ns = started.saturating_add(u64::from(crate::g17::job::TIMEOUT_MS) * 1_000_000);
         // A capacity refusal samples the render domain and retries once; only
@@ -108,7 +107,10 @@ impl Backend {
             let mut state = self.shared.state.lock();
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
             match firmware.queues.ensure_render_ids(slot, self.owner) {
-                Ok(()) => return Ok(lease),
+                Ok(()) => {
+                    let ready = firmware.queues.render_ready(slot, self.owner, &self.context)?;
+                    return Ok((lease, ready));
+                }
                 Err(error) if error == ENOSPC => {
                     let reclaimed = firmware.queues.reclaim_unused_render_spare(None, true)?;
                     if reclaimed.is_some() {
@@ -282,7 +284,7 @@ impl Backend {
         // A publication from the submitting ioctl (an early lease) never
         // sleeps for contention; it falls back to the scheduler instead.
         let sleep = early.is_none();
-        let admission = self.acquire_render_with_ids(packet, early, sleep)?;
+        let (admission, mut ready) = self.acquire_render_with_ids(packet, early, sleep)?;
         let slot = admission.slot();
         packet.completion.attach_render_lease(admission)?;
         let mut busy_since = None;
@@ -335,7 +337,14 @@ impl Backend {
                     result?;
                 }
             }
-            match self.ensure_render(packet, slot, sleep) {
+            // A pair found ready under the identity check needs no build; any
+            // retry revalidates through ensure_render.
+            let ensured = if core::mem::take(&mut ready) {
+                Ok(())
+            } else {
+                self.ensure_render(packet, slot, sleep)
+            };
+            match ensured {
                 Err(error) if error == ENOSPC => {
                     self.wait_render_capacity(&mut seen, capacity_started, sleep)?;
                     continue;
@@ -386,19 +395,9 @@ impl Backend {
         if self.backlog.load(Ordering::Acquire) != 0 || packet.has_dependencies() {
             return false;
         }
-        let admission = {
-            let state = self.shared.state.lock();
-            let Some(firmware) = (*state).as_deref() else {
-                return false;
-            };
-            match firmware
-                .queues
-                .admission
-                .try_acquire_render(self.owner, Request::of(packet))
-            {
-                Ok(Some(lease)) => lease,
-                _ => return false,
-            }
+        let admission = match self.admission.try_acquire_render(self.owner, Request::of(packet)) {
+            Ok(Some(lease)) => lease,
+            _ => return false,
         };
         if !packet.begin_publication() {
             packet.completion.fail_unpublished(ECANCELED);

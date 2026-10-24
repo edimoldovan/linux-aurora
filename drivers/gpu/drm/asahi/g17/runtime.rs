@@ -664,6 +664,8 @@ pub(super) struct Backend {
     /// channel from being shared away between prepare_job and run_job.
     #[pin]
     claimed: kernel::sync::Mutex<Option<Arc<ComputeCell>>>,
+    /// Render pair admission, shared by every logical queue of the session.
+    admission: Arc<admission::Pool>,
 }
 
 impl Backend {
@@ -745,6 +747,7 @@ impl Backend {
             return Err(EAGAIN);
         }
         drop(state);
+        let admission = slot.pool().clone();
         Ok((
             Arc::pin_init(
                 pin_init!(Self {
@@ -756,6 +759,7 @@ impl Backend {
                     closed: core::sync::atomic::AtomicBool::new(false),
                     direct <- kernel::new_mutex!(None, "g17::Backend::direct"),
                     claimed <- kernel::new_mutex!(None, "g17::Backend::claimed"),
+                    admission,
                 }),
                 GFP_KERNEL,
             )?,

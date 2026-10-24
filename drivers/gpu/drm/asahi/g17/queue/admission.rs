@@ -686,6 +686,12 @@ mod accounting_tests {
 pub(crate) struct QueueSlot {
     pool: Arc<Pool>,
 }
+impl QueueSlot {
+    /// The device's admission pool, which lives as long as the firmware session.
+    pub(crate) fn pool(&self) -> &Arc<Pool> {
+        &self.pool
+    }
+}
 impl Drop for QueueSlot {
     fn drop(&mut self) {
         self.pool.queues.fetch_sub(1, Ordering::AcqRel);
