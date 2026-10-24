@@ -20,12 +20,16 @@ use core::sync::atomic::{AtomicBool, Ordering};
 type Asid = u8;
 
 /// Invalidate ranges page by page (`mmu::UatQuirks::page_tlbi`): never range operations.
+///
+/// The setting is global because the invalidation helpers take no UAT. It assumes one GPU per
+/// system: `Uat::new` sets it for that GPU before the GPU's first invalidation, and a second
+/// UAT with another policy would change it for both.
 static PAGE_TLBI: AtomicBool = AtomicBool::new(false);
 
 /// Ranges above this many pages are invalidated by ASID in page mode.
 const PAGE_TLBI_MAX_PAGES: usize = 2048;
 
-/// Selects page-by-page range invalidation for this GPU.
+/// Selects page-by-page range invalidation for the system's GPU ([`PAGE_TLBI`]).
 pub(crate) fn set_page_tlbi(enabled: bool) {
     PAGE_TLBI.store(enabled, Ordering::Relaxed);
 }
