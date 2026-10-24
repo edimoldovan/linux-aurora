@@ -1525,8 +1525,14 @@ impl Pair {
                 let snapshot = observer.snapshot(active.ticket.ordinal)?;
                 let stamps = observer.stamps()?;
                 let (_, state) = observer.host.epoch()?;
+                // A torn sample is no proof, as in replay_abandoned(): the group stays retained
+                // (quarantined with the pair if nothing was retired) instead of the error
+                // stopping the runtime for every client.
                 if !active.outer_published
-                    || !retirement::abandoned(&active.ticket, snapshot, stamps, state, false)?
+                    || !matches!(
+                        retirement::abandoned(&active.ticket, snapshot, stamps, state, false),
+                        Ok(true)
+                    )
                 {
                     break;
                 }
