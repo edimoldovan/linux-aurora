@@ -959,6 +959,7 @@ impl Backend {
 /// The physical namespace bounds the batch independently of open logical queues.
 /// Collection failure leaves the engine's Active owner intact for a stopped retry.
 pub(super) struct DeferredBatch {
+    has_source_completions: bool,
     values: KVVec<super::completion::Deferred>,
     /// Exited owners detached from idle retained compute queues and the backing
     /// of vacated pools: unmapping and freeing happen in `finish`, off-lock.
@@ -994,6 +995,7 @@ impl DeferredBatch {
             0
         };
         Ok(Self {
+            has_source_completions: false,
             values: KVVec::with_capacity(capacity, GFP_KERNEL)?,
             bindings: KVVec::with_capacity(detached, GFP_KERNEL)?,
             vacated: KVVec::with_capacity(detached, GFP_KERNEL)?,
@@ -1051,6 +1053,12 @@ impl DeferredBatch {
                 completion.status().record(*error);
             }
         }
+        match &value {
+            Deferred::Retired(completion, Err(error)) | Deferred::Drained(completion, Err(error))
+            | Deferred::FailedOwned(completion, error) | Deferred::Unpublished(completion, error) =>
+                { completion.note_input_error(*error); },
+            _ => {},
+        }
         self.values.push_within_capacity(value).map_err(|_| EIO)?;
         // A later publisher can borrow this pair before finish signals its old
         // fence. Publish the exact completion's witness only after collection
@@ -1062,11 +1070,29 @@ impl DeferredBatch {
         ) = self.values.last()
         {
             completion.note_retirement_queued();
+            self.has_source_completions |= completion.sources().is_some();
         }
         Ok(())
     }
     /// Called only after releasing the device mutex.
     pub(super) fn finish(&mut self) {
+        use super::completion::Deferred;
+        if self.has_source_completions {
+            for _ in 0..self.values.len() {
+                let mut changed = false;
+                for value in &self.values {
+                    if let Deferred::Retired(completion, Ok(_))
+                        | Deferred::Drained(completion, Ok(_)) = value
+                    {
+                        if let Err(error) = completion.check_source_inputs() {
+                            changed |= completion.note_input_error(error);
+                        }
+                    }
+                }
+                if !changed { break; }
+            }
+        }
+        self.has_source_completions = false;
         for value in self.values.drain_all() {
             value.finish();
         }
@@ -1140,11 +1166,75 @@ impl compute::Host for ComputeHost<'_> {
 }
 
 impl super::Firmware {
-    fn publish_compute(
+    #[inline]
+    fn publish_compute(&mut self, owner: u64, packet: Arc<super::job::Packet>,
+        dependencies: &[super::fw::kick::KickDependency], deferred: &mut DeferredBatch) -> Result
+    {
+        if packet.completion.sources().is_some() {
+            self.publish_compute_inputs(owner, packet, dependencies, deferred)
+        } else {
+            self.publish_compute_raw(owner, packet, dependencies, &[], deferred)
+        }
+    }
+
+    #[inline(never)]
+    fn publish_compute_inputs(&mut self, owner: u64, packet: Arc<super::job::Packet>,
+        dependencies: &[super::fw::kick::KickDependency], deferred: &mut DeferredBatch) -> Result
+    {
+        if self.recovery.pending() || super::recovery::Memory::recovery_state(&self.init)? != 0 {
+            return Err(EAGAIN);
+        }
+        let sources = packet.completion.sources().ok_or(EINVAL)?.clone();
+        sources.check()?;
+        let mut merged = super::dependency::Frontier::new();
+        for dependency in dependencies { merged.insert(0, *dependency)?; }
+        let mut holds = KVec::with_capacity(sources.sources.len(), GFP_KERNEL)?;
+        let mut native: KVec<super::sync_input::NativeWait> =
+            KVec::with_capacity(sources.sources.len(), GFP_KERNEL)?;
+        for source in &sources.sources {
+            if source.submission.source_status()? { continue; }
+            let found = self.queues.compute.iter_mut().flatten()
+                .filter_map(|entry| entry.queue.as_deref_mut())
+                .find_map(|queue| match queue.source_dependency(source, packet.completion.status(),
+                    self.recovery.generation()) {
+                    Ok(None) => None,
+                    result => Some(result),
+                }).ok_or(EAGAIN)??;
+            let Some((sequence, dependency, stamp_va, event_slot, hold)) = found else {
+                return Err(EAGAIN);
+            };
+            merged.insert(sequence, dependency)?;
+            let wait = super::sync_input::NativeWait { sequence, dependency, stamp_va, event_slot };
+            if let Some(old) = native.iter_mut().find(|old|
+                old.dependency.qid() == dependency.qid()) {
+                if sequence > old.sequence { *old = wait; }
+            } else {
+                native.push(wait, GFP_KERNEL)?;
+            }
+            holds.push(hold, GFP_KERNEL)?;
+        }
+        let result = self.publish_compute_raw(owner, packet.clone(), merged.as_slice(),
+            native.as_slice(), deferred);
+        if packet.is_published() {
+            for queue in self.queues.compute.iter().flatten()
+                .filter_map(|entry| entry.queue.as_deref())
+                .filter(|queue| native.iter().any(|wait| wait.dependency.qid() == queue.qid()))
+            {
+                for source in &sources.sources { queue.note_input_consumer(source); }
+            }
+            sources.set_holds(holds);
+            super::sync_input::note_published();
+            super::sync_input::note_native(native.len());
+        }
+        result
+    }
+
+    fn publish_compute_raw(
         &mut self,
         owner: u64,
         packet: Arc<super::job::Packet>,
         dependencies: &[super::fw::kick::KickDependency],
+        native: &[super::sync_input::NativeWait],
         deferred: &mut DeferredBatch,
     ) -> Result {
         if self.recovery.pending() {
@@ -1183,9 +1273,12 @@ impl super::Firmware {
             accounting: &mut queues.accounting,
             generation: self.recovery.generation(),
         };
-        queue.publish(packet, dependencies, &mut host, &mut |event| {
-            deferred.push(event)
-        })
+        if native.is_empty() {
+            queue.publish(packet, dependencies, &mut host, &mut |event| deferred.push(event))
+        } else {
+            queue.publish_with_native_waits(packet, dependencies, native,
+                &mut host, &mut |event| deferred.push(event))
+        }
     }
 }
 
@@ -1442,6 +1535,27 @@ impl Backend {
         }
     }
 
+    /// A scheduled dependency may refer to a previous recovery epoch. Do not
+    /// acquire consumer capacity until every live source is published now.
+    fn sources_published(&self, packet: &super::job::Packet) -> Result<bool> {
+        let Some(sources) = packet.completion.sources() else { return Ok(true); };
+        sources.check()?;
+        let state = self.shared.state.lock();
+        let firmware = state.as_deref().ok_or(ENODEV)?;
+        if firmware.recovery.pending()
+            || super::recovery::Memory::recovery_state(&firmware.init)? != 0
+        { return Ok(false); }
+        for source in &sources.sources {
+            if source.submission.source_status()? { continue; }
+            if !firmware.queues.compute.iter().flatten()
+                .filter_map(|entry| entry.queue.as_deref())
+                .any(|queue| queue.has_input_source(&source.submission,
+                    packet.completion.status(), firmware.recovery.generation()))
+            { return Ok(false); }
+        }
+        Ok(true)
+    }
+
     /// Called after taking this packet's publication claim. All waits and work
     /// state allocation precede the device mutex; only the checked epoch commits.
     fn compute_packet(
@@ -1468,6 +1582,11 @@ impl Backend {
         let admission = Admission::new(deadline, &check);
         loop {
             admission.check()?;
+            if !self.sources_published(packet)? {
+                self.shared.queue_events();
+                kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+                continue;
+            }
             // All DRM dependencies were satisfied before this scheduler callback.
             // Recheck on every retry: pressure may yield an idle binding between
             // admission and publication without changing this logical queue.

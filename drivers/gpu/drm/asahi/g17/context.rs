@@ -354,6 +354,7 @@ pub(crate) struct WorkStateLease {
     word: AtomicU32,
 }
 impl WorkStateLease {
+    pub(super) fn status(&self) -> &Arc<VmStatus> { self.context.status() }
     pub(crate) fn deferred(context: Arc<Context>) -> Self {
         Self {
             context,

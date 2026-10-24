@@ -150,6 +150,7 @@ impl Packet {
             super::dependency::replay_status(fence_status(fence))?;
         }
         for fence in &self.firmware { check_status(fence)?; }
+        self.completion.check_source_inputs()?;
         Ok(())
     }
 
@@ -183,6 +184,7 @@ impl Packet {
         for fence in &self.firmware {
             check_status(fence)?;
         }
+        self.completion.check_source_inputs()?;
         Ok(())
     }
 
@@ -262,6 +264,9 @@ fn check_status(fence: &Fence) -> Result {
 /// It performs all completion signalling after releasing the device mutex.
 pub(crate) trait Backend: Send + Sync {
     /// Device detector retained by render completions after queue teardown.
+    fn input_sources(&self, _inputs: &[crate::file::SyncItem])
+        -> Option<Arc<super::sync_input::Sources>> { None }
+
     fn feed(&self) -> Option<Arc<super::feed::Feed>> {
         None
     }
@@ -430,6 +435,9 @@ impl<B: Backend> Scheduler<B> {
         // All fallible scheduler setup precedes early hardware publication. The
         // scheduler still owns watchdog, credits and cancellation after push.
         if !(early && self.backend.try_early(&packet)) {
+            if packet.completion.needs_source_ready() {
+                packet.completion.set_source_ready(ready.clone());
+            }
             self.backend.count_backlog(&packet);
         }
         job.push();

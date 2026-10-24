@@ -112,6 +112,55 @@ impl Backend {
 }
 
 impl job::Backend for Backend {
+    fn input_sources(&self, inputs: &[crate::file::SyncItem])
+        -> Option<Arc<crate::g17::sync_input::Sources>>
+    {
+        use crate::g17::{fence, sync_input};
+        let mut heads = KVec::new();
+        let mut sources: KVec<sync_input::Source> = KVec::new();
+        let mut publication_waits = KVec::new();
+        for input in inputs.iter().filter_map(|input| input.fence.as_ref()) {
+            let status = job::fence_status(input);
+            if status > 0 { continue; }
+            if status < 0 { return None; }
+            let leaves = sync_input::collect(input)?;
+            for leaf in &leaves {
+                if leaf.status > 0 { continue; }
+                if leaf.status < 0 { return None; }
+                // SAFETY: Collection owns each leaf until this lookup finishes.
+                let submission = unsafe { fence::exported_source_raw(leaf.fence) }?;
+                if submission.source_status().ok()? { continue; }
+                if !submission.same_vm(self.context.status()) { return None; }
+                if sources.iter().any(|known| Arc::ptr_eq(&known.submission, &submission)) {
+                    continue;
+                }
+                if sources.len() == crate::g17::fw::kick::KICK_BARRIERS_MAX { return None; }
+                let published = {
+                    let state = self.shared.state.lock();
+                    let firmware = state.as_deref()?;
+                    if self.shared.crashed.load(Ordering::Acquire) || firmware.recovery.pending()
+                        || crate::g17::recovery::Memory::recovery_state(&firmware.init).ok()? != 0
+                    { return None; }
+                    firmware.queues.compute.iter().flatten()
+                        .filter_map(|entry| entry.queue.as_deref())
+                        .any(|queue| queue.has_input_source(&submission, self.context.status(),
+                            firmware.recovery.generation()))
+                };
+                if !published {
+                    if submission.source_status().ok()? { continue; }
+                    // The existing scheduler fence becomes ready after actual
+                    // publication, not GPU completion. No binding loan or
+                    // consumer hardware capacity is acquired while waiting.
+                    publication_waits.push(submission.ready()?, GFP_KERNEL).ok()?;
+                }
+                sources.push(sync_input::Source { submission }, GFP_KERNEL).ok()?;
+            }
+            heads.push(input.clone(), GFP_KERNEL).ok()?;
+        }
+        if sources.is_empty() { return None; }
+        sync_input::Sources::new(heads, sources, publication_waits).ok()
+    }
+
     fn feed(&self) -> Option<Arc<crate::g17::feed::Feed>> {
         Some(self.shared.feed.clone())
     }

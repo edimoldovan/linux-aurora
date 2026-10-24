@@ -10,7 +10,7 @@ use super::{
     command::{Parser, UscWindow, Validated},
     completion::{Completion, Destinations, PreparedPublication},
     context::Context,
-    fence::{Outputs, Submission},
+    fence::Outputs,
     job::{self, Backend, Engine, Fences, Order, Packet, Scheduler},
     validation::Proof,
 };
@@ -179,7 +179,7 @@ impl<B: Backend> Queue<B> {
         command: Validated,
         order: Order,
         guard: mmu::VmJobGuard,
-        aggregate: &Arc<Submission>,
+        aggregate: &super::fence::Aggregate,
         inputs: &[file::SyncItem],
         destinations: Destinations,
     ) -> Result {
@@ -198,6 +198,22 @@ impl<B: Backend> Queue<B> {
             let Validated::Compute { scratch, .. } = &command else { return Err(EINVAL); };
             self.ensure_compute(scratch.pages())?;
         }
+        // Only convert inputs when no independent host-prefix wait could keep
+        // the retained source bookkeeping queued behind an external signal.
+        let sources = if engine == Engine::Compute && !inputs.is_empty()
+            && !destinations.has_outputs()
+            && self.frontiers[0].iter().all(|(sequence, fences)|
+                !Order::contains(order.wait_through[0], *sequence)
+                    || job::fence_status(&fences.completed) > 0)
+            && self.frontiers[1].iter().all(|(sequence, fences)|
+                !Order::contains(order.wait_through[1], *sequence)
+                    || fences.ready.raw() != fences.completed.raw()
+                    || job::fence_status(&fences.completed) > 0)
+            && self.failures.iter().enumerate().all(|(index, failure)|
+                failure.as_ref().is_none_or(|(sequence, _)|
+                    !Order::contains(order.wait_through[index], *sequence)))
+        { self.backend.input_sources(inputs) } else { None };
+
         // Only earlier render ordinals covered by the explicit logical prefix
         // can delay host publication. These links never become GPU dependencies.
         let host_predecessors = self.frontiers[index]
@@ -217,6 +233,7 @@ impl<B: Backend> Queue<B> {
             engine == Engine::Compute,
             host_predecessors.clone().next().is_some(),
             self.backend.feed(),
+            sources.clone(),
         )?;
         let publication = completion.publication()
             .map(|target| PreparedPublication::new(target, host_predecessors))
@@ -294,8 +311,17 @@ impl<B: Backend> Queue<B> {
                 if job::fence_status(fence) > 0 {
                     continue;
                 }
+                if sources.as_ref().is_some_and(|sources| sources.contains_input(fence)) {
+                    continue;
+                }
                 dependencies.push(fence.clone(), GFP_KERNEL)?;
                 checked_inputs.push(fence.clone(), GFP_KERNEL)?;
+            }
+        }
+        if let Some(sources) = &sources {
+            for ready in sources.publication_waits() {
+                dependencies.push(ready.clone(), GFP_KERNEL)?;
+                checked_inputs.push(ready.clone(), GFP_KERNEL)?;
             }
         }
         let early = dependencies.is_empty()
@@ -416,7 +442,10 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                 for (command, _, _) in pending.iter_mut() { command.allow_long_job(); }
             }
             let mut guards = guards.into_iter();
-            let aggregate = outputs.publish(self.context.clone())?;
+            let firmware_source = pending.len() == 1
+                && matches!(&pending[0].0, Validated::Compute { .. })
+                && !pending[0].2.has_outputs();
+            let aggregate = outputs.publish(self.context.clone(), firmware_source)?;
             for (command, order, destinations) in pending {
                 let guard = guards.next().ok_or(EIO)?;
                 self.enqueue(

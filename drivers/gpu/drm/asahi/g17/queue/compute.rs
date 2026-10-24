@@ -538,6 +538,8 @@ pub(crate) struct Queue {
     quarantine_error: Option<Error>,
     failure_status_pending: bool,
     retirement_proved: bool,
+    source_readers: Arc<core::sync::atomic::AtomicU32>,
+    source_hint: crate::g17::sync_input::ReaderHint,
 }
 
 impl Queue {
@@ -598,6 +600,8 @@ impl Queue {
             quarantine_error: None,
             failure_status_pending: false,
             retirement_proved: false,
+            source_readers: Arc::new(core::sync::atomic::AtomicU32::new(0), GFP_KERNEL)?,
+            source_hint: crate::g17::sync_input::ReaderHint::new(),
         })
     }
     pub(crate) fn qid(&self) -> u8 {
@@ -1231,11 +1235,15 @@ impl Queue {
             && self.active.len == 0
             && self.replays.len == 0
             && self.previous.is_none()
+            // Borrow acquisition is serialized by the device mutex. Avoid
+            // touching the separate loan counter for an otherwise busy queue.
+            && !self.source_hint.has_readers(&self.source_readers)
     }
     pub(crate) fn bind_owner(&mut self, owner: u64, context: Arc<Context>) -> Result {
         if !self.reusable() {
             return Err(EBUSY);
         }
+        self.source_hint.reset_for_owner(&self.source_readers)?;
         if !context.is_current() {
             return Err(EFAULT);
         }
@@ -1343,7 +1351,9 @@ impl Queue {
     }
     /// An idle retained queue whose USC backing may be given back.
     pub(crate) fn vacate_candidate(&self) -> bool {
-        (self.reusable() || self.recycled_pending()) && self.pool_phase == PoolPhase::Populated && self.pool.populated()
+        self.pool_phase == PoolPhase::Populated && self.pool.populated()
+            && (self.reusable() || self.recycled_pending())
+            && !self.source_hint.has_readers(&self.source_readers)
     }
     /// A recycled killed queue still holding the backing its killed work used.
     pub(crate) fn recycled_pending(&self) -> bool {
@@ -1781,6 +1791,17 @@ impl Queue {
         host: &mut impl Host,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
+        self.publish_with_native_waits(packet, dependencies, &[], host, defer)
+    }
+
+    pub(in crate::g17) fn publish_with_native_waits(
+        &mut self,
+        packet: Arc<Packet>,
+        dependencies: &[crate::g17::fw::kick::KickDependency],
+        native: &[crate::g17::sync_input::NativeWait],
+        host: &mut impl Host,
+        defer: &mut impl FnMut(Deferred) -> Result,
+    ) -> Result {
         use crate::g17::fw::{
             channels::WorkSlot,
             compute::{ComputeArgs, ComputeDescriptor, COMPUTE_KICK_EVENT_MASK, COMPUTE_QOS_CLASS},
@@ -1814,11 +1835,22 @@ impl Queue {
         let (descriptor_high, descriptor_low) =
             self.graph.descriptor_vas(kick_timestamp.slot() as u8)?;
         let first = !self.installed && self.ordinal == 0;
+        // The first prototype only waits on an installed consumer channel.
+        // A retry without a published source falls back to completion on CPU.
+        if first && !native.is_empty() { return Err(EAGAIN); }
+        if native.len() > crate::g17::kick::COMPUTE_CHANNELS { return Err(EINVAL); }
         let entry_signal = first
             || dependencies
                 .iter()
                 .any(|dependency| dependency.qid() != qid);
         item_capacity(self.graph.cursors()?, entry_signal)?;
+        if !native.is_empty() {
+            let cursors = self.graph.cursors()?;
+            let free = (cursors.consumer + cursors.count - cursors.producer - 1) % cursors.count;
+            if free < (if entry_signal { 4 } else { 3 }) + native.len() as u32 {
+                return Err(EAGAIN);
+            }
+        }
         let record_slot = (!first).then_some(self.ordinal as usize % RECORD_SLOTS);
         if let Some(slot) = record_slot {
             self.graph.ensure_record_slot(slot)?;
@@ -1928,6 +1960,13 @@ impl Queue {
             }
             let config_va = self.graph.record(record_slot, CONFIG, 0xc0, config)?;
             let cursors = self.graph.cursors()?;
+            let mut wait_vas = KVec::with_capacity(native.len(), GFP_KERNEL)?;
+            for (index, wait) in native.iter().enumerate() {
+                let record = wait.bytes(crate::g17::fw::stamp_value(kick_timestamp.get() as u32),
+                    packet.order.sequence);
+                let address = self.graph.record(record_slot, 0x900 + index * 0x60, 0x60, record)?;
+                wait_vas.push(address, GFP_KERNEL)?;
+            }
             let prepared_kick = self.kick.prepare_entry(&kick_args)?;
             let mut producer;
             if first {
@@ -1962,15 +2001,22 @@ impl Queue {
                     })?;
             } else {
                 let target = self.pool.reserve_submission()?;
-                producer = self
-                    .graph
-                    .append(cursors.producer, descriptor_high, || {
-                        packet.mark_published()
+                producer = (|| -> Result<u32> {
+                    let mut before_descriptor = cursors.producer;
+                    for &wait in &wait_vas {
+                        before_descriptor = self.graph.append(before_descriptor, wait, || {
+                            packet.mark_published();
+                            visible = true;
+                        })?;
+                    }
+                    self.graph.append(before_descriptor, descriptor_high, || {
+                        packet.mark_published();
+                        visible = true;
                     })
-                    .or_else(|error| {
-                        self.pool.cancel_unpublished(target)?;
-                        Err(error)
-                    })?;
+                })().or_else(|error| {
+                    if !visible { self.pool.cancel_unpublished(target)?; }
+                    Err(error)
+                })?;
                 visible = true;
                 self.unpublished_binding = false;
                 let qos = host.qos_publish(
@@ -2282,6 +2328,7 @@ impl Queue {
 impl Queue {
     pub(crate) fn can_rearm(&self) -> bool {
         self.pool_phase == PoolPhase::Vacant && (self.reusable() || self.recycled_pending())
+            && !self.source_hint.has_readers(&self.source_readers)
     }
 }
 
@@ -2321,5 +2368,52 @@ impl Queue {
         self.owner = None;
         self.released_at = now_ns();
         Ok((false, retired))
+    }
+}
+
+
+impl Queue {
+    /// Same immutable singleton identity and current physical epoch.
+    pub(crate) fn has_input_source(&self, source: &Arc<crate::g17::fence::Submission>,
+        status: &Arc<VmStatus>, epoch: u64) -> bool
+    {
+        !self.quarantined && self.replays.len == 0 && self.active.iter().any(|active|
+            active.ticket.is_some_and(|ticket| ticket.epoch == epoch)
+                && Arc::ptr_eq(active.packet.completion.status(), status)
+                && active.packet.completion.is_input_source(source))
+    }
+
+    pub(crate) fn source_dependency(&mut self, source: &crate::g17::sync_input::Source,
+        status: &Arc<VmStatus>, epoch: u64) -> Result<Option<(u64,
+            crate::g17::fw::kick::KickDependency, u64, u32, crate::g17::sync_input::Hold)>>
+    {
+        for active in self.active.iter() {
+            if !active.packet.completion.is_input_source(&source.submission) { continue; }
+            if !Arc::ptr_eq(active.packet.completion.status(), status) { return Err(EINVAL); }
+            if self.quarantined || self.replays.len != 0 { return Err(EAGAIN); }
+            let ticket = active.ticket.ok_or(EAGAIN)?;
+            if ticket.epoch != epoch { return Err(EAGAIN); }
+            self.valid_ticket(active, &ticket)?;
+            if active.packet.cancel_requested() { return Err(ECANCELED); }
+            source.submission.source_status()?;
+            let dependency = crate::g17::fw::kick::KickDependency::new(self.qid(),
+                crate::g17::fw::kick::KickTimestamp::new(ticket.kick).ok_or(EIO)?).ok_or(EIO)?;
+            let hold = self.source_hint.hold(&self.source_readers)?;
+            return Ok(Some((active.published, dependency,
+                self.graph.support.gpu_va() + STAMP as u64,
+                u32::from(self.qid()), hold)));
+        }
+        Ok(None)
+    }
+
+    /// Preparing a possible wait does not create a firmware consumer. Mark it
+    /// only once the consumer's first item is visible, under the device mutex.
+    pub(crate) fn note_input_consumer(&self, source: &crate::g17::sync_input::Source) {
+        for active in self.active.iter() {
+            if active.packet.completion.is_input_source(&source.submission) {
+                active.packet.completion.note_firmware_consumer();
+                break;
+            }
+        }
     }
 }

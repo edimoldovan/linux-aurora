@@ -92,6 +92,8 @@ impl Destinations {
         Ok(Self(retained))
     }
 
+    pub(crate) fn has_outputs(&self) -> bool { self.0.is_some() }
+
     fn iter(&self) -> core::slice::Iter<'_, Option<Destination>> {
         let destinations: &[Option<Destination>] =
             self.0.as_deref().map_or(&[], |destinations| destinations.as_slice());
@@ -254,6 +256,7 @@ pub(crate) struct Completion {
     terminal: Option<UserFence<CompletionFence>>,
     compute: Option<PooledTimestamps>,
     feed: Option<Arc<super::feed::Feed>>,
+    sources: Option<Arc<super::sync_input::Sources>>,
     #[pin]
     vm_job: Mutex<Option<mmu::VmJobGuard>>,
     #[pin]
@@ -286,6 +289,7 @@ impl Completion {
         compute: bool,
         host_predecessors: bool,
         feed: Option<Arc<super::feed::Feed>>,
+        sources: Option<Arc<super::sync_input::Sources>>,
     ) -> Result<Arc<Self>> {
         let fence = fence::independent(contexts)?;
         let ordered = !compute
@@ -313,6 +317,7 @@ impl Completion {
                 terminal,
                 compute,
                 feed,
+                sources,
                 vm_job <- new_mutex!(Some(vm_job), "G17 command VM pin"),
                 render <- new_mutex!(None, "G17 command render lease"),
                 signalled: AtomicBool::new(false),
@@ -357,6 +362,26 @@ impl Completion {
     pub(crate) fn status(&self) -> &Arc<VmStatus> {
         &self.status
     }
+    pub(super) fn sources(&self) -> Option<&Arc<super::sync_input::Sources>> {
+        self.sources.as_ref()
+    }
+    pub(super) fn is_input_source(&self, source: &Arc<super::fence::Submission>) -> bool {
+        self.output.output().member.is_source(source)
+    }
+    pub(super) fn set_source_ready(&self, ready: Fence) {
+        self.output.output().member.set_source_ready(ready);
+    }
+    pub(super) fn needs_source_ready(&self) -> bool {
+        self.output.output().member.needs_source_ready()
+    }
+    pub(super) fn note_input_error(&self, error: Error) -> bool {
+        self.output.output().member.note_error(error)
+    }
+    pub(super) fn check_source_inputs(&self) -> Result {
+        if let Some(sources) = &self.sources { sources.check()?; }
+        Ok(())
+    }
+
     pub(crate) fn work_state(&self) -> Result<Arc<WorkStateLease>> {
         self.output.output().member.work_state()
     }
@@ -525,6 +550,7 @@ impl Completion {
     /// An exact whole-pair drain or processor stop allows rehabilitation. The
     /// VM pin goes first; the still-held lease excludes reuse until both settle.
     pub(crate) fn release_after_retirement(&self) {
+        if let Some(sources) = &self.sources { sources.release(); }
         drop(self.vm_job.lock().take());
         let lease = self.render.lock().take();
         if let Some(lease) = lease.as_ref() {
@@ -534,6 +560,7 @@ impl Completion {
     }
 
     fn release_healthy(&self) {
+        if let Some(sources) = &self.sources { sources.release(); }
         drop(self.render.lock().take());
         drop(self.vm_job.lock().take());
     }
@@ -541,7 +568,10 @@ impl Completion {
     /// Exact retirement permits the physical lease and VM pin to be released
     /// before waking userspace. A failure fence alone never establishes this.
     #[track_caller]
-    pub(crate) fn complete(&self, result: Result<[u64; 4]>) {
+    pub(crate) fn complete(&self, mut result: Result<[u64; 4]>) {
+        if result.is_ok() {
+            if let Err(error) = self.check_source_inputs() { result = Err(error); }
+        }
         if self.signalled.swap(true, Ordering::AcqRel) {
             return;
         }

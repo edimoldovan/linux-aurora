@@ -25,6 +25,7 @@ mod completion;
 pub(crate) mod context;
 mod data_segment;
 mod dependency;
+mod sync_input;
 mod event;
 mod feed;
 mod fence;
