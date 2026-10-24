@@ -781,7 +781,7 @@ mod fault_capacity_tests {
 
     #[test]
     fn a_guilty_failure_makes_a_spared_quarantine_guilty() {
-        let pool = Pool::new().unwrap();
+        let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
         let queue = pool.reserve_queue().unwrap();
         let lease = pool.acquire_render(1, None, u64::MAX, || Ok(())).unwrap();
         let bit = 1u64 << lease.slot();
