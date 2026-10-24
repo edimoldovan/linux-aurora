@@ -231,33 +231,46 @@ impl job::Backend for Backend {
             return self.defer_compute_timeout(packet, renewals);
         }
         use crate::g17::timeout::{self, Decision};
-        let mut state = self.shared.state.lock();
-        let Some(firmware) = (*state).as_deref_mut() else {
-            return false;
-        };
-        // Borrowed-graph and queued-retirement deferrals share the renewal bound.
-        if timeout::transaction_grace(renewals)
-            && firmware.queues.defer_render_timeout(packet, ETIMEDOUT)
-        {
-            return true;
-        }
-        let verdict = firmware.queues.render_timeout_decision(packet, renewals);
-        let decision = verdict.map_or(Decision::Own, |verdict| verdict.decision);
-        // As compute does: work still blocked behind another VM's older unfinished work after the
-        // whole grace is innocent, so its failure must stay non-sticky. The pair's quarantine
-        // extends the class to the pair's other groups.
-        if decision == Decision::Spare {
-            packet.completion.classify(crate::g17::recovery::Class::Spared);
-        }
-        if let Some(verdict) = verdict {
-            if let Some(blocker) = verdict.reported_blocker(renewals) {
-                dev_warn!(self.shared.dev.as_ref(),
-                    "Render watchdog owner={} vm={} publication={} renewals={} decision={:?} behind earlier work of another VM: blocker_vm={} blocker_publication={} blocker_failed={}\n",
-                    self.owner, verdict.own.vm, verdict.own.published, renewals, decision,
-                    blocker.vm, blocker.published, u8::from(blocker.failed));
+        // As for compute, a final retirement pass precedes the attribution, and all completion
+        // callbacks run after releasing the device mutex. Without a collector the attribution
+        // goes ahead without that pass, as it did before it existed.
+        let mut deferred = DeferredBatch::worker().ok();
+        let result = (|| -> Result<bool> {
+            let mut state = self.shared.state.lock();
+            let Some(firmware) = (*state).as_deref_mut() else {
+                return Ok(false);
+            };
+            if let Some(deferred) = deferred.as_mut() {
+                firmware.scan_renders(deferred)?;
             }
+            // Borrowed-graph and queued-retirement deferrals share the renewal bound.
+            if timeout::transaction_grace(renewals)
+                && firmware.queues.defer_render_timeout(packet, ETIMEDOUT)
+            {
+                return Ok(true);
+            }
+            let verdict = firmware.queues.render_timeout_decision(packet, renewals);
+            let decision = verdict.map_or(Decision::Own, |verdict| verdict.decision);
+            // As compute does: work still blocked behind another VM's older unfinished work
+            // after the whole grace is innocent, so its failure must stay non-sticky. The pair's
+            // quarantine extends the class to the pair's other groups.
+            if decision == Decision::Spare {
+                packet.completion.classify(crate::g17::recovery::Class::Spared);
+            }
+            if let Some(verdict) = verdict {
+                if let Some(blocker) = verdict.reported_blocker(renewals) {
+                    dev_warn!(self.shared.dev.as_ref(),
+                        "Render watchdog owner={} vm={} publication={} renewals={} decision={:?} behind earlier work of another VM: blocker_vm={} blocker_publication={} blocker_failed={}\n",
+                        self.owner, verdict.own.vm, verdict.own.published, renewals, decision,
+                        blocker.vm, blocker.published, u8::from(blocker.failed));
+                }
+            }
+            Ok(decision == Decision::Defer)
+        })();
+        if let Some(deferred) = deferred.as_mut() {
+            deferred.finish();
         }
-        decision == Decision::Defer
+        matches!(result, Ok(true))
     }
 
     fn try_early(&self, packet: &Arc<Packet>) -> bool {

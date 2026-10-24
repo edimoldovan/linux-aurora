@@ -694,6 +694,44 @@ impl crate::g17::Firmware {
         Ok(())
     }
 
+    /// A final retirement pass before a render watchdog attributes its timeout, as compute runs
+    /// scan_compute() first: a head that finished but whose completion the event worker has not
+    /// processed yet must not defer another VM's timeout. Pairs lent out, or holding a deferred
+    /// timeout or error, stay with the worker, which observes and settles them in its order.
+    pub(in crate::g17::runtime) fn scan_renders(&mut self, deferred: &mut DeferredBatch) -> Result {
+        if self.recovery.pending()
+            || self
+                .primary
+                .state
+                .shared
+                .crashed
+                .load(core::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        for slot in 1..self.queues.render.entries.len() {
+            if !self.queues.render.entries[slot]
+                .as_ref()
+                .is_some_and(|entry| {
+                    entry
+                        .pair
+                        .as_ref()
+                        .is_some_and(|pair| pair.published_in_flight())
+                        && entry.preparing.is_none()
+                        && !entry.growing
+                        && !entry.pending_timeout
+                        && entry.pending_error.is_none()
+                })
+            {
+                continue;
+            }
+            self.retire_render_slot(slot, None, deferred)?;
+            self.queues.render.collect_retired(slot)?;
+            self.settle_render_terminal(slot, deferred)?;
+        }
+        Ok(())
+    }
+
     pub(in crate::g17) fn settle_render_vm(
         &mut self,
         status: &Arc<crate::g17::status::VmStatus>,
