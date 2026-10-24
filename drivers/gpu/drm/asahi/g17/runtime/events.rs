@@ -323,8 +323,10 @@ impl crate::g17::Shared {
             };
             deferred
         };
+        crate::g17::trace::event(0);
         let result = self.runtime_event_turn(&mut deferred);
         deferred.finish();
+        crate::g17::trace::event(2);
         self.queue_feed();
         if let Some(firmware) = (*self.state.lock()).as_deref_mut() {
             firmware.queues.worker_deferred = Some(deferred);
@@ -352,6 +354,7 @@ impl crate::g17::Shared {
             (recover, masks)
         };
         deferred.finish();
+        crate::g17::trace::event(1);
         if recover {
             self.preparations.wait_drained_until(super::now_ns().saturating_add(super::WORK_RING_WAIT_NS))?;
         }

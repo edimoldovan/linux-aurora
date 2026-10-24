@@ -31,6 +31,7 @@ pub(crate) mod context;
 mod data_segment;
 mod dependency;
 mod sync_input;
+mod trace;
 mod event;
 mod feed;
 mod fence;

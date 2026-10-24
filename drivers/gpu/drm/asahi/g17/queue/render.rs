@@ -954,6 +954,8 @@ impl Pair {
             host.publish_retained_pair(priority, fragment_slot, tiling_slot, outer_next)?;
             self.active.back_mut().ok_or(EIO)?.outer_published = true;
             host.notify_render(priority)?;
+            crate::g17::trace::publish(crate::g17::trace::RENDER, self.qids()[1], self.ordinal as u32,
+                packet);
             host.note_submission()
         })();
         if let Err(error) = publish {
@@ -1236,6 +1238,8 @@ impl Pair {
             front.qos_completed = true;
             front.flist_completed = true;
         }
+        crate::g17::trace::complete(crate::g17::trace::RENDER, qids[1], ordinal as u32,
+            &front.packet, [timestamps[0], timestamps[3]]);
         defer(Deferred::Retired(
             front.packet.completion.clone(),
             Ok(timestamps),

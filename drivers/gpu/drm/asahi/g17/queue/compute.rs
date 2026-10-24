@@ -589,6 +589,7 @@ impl Queue {
         let binding = graph.bind(context.clone(), kick_alias, pool_alias)?;
         context.mark_published();
         context.note_compute_binding(true);
+        crate::g17::trace::bind(crate::g17::trace::COMPUTE, kick.id().qid(), context.id(), 0);
         Ok(Self {
             owner: Some(owner),
             retained_owner: None,
@@ -924,6 +925,10 @@ impl Queue {
                         self.active.iter_mut().next().ok_or(EIO)?.qos_pending = false;
                     }
                     let front = self.active.front().ok_or(EIO)?;
+                    if let Some(ticket) = front.ticket {
+                        crate::g17::trace::complete(crate::g17::trace::COMPUTE, ticket.qid,
+                            ticket.ordinal, &front.packet, [timestamps[0], timestamps[1]]);
+                    }
                     self.retire_pending = true;
                     defer(Deferred::Retired(
                         front.packet.completion.clone(),
@@ -1316,6 +1321,8 @@ impl Queue {
         }
         context.mark_published();
         context.note_compute_binding(true);
+        crate::g17::trace::bind(crate::g17::trace::COMPUTE, self.qid(), context.id(),
+            if same_vm { 2 } else { 1 });
         self.owner = Some(owner);
         self.unpublished_binding = true;
         self.released = false;
@@ -2151,6 +2158,7 @@ impl Queue {
             }
             fence(Ordering::SeqCst);
             host.notify((0x83 << 48) | 0x10)?;
+            crate::g17::trace::publish(crate::g17::trace::COMPUTE, qid, ordinal, &packet);
             host.note_submission()
         })();
         if let Err(error) = result {
