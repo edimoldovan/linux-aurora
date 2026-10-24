@@ -28,8 +28,8 @@ pub(crate) enum Decision {
 }
 
 /// Groups are read in order and the first one that decides stops the walk, so a caller can
-/// observe the abandonment lazily. An exhausted front is replayed: the replay fails it alone.
-/// An exhausted successor would break the order.
+/// observe the abandonment lazily. An exhausted front is replayed: the replay fails it, and its
+/// successors, which consume its output, with it. An exhausted successor would break the order.
 pub(crate) fn decide(groups: impl Iterator<Item = Group>) -> Decision {
     let mut front_exhausted = None;
     let mut successor_exhausted = false;
