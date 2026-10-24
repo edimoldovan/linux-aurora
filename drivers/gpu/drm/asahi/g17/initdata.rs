@@ -185,6 +185,8 @@ struct BuildEnv<'a> {
     render: &'a mmu::Vm,
     base: u64,
     dynamic: Range<u64>,
+    /// GPU clusters, as the GPU reports them.
+    clusters: u32,
 }
 
 impl BuildEnv<'_> {
@@ -714,6 +716,7 @@ impl InitData {
         uat: &mmu::Uat,
         render: &mmu::Vm,
         metrics: &KernelObject,
+        clusters: u32,
         active_cores: u32,
         variant: &super::fw::Variant,
     ) -> Result {
@@ -727,6 +730,7 @@ impl InitData {
             render,
             base: range.start,
             dynamic: range.start + t8140::dynamic::KERNEL_OFFSET..range.end,
+            clusters,
         };
         if variant.graph == super::fw::variant::InitGraph::V25G83 {
             return self.build_25g83(&env, cfg, metrics, active_cores);
@@ -1025,7 +1029,7 @@ impl InitData {
         bundle: &BundleObjects,
     ) -> Result {
         let base = env.base;
-        let opps = Self::opps(env.dev, cfg.opps)?;
+        let opps = Self::opps(env.dev, cfg.opps, env.clusters)?;
         let hw_args = abi::HwDataArgs {
             chip_id: cfg.chip_id,
             windows: cfg.windows,
@@ -1217,9 +1221,21 @@ impl InitData {
             .load(Ordering::Relaxed))
     }
 
-    fn opps(dev: &AsahiDrmDevice, count: usize) -> Result<KVec<abi::Opp>> {
+    /// The GPU's operating points: `count` of them, each with one voltage cell for the whole
+    /// GPU or one per cluster.
+    fn opps(dev: &AsahiDrmDevice, count: usize, clusters: u32) -> Result<KVec<abi::Opp>> {
         let opps = Self::opp_table(dev, c_str!("operating-points-v2"))?;
         if opps.len() != count {
+            return Err(EINVAL);
+        }
+        let cells = opps.first().map_or(0, |opp| opp.cells);
+        if cells != 1 && u32::try_from(cells) != Ok(clusters) {
+            dev_err!(
+                dev.as_ref(),
+                "GPU operating points have {} voltage cells, expected 1 or {}\n",
+                cells,
+                clusters
+            );
             return Err(EINVAL);
         }
         Ok(opps)

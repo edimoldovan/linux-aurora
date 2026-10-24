@@ -98,7 +98,7 @@ impl InitData {
             *va = self.object(index)?.gpu_va();
         }
 
-        let opps = Self::opps(env.dev, cfg.opps)?;
+        let opps = Self::opps(env.dev, cfg.opps, env.clusters)?;
         let cs_opps = Self::opp_table(env.dev, c_str!("apple,cs-opp"))?;
         let afr_opps = Self::opp_table(env.dev, c_str!("apple,afr-opp"))?;
         let hw_args = abi::HwDataArgs {

@@ -1190,6 +1190,7 @@ impl Gpu {
             &session.uat,
             &session._render_global,
             &session._pm_metrics,
+            shared.clusters,
             shared.active_cores,
             shared.variant,
         )?;
