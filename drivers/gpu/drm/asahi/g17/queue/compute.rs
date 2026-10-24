@@ -2120,7 +2120,6 @@ impl Queue {
                     self.outer_started & ring == 0,
                 )?,
             )?;
-            let notify_activation = self.outer_started & ring == 0;
             self.outer_started |= ring;
             self.installed = true;
             self.published_config = Some(identity);
@@ -2151,13 +2150,12 @@ impl Queue {
                     previous.publication = Some((packet.order.sequence, epoch));
                 }
             }
-            if notify_activation {
-                fence(Ordering::SeqCst);
-                // Pipe 2 (compute) in bits 1:0, priority class in bits 3:2.
-                host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
-            }
+            // Every publication rings its own pipe and priority class, as render
+            // publication does: pipe 2 (compute) in bits 1:0, priority class in
+            // bits 3:2. The generic work doorbell left the firmware to find the
+            // ring itself and delayed dispatch.
             fence(Ordering::SeqCst);
-            host.notify((0x83 << 48) | 0x10)?;
+            host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
             crate::g17::trace::publish(crate::g17::trace::COMPUTE, qid, ordinal, &packet);
             host.note_submission()
         })();
