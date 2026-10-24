@@ -15,7 +15,7 @@ use crate::g17::{
         queue::*,
         variant::PointerLayout,
     },
-    object::{Allocator, CpuMap, KernelObject},
+    object::{Allocator, CpuMap, Family, KernelObject, Pool, PooledObject},
 };
 use crate::{hw::t8140::dynamic, mmu};
 use core::sync::atomic::{fence, Ordering};
@@ -83,24 +83,32 @@ pub(crate) struct Binding {
 /// Descriptor ring of one compute QID with its kernel-VM alias. Built without
 /// the device mutex; installed into a vacant graph before an owner binds.
 pub(crate) struct DescriptorRing {
-    object: KernelObject,
-    high: mmu::KernelMapping,
+    // Drop the GPU alias before the retained storage returns to its pool.
+    low: mmu::KernelMapping,
+    object: PooledObject,
 }
 
 impl DescriptorRing {
-    pub(crate) fn new(alloc: &Allocator<'_>) -> Result<Self> {
-        let page = mmu::UAT_PGSZ as u64;
-        let prot = mmu::PROT_GPU_FW_SHARED_RW;
-        let object = alloc.lower(
-            DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE,
-            page,
-            prot,
+    /// Firmware reads every descriptor through a cached kernel mapping, as it
+    /// does for render. The pool keeps that mapping until processor stop; the
+    /// hardware reads the same pages through an uncached canonical low alias.
+    pub(crate) fn new(alloc: &Allocator<'_>, objects: &Arc<Pool>) -> Result<Self> {
+        let size = DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE;
+        let object = objects.allocate(
+            alloc,
+            Family::Descriptor,
+            size,
+            size,
+            mmu::PROT_GPU_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
-        let mut high = alloc.uat.geometry().kernel_range();
-        high.start += dynamic::KERNEL_OFFSET;
-        let high = object.alias_in(alloc.uat.kernel_vm(), high, page, prot)?;
-        Ok(Self { object, high })
+        let low = object.alias_in(
+            alloc.uat.kernel_lower_vm(),
+            dynamic::LOWER,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_SHARED_RW,
+        )?;
+        Ok(Self { low, object })
     }
 }
 
@@ -127,6 +135,7 @@ struct Graph {
 impl Graph {
     fn new(
         alloc: &Allocator<'_>,
+        objects: &Arc<Pool>,
         context: &Context,
         pointers: PointerLayout,
         operand_state: &'static OperandState,
@@ -134,7 +143,7 @@ impl Graph {
         let page = mmu::UAT_PGSZ as u64;
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
         let cpu = CpuMap::WriteCombined;
-        let ring = DescriptorRing::new(alloc)?;
+        let ring = DescriptorRing::new(alloc, objects)?;
         let preempt = alloc.kernel(0x4000, page, prot, cpu)?;
         let usage = alloc.kernel(mmu::UAT_PGSZ, page, prot, cpu)?;
         let operand = alloc.lower(operand_state.size, page, prot, cpu)?;
@@ -250,12 +259,12 @@ impl Graph {
     fn descriptor_vas(&self, slot: u8) -> Result<(u64, u64)> {
         let ring = self.ring.as_ref().ok_or(EAGAIN)?;
         let offset = (usize::from(slot) % DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE) as u64;
-        Ok((ring.high.iova() + offset, ring.object.gpu_va() + offset))
+        Ok((ring.object.gpu_va() + offset, ring.low.iova() + offset))
     }
     fn descriptor_alias(&self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
         let ring = self.ring.as_ref().ok_or(EAGAIN)?;
         ring.object
-            .map_alias(vm, ring.object.gpu_va(), mmu::PROT_GPU_SHARED_RO)
+            .map_alias(vm, ring.low.iova(), mmu::PROT_GPU_SHARED_RO)
     }
     /// Detaches the descriptor ring of an idle vacant queue; the caller frees it
     /// off-lock. The job list and the context item only name consumed
@@ -547,6 +556,7 @@ impl Queue {
     /// successfully installed queue until processor stop. Shared VM apertures precede this call.
     pub(crate) fn new(
         alloc: &Allocator<'_>,
+        objects: &Arc<Pool>,
         backing: Backing,
         owner: u64,
         context: Arc<Context>,
@@ -554,7 +564,7 @@ impl Queue {
         operand_state: &'static OperandState,
     ) -> Result<Self> {
         let Backing { mut pool, mut kick } = backing;
-        let mut graph = Graph::new(alloc, &context, pointers, operand_state)?;
+        let mut graph = Graph::new(alloc, objects, &context, pointers, operand_state)?;
         let kick_alias = kick.map_client(context.vm())?;
         let pool_alias = pool.map_client(context.vm())?;
         let binding = graph.bind(context.clone(), kick_alias, pool_alias)?;

@@ -790,7 +790,7 @@ impl Backend {
             admission.check()?;
             let lease = self.shared.preparations.enter_until(admission)?;
             let dev = self.shared.drm()?;
-            let (uat, reservation) = {
+            let (uat, objects, reservation) = {
                 let mut state = self.shared.state.lock();
                 admission.check()?;
                 let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
@@ -814,7 +814,7 @@ impl Backend {
                 match rebound {
                     Rebind::Done => return Ok(()),
                     Rebind::Grow => { drop(state); drop(lease); return self.grow_compute(required, admission); }
-                    Rebind::Rearm(qid) => (firmware.uat.clone(), Err(qid)),
+                    Rebind::Rearm(qid) => (firmware.uat.clone(), firmware.pool.clone(), Err(qid)),
                     Rebind::Fresh => {
                         let reservation = match firmware.queues.reserve_compute(self.owner) {
                             Ok(reservation) => reservation,
@@ -838,7 +838,7 @@ impl Backend {
                             }
                             Err(error) => return Err(error),
                         };
-                        (firmware.uat.clone(), Ok(reservation))
+                        (firmware.uat.clone(), firmware.pool.clone(), Ok(reservation))
                     }
                 }
             };
@@ -853,7 +853,7 @@ impl Backend {
                     // queue may have been taken or re-armed by another owner since.
                     let built = (|| -> Result<_> {
                         let pages = crate::g17::freelist::Pages::compute_sized(&alloc, required)?;
-                        Ok((pages, compute::DescriptorRing::new(&alloc)?))
+                        Ok((pages, compute::DescriptorRing::new(&alloc, &objects)?))
                     })();
                     let (pages, ring) = match built {
                         Err(error) if error == ENOSPC => {
@@ -908,6 +908,7 @@ impl Backend {
                 self.compute_scheduler(&alloc, &lease, admission)?;
                 let queue = compute::Queue::new(
                     &alloc,
+                    &objects,
                     backing,
                     self.owner,
                     self.context.clone(),
