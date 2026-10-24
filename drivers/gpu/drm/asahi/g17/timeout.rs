@@ -58,6 +58,9 @@ pub(crate) struct Head {
     pub(crate) vm: usize,
     pub(crate) published: u64,
     pub(crate) finished: bool,
+    /// Its queue already failed (quarantined) and holds the GPU only until the firmware drains
+    /// it. No later watchdog of its own will settle it.
+    pub(crate) failed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,16 +70,32 @@ pub(crate) enum Decision {
     Spare,
 }
 
-pub(crate) fn classify(own: Head, renewals: u8, others: impl Iterator<Item = Head>) -> Decision {
-    if own.finished || !others.into_iter().any(|other| {
-        other.vm != own.vm && !other.finished && other.published < own.published
-    }) {
-        Decision::Own
-    } else if renewals < MAX_RENEWALS {
-        Decision::Defer
-    } else {
-        Decision::Spare
+/// Another VM's older unfinished work that can block `own`: live work before work whose queue
+/// already failed, the oldest of each first.
+pub(crate) fn blocker(own: Head, others: impl Iterator<Item = Head>) -> Option<Head> {
+    others
+        .filter(|other| other.vm != own.vm && !other.finished && other.published < own.published)
+        .min_by_key(|other| (other.failed, other.published))
+}
+
+/// Work behind another VM's older unfinished work is renewed up to MAX_RENEWALS times, so that
+/// the blocker's own failure and teardown can free the GPU. After that it is spared only behind
+/// a live blocker, which its own watchdog still settles. A blocker that already failed waits only
+/// for the firmware to drain it and no longer excuses later work: otherwise an innocent frame
+/// published before the culprit, which timed out first, would spare the culprit, and a pair that
+/// never drains would spare every later timeout.
+pub(crate) fn decide(own: Head, renewals: u8, blocker: Option<Head>) -> Decision {
+    match blocker {
+        _ if own.finished => Decision::Own,
+        None => Decision::Own,
+        Some(_) if renewals < MAX_RENEWALS => Decision::Defer,
+        Some(blocker) if blocker.failed => Decision::Own,
+        Some(_) => Decision::Spare,
     }
+}
+
+pub(crate) fn classify(own: Head, renewals: u8, others: impl Iterator<Item = Head>) -> Decision {
+    decide(own, renewals, blocker(own, others))
 }
 
 #[cfg_attr(not(test), kernel::macros::kunit_tests(asahi_g17_execution_allowance))]
@@ -132,7 +151,10 @@ mod tests {
         assert!(background_stalled(Some(since), u64::MAX));
     }
     fn head(vm: usize, published: u64, finished: bool) -> Head {
-        Head { vm, published, finished }
+        Head { vm, published, finished, failed: false }
+    }
+    fn failed(vm: usize, published: u64) -> Head {
+        Head { vm, published, finished: false, failed: true }
     }
     #[test]
     fn ray_query_execution_is_bounded_at_ten_seconds() {
@@ -188,6 +210,36 @@ mod tests {
     #[test]
     fn oldest_unfinished_queue_is_never_excused() {
         assert_eq!(classify(head(7, 100, false), 0, [head(5, 101, false)].into_iter()), Decision::Own);
+    }
+    #[test]
+    fn a_blocker_that_already_failed_defers_then_never_spares() {
+        // An innocent frame published before the culprit timed out first and failed; its
+        // quarantined pair keeps its head until the firmware drains it.
+        let culprit = head(7, 101, false);
+        for count in 0..MAX_RENEWALS {
+            assert_eq!(classify(culprit, count, [failed(5, 100)].into_iter()), Decision::Defer);
+        }
+        assert_eq!(classify(culprit, MAX_RENEWALS, [failed(5, 100)].into_iter()), Decision::Own);
+        assert_eq!(classify(culprit, u8::MAX, [failed(5, 100)].into_iter()), Decision::Own);
+        // A pair that never drains does not spare any later timeout either.
+        let drained_never = [failed(5, 100), failed(5, 102)];
+        for own in [head(7, 105, false), head(9, 200, false)] {
+            assert_eq!(classify(own, MAX_RENEWALS, drained_never.into_iter()), Decision::Own);
+        }
+    }
+    #[test]
+    fn a_live_blocker_still_spares_beside_a_failed_one() {
+        let own = head(9, 103, false);
+        let others = [failed(5, 100), head(7, 101, false), failed(8, 102)];
+        assert_eq!(blocker(own, others.into_iter()), Some(head(7, 101, false)));
+        assert_eq!(classify(own, MAX_RENEWALS, others.into_iter()), Decision::Spare);
+        // Failed or not, a blocker must be older, unfinished and of another VM.
+        let late = [failed(5, 104), failed(9, 100), Head { finished: true, ..failed(5, 100) }];
+        assert_eq!(blocker(own, late.into_iter()), None);
+        assert_eq!(classify(own, 0, late.into_iter()), Decision::Own);
+        // Among failed blockers the oldest is reported.
+        let both_failed = [failed(8, 102), failed(5, 100)];
+        assert_eq!(blocker(own, both_failed.into_iter()), Some(failed(5, 100)));
     }
     #[test]
     fn same_vm_finished_and_later_work_do_not_block() {

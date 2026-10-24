@@ -1002,7 +1002,7 @@ impl Pair {
     }
     /// The oldest published group still running, for cross-VM timeout attribution
     /// (crate::g17::timeout). A quarantined pair's work holds the GPU until the firmware drains
-    /// it, so it stays visible to other VMs' watchdogs, as compute does.
+    /// it, so it stays visible to other VMs' watchdogs, as compute does, marked as failed.
     pub(crate) fn timeout_head(&self) -> Option<crate::g17::timeout::Head> {
         self.active
             .iter()
@@ -1012,6 +1012,7 @@ impl Pair {
                 vm: Arc::as_ptr(active.packet.completion.status()) as usize,
                 published: active.published,
                 finished: false,
+                failed: self.quarantined,
             })
     }
 
