@@ -537,22 +537,30 @@ const _: () = {
 };
 
 impl Memory {
-    /// Requests the tiling descriptor slot of `ordinal` for writing. The firmware accessed
-    /// that slot for the command that used it last, so the host no longer holds its lines;
-    /// requesting them before the rest of the preparation overlaps those transfers with it
-    /// instead of stalling the descriptor write one line at a time.
+    /// Requests the tiling descriptor slot and both queue configuration records of
+    /// `ordinal` for writing. The firmware accessed them for the command that used them
+    /// last, so the host no longer holds their lines; requesting them before the rest of
+    /// the preparation overlaps those transfers with it instead of stalling the writes one
+    /// line at a time.
     pub(super) fn prefetch_descriptors(&self, ordinal: u64) {
-        const LINE: usize = 64;
-        let size = size_of::<abi::TaDescriptor>();
-        let Ok(base) = self.graph.descriptors.pointer(Graph::offset(0, ordinal), size) else {
-            return;
-        };
-        for offset in (0..size).step_by(LINE) {
-            // SAFETY: A prefetch hint inside the retained mapping; it has no
-            // architectural effect on memory.
-            unsafe {
-                core::arch::asm!("prfm pstl1keep, [{0}]", in(reg) base.add(offset),
-                    options(nostack, preserves_flags, readonly));
+        let record = ordinal as usize % RECORDS;
+        let config = size_of::<queue::QueueConfig>();
+        let ranges = [
+            (&self.graph.descriptors, Graph::offset(0, ordinal), size_of::<abi::TaDescriptor>()),
+            (&self.graph.config, CONFIG[0] + record * CONFIG_STRIDE, config),
+            (&self.graph.config, CONFIG[1] + record * CONFIG_STRIDE, config),
+        ];
+        for (object, offset, size) in ranges {
+            let Ok(base) = object.pointer(offset, size) else {
+                continue;
+            };
+            for line in (0..size).step_by(64) {
+                // SAFETY: A prefetch hint inside the retained mapping; it has no
+                // architectural effect on memory.
+                unsafe {
+                    core::arch::asm!("prfm pstl1keep, [{0}]", in(reg) base.add(line),
+                        options(nostack, preserves_flags, readonly));
+                }
             }
         }
     }
