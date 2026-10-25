@@ -14,7 +14,7 @@ use super::super::{Backend, DeferredBatch};
 use crate::g17::{
     job::Packet,
     object::Allocator,
-    port::Port,
+    port::{Port, RenderRoom},
     queue::render::{Pair, PublicationLease, RenderAddresses},
 };
 use core::sync::atomic::Ordering;
@@ -39,6 +39,7 @@ pub(in crate::g17::runtime) struct Loan {
 struct DirectHost<'a> {
     port: &'a Port,
     render: &'a MutexGuard<'a, ()>,
+    room: RenderRoom,
     generation: u64,
     activation: Option<(u16, u64)>,
 }
@@ -79,8 +80,11 @@ impl crate::g17::queue::render::Host for DirectHost<'_> {
         commit: impl FnOnce() -> Result,
         late_tiling: impl FnOnce(),
     ) -> Result<[u32; 2]> {
+        if priority != self.room.priority() {
+            return Err(EINVAL);
+        }
         self.port
-            .write_render_pair(self.render, priority, fragment, tiling, commit, late_tiling)
+            .write_render_pair(self.render, &self.room, fragment, tiling, commit, late_tiling)
     }
     fn activate_render_pool(&mut self, id: u16, generation: u64) -> Result {
         // The lease leaves preparation when the pair is returned; nothing can
@@ -95,7 +99,10 @@ impl crate::g17::queue::render::Host for DirectHost<'_> {
         _tiling: &crate::g17::fw::channels::WorkSlot,
         next: [u32; 2],
     ) -> Result {
-        self.port.expose_render_pair(self.render, priority, next)
+        if priority != self.room.priority() {
+            return Err(EINVAL);
+        }
+        self.port.expose_render_pair(self.render, &self.room, next)
     }
     /// Pipe 0 (tiling) in bits 1:0, priority class in bits 3:2.
     fn notify_render(&mut self, priority: u8) -> Result {
@@ -302,9 +309,10 @@ impl Backend {
             };
             pair.prepare(&alloc, packet, loan.addresses)?;
             let render = port.render_lock();
-            if !lease.is_current() || !port.render_room(&render, priority)? {
+            if !lease.is_current() {
                 return Err(EBUSY);
             }
+            let room = port.observe_render_room(&render, priority)?.ok_or(EBUSY)?;
             let mut dependencies = pair.own_dependencies(self.owner, packet)?;
             if let Some(footprint) = packet.footprint.as_ref() {
                 dependencies.hazard_count = self.admission.publication_barriers(
@@ -317,6 +325,7 @@ impl Backend {
             let mut host = DirectHost {
                 port,
                 render: &render,
+                room,
                 generation,
                 activation: None,
             };

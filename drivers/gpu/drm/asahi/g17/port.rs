@@ -103,6 +103,22 @@ pub(super) struct Port {
     submissions: AtomicU64,
 }
 
+/// Room in both render work rings of one priority, observed under the render publication
+/// lock. While that lock is held no other host producer moves, and the firmware consumers only
+/// advance, so the observed producers stay current and the room stays available.
+#[derive(Clone, Copy)]
+pub(super) struct RenderRoom {
+    priority: u8,
+    /// Fragment, then tiling producer.
+    producers: [u32; 2],
+}
+
+impl RenderRoom {
+    pub(super) fn priority(&self) -> u8 {
+        self.priority
+    }
+}
+
 /// A compute work-ring slot reserved before any command becomes visible. Dropping an unused
 /// claim returns the slot.
 pub(super) struct OuterClaim<'a> {
@@ -225,20 +241,33 @@ impl Port {
         ))
     }
 
-    /// Both render work rings of `priority` have a free slot. Only firmware consumption,
-    /// never a publisher without the render lock, changes this.
-    pub(super) fn render_room(&self, _guard: &MutexGuard<'_, ()>, priority: u8) -> Result<bool> {
-        let (fragment, tiling) = self.render_rings(priority)?;
-        Ok(fragment.free()? > 0 && tiling.free()? > 0)
-    }
-
-    /// Copies a render pair's fragment, then tiling record into the slots after each
-    /// producer without exposing them, as `InitData::publish_work_pair` does for a deferred
-    /// pair. Returns the producers that expose them.
-    pub(super) fn write_render_pair(
+    /// Reads both render work rings of `priority` once. Returns their producers if both have a
+    /// free slot; the room holds for as long as `guard`. Only firmware consumption, never a
+    /// publisher without the render lock, changes it.
+    pub(super) fn observe_render_room(
         &self,
         _guard: &MutexGuard<'_, ()>,
         priority: u8,
+    ) -> Result<Option<RenderRoom>> {
+        let (fragment, tiling) = self.render_rings(priority)?;
+        let cursors = [fragment.cursors()?, tiling.cursors()?];
+        let room = |[first, second, producer]: [u32; 3]| {
+            let room = |consumer: u32| (consumer + WORK_RING_SLOTS - producer - 1) % WORK_RING_SLOTS;
+            room(first).min(room(second))
+        };
+        Ok((room(cursors[0]) > 0 && room(cursors[1]) > 0).then_some(RenderRoom {
+            priority,
+            producers: [cursors[0][2], cursors[1][2]],
+        }))
+    }
+
+    /// Copies a render pair's fragment, then tiling record into the slots after the producers
+    /// that `room` observed, without exposing them, as `InitData::publish_work_pair` does for a
+    /// deferred pair. Returns the producers that expose them.
+    pub(super) fn write_render_pair(
+        &self,
+        _guard: &MutexGuard<'_, ()>,
+        room: &RenderRoom,
         fragment: &WorkSlot,
         tiling: &WorkSlot,
         commit_accounting: impl FnOnce() -> Result,
@@ -249,21 +278,20 @@ impl Port {
         {
             return Err(EINVAL);
         }
-        let (fragment_ring, tiling_ring) = self.render_rings(priority)?;
-        let slot = |ring: &RingView| -> Result<(*mut u8, u32)> {
-            let [first, second, producer] = ring.cursors()?;
-            let next = (producer + 1) % WORK_RING_SLOTS;
-            if next == first || next == second {
+        let (fragment_ring, tiling_ring) = self.render_rings(room.priority)?;
+        let slot = |ring: &RingView, producer: u32| -> Result<(*mut u8, u32)> {
+            if producer >= WORK_RING_SLOTS {
                 return Err(EINVAL);
             }
             // SAFETY: The ring view spans WORK_RING_SLOTS records; `producer` is in range.
-            Ok((unsafe { ring.slots.add(producer as usize * core::mem::size_of::<WorkSlot>()) }, next))
+            let slot = unsafe { ring.slots.add(producer as usize * core::mem::size_of::<WorkSlot>()) };
+            Ok((slot, (producer + 1) % WORK_RING_SLOTS))
         };
-        let (fragment_slot, fragment_next) = slot(&fragment_ring)?;
-        let (tiling_slot, tiling_next) = slot(&tiling_ring)?;
+        let (fragment_slot, fragment_next) = slot(&fragment_ring, room.producers[0])?;
+        let (tiling_slot, tiling_next) = slot(&tiling_ring, room.producers[1])?;
         let copy = |record: &WorkSlot, destination: *mut u8| {
-            // SAFETY: The slot after the producer is host-owned until the producer moves past
-            // it, and the render lock excludes every other host writer of this ring.
+            // SAFETY: The room proves that the slot after the producer is host-owned until the
+            // producer moves past it, and the render lock excludes every other host writer.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     core::ptr::from_ref(record).cast::<u8>(),
@@ -281,17 +309,16 @@ impl Port {
         Ok([fragment_next, tiling_next])
     }
 
-    /// Exposes a pair written by `write_render_pair`, fragment first, as
-    /// `InitData::publish_retained_work_pair` does: the producers must still precede `next`.
+    /// Exposes a pair written by `write_render_pair` with `room`, fragment first, as
+    /// `InitData::publish_retained_work_pair` does: `next` must follow the observed producers.
     pub(super) fn expose_render_pair(
         &self,
         _guard: &MutexGuard<'_, ()>,
-        priority: u8,
+        room: &RenderRoom,
         next: [u32; 2],
     ) -> Result {
-        let (fragment_ring, tiling_ring) = self.render_rings(priority)?;
-        for (ring, next) in [(&fragment_ring, next[0]), (&tiling_ring, next[1])] {
-            let [_, _, producer] = ring.cursors()?;
+        let (fragment_ring, tiling_ring) = self.render_rings(room.priority)?;
+        for (producer, next) in room.producers.into_iter().zip(next) {
             if next != (producer + 1) % WORK_RING_SLOTS {
                 return Err(EBUSY);
             }
