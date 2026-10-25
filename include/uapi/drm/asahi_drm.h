@@ -374,7 +374,7 @@ enum drm_asahi_feature {
 	 * DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ_CUMULATIVE output. All outputs
 	 * include the earlier points of that timeline without adding GPU waits.
 	 */
-	DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS = (1UL) << 17,
+	DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS = (1UL) << 29,
 };
 
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1

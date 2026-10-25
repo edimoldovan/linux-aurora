@@ -6,7 +6,7 @@ use kernel::{bindings, dma_fence::{Fence, RawDmaFence}, prelude::*};
 // Wire values also documented in include/uapi/drm/asahi_drm.h. Keeping these
 // local permits building this module against an older kernel's Rust bindings.
 pub(crate) const SYNC_CUMULATIVE: u32 = 2;
-pub(crate) const FEATURE_CUMULATIVE_SIGNALS: u64 = 1 << 17;
+pub(crate) const FEATURE_CUMULATIVE_SIGNALS: u64 = 1 << 29;
 
 unsafe extern "C" {
     fn asahi_g17_signals_new(syncs: *const SignalSpec, count: usize, anchor: usize,
