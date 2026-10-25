@@ -307,6 +307,7 @@ struct Timeout<B: Backend> {
     backend: Arc<B>,
     victim_renewals: u8,
     execution_renewals: u8,
+    shared_renewals: u8,
     packet: Arc<Packet>,
 }
 
@@ -331,6 +332,7 @@ impl<B: Backend> sched::JobImpl for Job<B> {
             backend: self.backend.clone(),
             victim_renewals: 0,
             execution_renewals: 0,
+            shared_renewals: 0,
             packet: self.packet.clone(),
         }
     }
@@ -341,6 +343,13 @@ impl<B: Backend> sched::JobImpl for Job<B> {
         }
         if super::timeout::renew_execution(
             job.packet.is_published(), job.packet.command.long_job(), &mut job.execution_renewals,
+        ) {
+            return true;
+        }
+        // Other work retiring means the GPU is shared, not hung.
+        if super::timeout::renew_shared(
+            job.packet.is_published(), super::recovery::since_retired(super::now_ns()),
+            &mut job.shared_renewals,
         ) {
             return true;
         }

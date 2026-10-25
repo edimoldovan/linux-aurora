@@ -10,14 +10,25 @@ const LIMIT: u8 = 8;
 /// Commands retired successfully. A watchdog storm means the GPU stopped making progress;
 /// timeouts of overloaded clients while other work keeps retiring are not one.
 static RETIRED: AtomicU64 = AtomicU64::new(0);
+/// [`crate::g17::now_ns`] of the latest successful retirement, zero before the first.
+static LAST_RETIRED_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Called for every command that retires without error.
 pub(crate) fn note_retired() {
     RETIRED.fetch_add(1, Ordering::Relaxed);
+    LAST_RETIRED_NS.store(crate::g17::now_ns(), Ordering::Relaxed);
 }
 
 pub(super) fn retired() -> u64 {
     RETIRED.load(Ordering::Relaxed)
+}
+
+/// Nanoseconds since any command last retired successfully, or `None` before the first.
+pub(crate) fn since_retired(now: u64) -> Option<u64> {
+    match LAST_RETIRED_NS.load(Ordering::Relaxed) {
+        0 => None,
+        last => Some(now.saturating_sub(last)),
+    }
 }
 
 pub(super) struct Storm {

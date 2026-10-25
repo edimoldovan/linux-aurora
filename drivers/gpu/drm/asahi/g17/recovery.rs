@@ -10,7 +10,7 @@
 mod attribution;
 mod slot;
 mod safety;
-pub(crate) use safety::note_retired;
+pub(crate) use safety::{note_retired, since_retired};
 pub(crate) use attribution::Sources;
 use attribution::Attribution;
 
