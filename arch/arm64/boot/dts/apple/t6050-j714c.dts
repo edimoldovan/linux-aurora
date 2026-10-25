@@ -6,8 +6,8 @@
  *
  * Initial RAM boot resources measured on J714c/T6050.
  * The loader supplies usable memory, CPU release addresses and
- * framebuffer geometry; peripheral power management is left with the
- * boot firmware (t8152-j873g minimal-boot pattern).
+ * framebuffer geometry. Peripheral power domains come from
+ * t6050-pmgr.dtsi; the framebuffer holds the display domain.
  *
  * The loader's command line MUST include maxcpus=1 for the first boot:
  * spin-table bring-up of the secondaries is blocked by the T6050
@@ -48,6 +48,7 @@
 			compatible = "apple,simple-framebuffer", "simple-framebuffer";
 			reg = <0 0 0 0>; /* Filled by the loader. */
 			status = "okay"; /* m1n1 only enables it on chips it knows. */
+			power-domains = <&ps_disp_cpu>;
 		};
 	};
 

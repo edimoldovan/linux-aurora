@@ -3,11 +3,8 @@
  * Devices on the Apple T6050 "M5 Max" SoC (single die)
  *
  * Register windows from the live J714c device tree (dumps/j714c.adt).
- * Peripheral power management is left with the boot firmware for the
- * minimal first boot: the pmgr node declares only its register window
- * and carries no power-domain children, so the apple-pmgr-pwrstate
- * driver finds nothing to manage and clocks stay as the loader left
- * them (t8152-j873g minimal-boot pattern).
+ * The six pmgr register blocks are declared here; their power domains
+ * live in t6050-pmgr.dtsi.
  *
  * Copyright The Asahi Linux Contributors
  */
@@ -33,17 +30,46 @@
 		clock-names = "uart", "clk_uart_baud0";
 	};
 
-	pmgr: power-management@280600000 {
+	pmgr: pmgr0: power-management@280600000 {
 		compatible = "apple,t6050-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		reg = <0x2 0x80600000 0 0x4000>;
 		#address-cells = <1>;
 		#size-cells = <1>;
+	};
 
-		reg = <0x2 0x80600000 0x0 0x1fc000>;
-		/* No power-domain children for the first boot: power management
-		 * is left with the boot firmware (see file header). T6050's pmgr
-		 * is the ps-groups-era schema; a full t6050-pmgr.dtsi is future
-		 * work and is not required to reach a single-core console.
-		 */
+	pmgr1: power-management@280900000 {
+		compatible = "apple,t6050-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		reg = <0x2 0x80900000 0 0x4000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+	};
+
+	pmgr2: power-management@288300000 {
+		compatible = "apple,t6050-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		reg = <0x2 0x88300000 0 0xc000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+	};
+
+	pmgr3: power-management@2300e80000 {
+		compatible = "apple,t6050-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		reg = <0x23 0xe80000 0 0x4000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+	};
+
+	pmgr4: power-management@2380600000 {
+		compatible = "apple,t6050-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		reg = <0x23 0x80600000 0 0xc000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+	};
+
+	pmgr5: power-management@2388300000 {
+		compatible = "apple,t6050-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		reg = <0x23 0x88300000 0 0x4000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
 	};
 
 	wdt: watchdog@28836c000 {
