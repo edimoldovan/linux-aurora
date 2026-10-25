@@ -1088,6 +1088,28 @@ impl Pair {
             .front()
             .map(|active| active.packet.completion.spared())
     }
+    /// A recovery record names one of this pair's queues and the completion
+    /// stamp of the group it interrupted, `(ordinal + 1) << 8` like the pair's
+    /// stamps. Without a stamp match the oldest published group is marked.
+    pub(crate) fn note_interrupted(&self, stamp: u32) -> recovery::Interrupted {
+        let sequence = stamp >> 8;
+        if let Some(active) = self
+            .active
+            .iter()
+            .filter(|active| active.outer_published)
+            .find(|active| (active.ticket.ordinal.wrapping_add(1) as u32) & 0xff_ffff == sequence)
+        {
+            active.packet.completion.note_interrupted();
+            return recovery::Interrupted::Exact;
+        }
+        match self.active.iter().find(|active| active.outer_published) {
+            Some(active) => {
+                active.packet.completion.note_interrupted();
+                recovery::Interrupted::Oldest
+            }
+            None => recovery::Interrupted::None,
+        }
+    }
     pub(crate) fn visit_owners(&self, visit: &mut dyn FnMut(&Arc<VmStatus>)) {
         for active in self.active.iter() {
             visit(active.packet.completion.status());
@@ -1271,6 +1293,9 @@ impl Pair {
         if self.quarantined || self.active.len() == 0 || self.replay.len() != 0 {
             return Ok(false);
         }
+        if let Some(progressed) = self.settle_interrupted_front(host, defer, grace)? {
+            return Ok(progressed);
+        }
         use crate::g17::replay::{self, Decision, Group};
         let qids = self.qids();
         let memory = &self.memory;
@@ -1295,10 +1320,11 @@ impl Pair {
                     let stamps = observer.stamps()?;
                     let (_, state) = observer.host.epoch()?;
                     // A torn sample is no proof; a later poll or the timeout looks again.
+                    // Interrupted work is run again only if it never started.
                     Ok(matches!(
                         retirement::abandoned(&active.ticket, snapshot, stamps, state, false),
                         Ok(true)
-                    ))
+                    ) && (!active.packet.completion.interrupted() || snapshot.untouched()))
                 })()
                 .unwrap_or_else(|error: Error| {
                     failure = Some(error);
@@ -1389,6 +1415,81 @@ impl Pair {
             self.replay.push(packet).map_err(|_| EIO)?;
         }
         Ok(true)
+    }
+
+    /// A front group a restart interrupted after its tiler started, which firmware
+    /// then retired without writing its fragment end, may have run partly. It is
+    /// not replayed (blending or storage writes could apply twice) and fails now,
+    /// reported to its owner, instead of waiting out the render timeout. Returns
+    /// None when the front is not such a group.
+    fn settle_interrupted_front(
+        &mut self,
+        host: &mut impl Host,
+        defer: &mut impl FnMut(Deferred) -> Result,
+        grace: bool,
+    ) -> Result<Option<bool>> {
+        use retirement::Memory;
+        let qids = self.qids();
+        let Some(front) = self.active.front() else {
+            return Ok(None);
+        };
+        if !front.outer_published || front.failed || !front.packet.completion.interrupted() {
+            return Ok(None);
+        }
+        let ordinal = front.ticket.ordinal;
+        let ticket = front.ticket;
+        let mut observer = Observer {
+            memory: &self.memory,
+            qids,
+            host: &mut *host,
+        };
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let snapshot = observer.snapshot(ordinal)?;
+        let stamps = observer.stamps()?;
+        let (_, state) = observer.host.epoch()?;
+        if snapshot.untouched()
+            || !matches!(
+                retirement::abandoned(&ticket, snapshot, stamps, state, false),
+                Ok(true)
+            )
+        {
+            return Ok(None);
+        }
+        let now = crate::g17::now_ns();
+        let front = self.active.front_mut().ok_or(EIO)?;
+        if grace {
+            let Some(since) = front.abandoned_since else {
+                front.abandoned_since = Some(now);
+                return Ok(Some(false));
+            };
+            if now.saturating_sub(since) < ABANDON_GRACE_NS {
+                return Ok(Some(false));
+            }
+        }
+        if !front.flist_completed {
+            let qos = self.qos_owners();
+            let buffer = self.buffer_id();
+            let pool = self.free_list.id();
+            let front = self.active.front_mut().ok_or(EIO)?;
+            host.complete_render(
+                (!front.qos_completed).then_some(qos),
+                pool,
+                front.generation,
+                buffer,
+            )?;
+            front.flist_completed = true;
+            front.qos_completed = true;
+        }
+        pr_warn!(
+            "G17: render slot {}: group {} was interrupted by a GPU recovery after it started; failing it\n",
+            self.slot,
+            ordinal
+        );
+        let packet = self.active.front().ok_or(EIO)?.packet.clone();
+        defer(Deferred::Retired(packet.completion.clone(), Err(ECANCELED)))?;
+        self.memory.retire(ordinal)?;
+        self.active.pop().ok_or(EIO)?;
+        Ok(Some(true))
     }
 
     /// The pending replay cannot proceed (closed owner, cancellation or a

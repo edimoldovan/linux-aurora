@@ -131,8 +131,8 @@ impl recovery::Memory for Service<'_> {
     fn clear_timestamps(&self) -> Result {
         self.firmware.init.clear_timestamps()
     }
-    fn entries(&self) -> Result<recovery::Entries> {
-        self.firmware.init.entries()
+    fn entry(&self, index: usize) -> Result<(u32, u32)> {
+        self.firmware.init.entry(index)
     }
     fn wait_tick(&self) {
         self.firmware.init.wait_tick();
@@ -202,6 +202,22 @@ impl recovery::Queues for Service<'_> {
             queue.classify(class);
         }
         self.firmware.queues.classify_render(class)
+    }
+    fn note_interrupted(&mut self, qid: u8, stamp: u32) -> recovery::Interrupted {
+        let render = self.firmware.queues.note_render_interrupted(qid, stamp);
+        if render != recovery::Interrupted::None {
+            return render;
+        }
+        self.firmware
+            .queues
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .find(|queue| queue.qid() == qid)
+            .map_or(recovery::Interrupted::None, |queue| {
+                queue.note_interrupted(stamp)
+            })
     }
     fn settle_blamed_render(&mut self, qid: u8, error: Error) {
         let result = self

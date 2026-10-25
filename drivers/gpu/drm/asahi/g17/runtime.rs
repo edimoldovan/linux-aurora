@@ -1275,7 +1275,7 @@ impl DeferredBatch {
         // it. Expose terminal VM status now, before off-lock fence callbacks.
         // Recovery-spared and cancelled commands never poison their VM.
         if let Deferred::FailedOwned(completion, error) = &value {
-            if *error != ECANCELED && !completion.spared() {
+            if completion.poisons(*error) {
                 completion.status().record(*error);
             }
         }

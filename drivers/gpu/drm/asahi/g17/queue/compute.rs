@@ -718,6 +718,27 @@ impl Queue {
             visit(active.packet.completion.status());
         }
     }
+    /// A recovery record names this queue and the completion stamp of the
+    /// command it interrupted, `kick << 8` like the queue's stamp. Without a
+    /// stamp match the oldest published command is marked.
+    pub(crate) fn note_interrupted(&self, stamp: u32) -> recovery::Interrupted {
+        let sequence = stamp >> 8;
+        if let Some(active) = self.active.iter().find(|active| {
+            active
+                .ticket
+                .is_some_and(|ticket| (ticket.kick as u32) & 0xff_ffff == sequence)
+        }) {
+            active.packet.completion.note_interrupted();
+            return recovery::Interrupted::Exact;
+        }
+        match self.active.iter().find(|active| active.ticket.is_some()) {
+            Some(active) => {
+                active.packet.completion.note_interrupted();
+                recovery::Interrupted::Oldest
+            }
+            None => recovery::Interrupted::None,
+        }
+    }
     pub(crate) fn classify(&self, class: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) {
         for active in self.active.iter() {
             active

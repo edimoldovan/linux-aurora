@@ -1564,17 +1564,22 @@ impl super::recovery::Memory for InitData {
         Ok(())
     }
 
-    fn entries(&self) -> Result<super::recovery::Entries> {
-        let cluster = self.object(self.cluster)?;
-        let base = self.status_b + abi::PrimaryStatusB::RECOVERY_INFO;
-        fence(Ordering::Acquire);
-        let mut entries = super::recovery::Entries::default();
-        for index in 0..256 {
-            let offset = base + index * core::mem::size_of::<abi::RecoveryInfoEntry>();
-            let flags = cluster.word(offset)?.load(Ordering::Relaxed);
-            entries.include(flags);
+    fn entry(&self, index: usize) -> Result<(u32, u32)> {
+        if index >= super::recovery::RECOVERY_RECORDS {
+            return Err(EINVAL);
         }
-        Ok(entries)
+        let cluster = self.object(self.cluster)?;
+        let offset = self.status_b
+            + abi::PrimaryStatusB::RECOVERY_INFO
+            + index * core::mem::size_of::<abi::RecoveryInfoEntry>();
+        fence(Ordering::Acquire);
+        let flags = cluster
+            .word(offset + core::mem::offset_of!(abi::RecoveryInfoEntry, flags))?
+            .load(Ordering::Relaxed);
+        let stamp = cluster
+            .word(offset + core::mem::offset_of!(abi::RecoveryInfoEntry, stamp))?
+            .load(Ordering::Relaxed);
+        Ok((flags, stamp))
     }
 
     fn wait_tick(&self) {

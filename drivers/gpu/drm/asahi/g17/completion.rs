@@ -270,6 +270,9 @@ pub(crate) struct Completion {
     /// A recovery blamed this command. Unlike `class`, which a later
     /// classification can change, this never clears.
     blamed: AtomicBool,
+    /// A firmware restart listed this command as in flight. Until a replay
+    /// republishes it from the start, it never reports success.
+    interrupted: AtomicBool,
     firmware_consumer: AtomicBool,
     class: AtomicU8,
 }
@@ -327,6 +330,7 @@ impl Completion {
                 replays: AtomicU8::new(0),
                 replay_timeout: AtomicBool::new(false),
                 blamed: AtomicBool::new(false),
+                interrupted: AtomicBool::new(false),
                 firmware_consumer: AtomicBool::new(false),
                 class: AtomicU8::new(0),
             }),
@@ -379,6 +383,11 @@ impl Completion {
     }
     /// Called under the device mutex as a successful retirement is queued.
     pub(super) fn note_source_retired(&self) {
+        if self.interrupted() {
+            // complete() fails it; consumers must not take its output as valid.
+            self.note_input_error(ECANCELED);
+            return;
+        }
         match self.check_source_inputs() {
             Ok(()) => self.output.output().member.note_retired(),
             Err(error) => { self.note_input_error(error); }
@@ -429,6 +438,9 @@ impl Completion {
             .is_ok();
         if accepted {
             self.replay_timeout.store(true, Ordering::Release);
+            // Callers replay only work proven not to have started; the new
+            // publication runs from the beginning and reports its own result.
+            self.interrupted.store(false, Ordering::Release);
         }
         accepted
     }
@@ -517,6 +529,35 @@ impl Completion {
         self.blamed.load(Ordering::Acquire)
     }
 
+    /// A firmware restart listed this command in its recovery table: it was in
+    /// flight, so it may have run partly. Its stamps and completion record may
+    /// still look like success. Unless a replay republishes it from the start,
+    /// it fails and the failure is always reported to the client.
+    pub(crate) fn note_interrupted(&self) {
+        self.interrupted.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::Acquire)
+    }
+
+    /// Whether this failure makes the VM unusable. Spared work, and interrupted
+    /// work no recovery found guilty, fail without poisoning it.
+    pub(crate) fn poisons(&self, error: Error) -> bool {
+        let interrupted = self.interrupted();
+        (error != ECANCELED || interrupted) && !self.spared() && !(interrupted && !self.guilty())
+    }
+
+    /// ECANCELED stays silent only for work that was never interrupted (closed
+    /// or cancelled by its owner); every other failure reaches the client.
+    fn report(&self, error: Error) {
+        if self.poisons(error) {
+            self.status.record(error);
+        } else if error != ECANCELED || self.interrupted() {
+            self.status.report_failure(error);
+        }
+    }
+
     /// Installed before the first firmware-visible prefix. Cancellation takes
     /// the same lock after claiming the signal, so it cannot miss a late lease.
     pub(crate) fn attach_render_lease(
@@ -589,6 +630,9 @@ impl Completion {
         if self.signalled.swap(true, Ordering::AcqRel) {
             return;
         }
+        if result.is_ok() && self.interrupted() {
+            result = Err(ECANCELED);
+        }
         if let (Some(feed), Ok(ticks)) = (&self.feed, &result) {
             // Compute reports its dispatch envelope in the first pair, a
             // render its fragment pass in the second.
@@ -600,13 +644,7 @@ impl Completion {
         }
         if let Err(error) = result {
             // Spared work cancelled after another VM's recovery is not this client's device loss.
-            if self.spared() {
-                if error != ECANCELED {
-                    self.status.report_failure(error);
-                }
-            } else if error != ECANCELED {
-                self.status.record(error);
-            }
+            self.report(error);
         }
         self.release_healthy();
         self.signal_terminal(result);
@@ -640,8 +678,8 @@ impl Completion {
         }
         if self.spared() {
             self.status.report_failure(error);
-        } else if error != ECANCELED {
-            self.status.record(error);
+        } else {
+            self.report(error);
         }
         self.signal_terminal(Err(error));
         self.output.finish(Err(error));

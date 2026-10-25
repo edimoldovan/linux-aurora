@@ -830,6 +830,22 @@ impl Registry {
             .find(|pair| pair.qids().contains(&qid))
             .and_then(|pair| pair.oldest_spared())
     }
+    /// Marks the interrupted group of the pair that owns `qid`.
+    pub(in crate::g17) fn note_render_interrupted(
+        &self,
+        qid: u8,
+        stamp: u32,
+    ) -> crate::g17::recovery::Interrupted {
+        self.render
+            .entries
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.pair.as_ref())
+            .find(|pair| pair.qids().contains(&qid))
+            .map_or(crate::g17::recovery::Interrupted::None, |pair| {
+                pair.note_interrupted(stamp)
+            })
+    }
     pub(in crate::g17) fn visit_render_owners(
         &self,
         qid: u8,
