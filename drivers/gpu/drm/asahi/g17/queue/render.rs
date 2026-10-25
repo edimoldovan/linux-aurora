@@ -83,12 +83,13 @@ pub(crate) struct PublicationLease {
 pub(crate) trait Host {
     fn epoch(&self) -> Result<(u64, u32)>;
     fn stamps(&self, qids: [u8; 2]) -> Result<[u32; 2]>;
-    fn qos_publish(
+    /// Publishes `owners` in order with one pass over the QoS table.
+    fn qos_publish_pair(
         &mut self,
-        owner: qos::Owner,
+        owners: [qos::Owner; 2],
         scheduler: u64,
         policy: crate::g17::fw::queue::Policy,
-    ) -> Result<qos::Publication>;
+    ) -> Result<[qos::Publication; 2]>;
     fn qos_cancel(&mut self, publication: qos::Publication) -> Result;
     fn install_pair(&mut self, registration: &RenderRegistration) -> Result;
     fn publish_qid(&mut self, id: kick::Id) -> Result;
@@ -800,10 +801,12 @@ impl Pair {
         tiling_kick.commit();
         let mut qos_publications = [None; 2];
         let result = (|| {
-            qos_publications[1] =
-                Some(host.qos_publish(qos_owners[1], context.scheduler_va(), policy)?);
-            qos_publications[0] =
-                Some(host.qos_publish(qos_owners[0], context.scheduler_va(), policy)?);
+            let [fragment, tiling] = host.qos_publish_pair(
+                [qos_owners[1], qos_owners[0]],
+                context.scheduler_va(),
+                policy,
+            )?;
+            qos_publications = [Some(tiling), Some(fragment)];
             // A class change happens only at a rebind, after the pair drained.
             if self.registered != Some(policy.priority()) {
                 host.install_pair(&registration)?;

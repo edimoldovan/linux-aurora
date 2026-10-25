@@ -53,13 +53,13 @@ impl crate::g17::queue::render::Host for DirectHost<'_> {
     fn stamps(&self, qids: [u8; 2]) -> Result<[u32; 2]> {
         Ok([self.port.stamp(qids[0])?, self.port.stamp(qids[1])?])
     }
-    fn qos_publish(
+    fn qos_publish_pair(
         &mut self,
-        owner: crate::g17::qos::Owner,
+        owners: [crate::g17::qos::Owner; 2],
         scheduler: u64,
         policy: crate::g17::fw::queue::Policy,
-    ) -> Result<crate::g17::qos::Publication> {
-        self.port.qos_publish(owner, scheduler, policy)
+    ) -> Result<[crate::g17::qos::Publication; 2]> {
+        self.port.qos_publish_pair(owners, scheduler, policy)
     }
     fn qos_cancel(&mut self, publication: crate::g17::qos::Publication) -> Result {
         self.port.qos_cancel(publication)

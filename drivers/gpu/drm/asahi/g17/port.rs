@@ -333,6 +333,17 @@ impl Port {
         self.qos.lock().publish(&view, owner, scheduler, policy, qos::clock)
     }
 
+    /// Publishes the two owners of a render command, fragment then tiling.
+    pub(super) fn qos_publish_pair(
+        &self,
+        owners: [qos::Owner; 2],
+        scheduler: u64,
+        policy: Policy,
+    ) -> Result<[qos::Publication; 2]> {
+        let view = self.qos_view()?;
+        self.qos.lock().publish_owners(&view, owners, scheduler, policy, qos::clock)
+    }
+
     pub(super) fn qos_cancel(&self, publication: qos::Publication) -> Result {
         let view = self.qos_view()?;
         self.qos.lock().cancel(&view, publication)

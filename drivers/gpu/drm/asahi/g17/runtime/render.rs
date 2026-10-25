@@ -531,13 +531,13 @@ impl crate::g17::queue::render::Host for Host<'_> {
         core::sync::atomic::fence(Ordering::Acquire);
         Ok(stamps)
     }
-    fn qos_publish(
+    fn qos_publish_pair(
         &mut self,
-        owner: crate::g17::qos::Owner,
+        owners: [crate::g17::qos::Owner; 2],
         scheduler: u64,
         policy: crate::g17::fw::queue::Policy,
-    ) -> Result<crate::g17::qos::Publication> {
-        self.firmware.port.qos_publish(owner, scheduler, policy)
+    ) -> Result<[crate::g17::qos::Publication; 2]> {
+        self.firmware.port.qos_publish_pair(owners, scheduler, policy)
     }
     fn qos_cancel(&mut self, publication: crate::g17::qos::Publication) -> Result {
         self.firmware.port.qos_cancel(publication)
