@@ -192,6 +192,9 @@ pub(crate) struct Pair {
     /// An owner change in flight: the previous scheduler page and the ordinal of
     /// the new owner's first command, until that command leaves the pair.
     switch: Option<(u64, u64)>,
+    /// Completion values of the two kicks of the last publication, kept with the configuration
+    /// cache: what each queue holds once that publication completed.
+    published_completions: Option<[u64; 2]>,
 }
 impl Pair {
     #[inline(never)]
@@ -290,6 +293,7 @@ impl Pair {
             context_update: true,
             executed: 0,
             switch: None,
+            published_completions: None,
         }))
     }
     pub(crate) fn qids(&self) -> [u8; 2] {
@@ -649,10 +653,26 @@ impl Pair {
         } else {
             [None; 2]
         };
-        let present = [
-            publication::required(cache[0], configs[0]),
-            publication::required(cache[1], configs[1]),
-        ];
+        // A covered queue holds the completion value of its newest kick. When that kick is the
+        // previous publication of this pair in this recovery epoch, the seed would reload the
+        // value already held, so the configuration record is needed only for its identity.
+        // Each record costs the firmware time before it starts the kick.
+        let held = self
+            .published_completions
+            .take()
+            .filter(|_| self.recovery_generation == epoch);
+        let present = [0, 1].map(|stage| {
+            let mut config = configs[stage];
+            let reload = kicks[stage].prev().completion_value(payload.wrapping_sub(1));
+            if config.completion_seed_valid != 0
+                && self.installed[stage]
+                && held.is_some_and(|held| held[stage] == reload)
+            {
+                config.completion_seed_valid = 0;
+                config.completion_seed = 0;
+            }
+            publication::required(cache[stage], config)
+        });
         let cursors = self.memory.graph.cursors()?;
         if cursors[0].write != self.cursors[0] || cursors[1].write != self.cursors[1] {
             return Err(EBUSY);
@@ -865,6 +885,7 @@ impl Pair {
         }
         self.recovery_generation = epoch;
         self.installed = [true; 2];
+        self.published_completions = Some(kicks.map(|kick| kick.completion_value(payload)));
         self.outer_started |= ring;
         if let Some(previous) = self.previous.as_mut().filter(|p| p.publication.is_none()) {
             previous.publication = Some(ordinal);
@@ -1142,6 +1163,7 @@ impl Pair {
 
     pub(crate) fn resync(&mut self) {
         self.configs = [None; 2];
+        self.published_completions = None;
         for kick in &mut self.kicks {
             kick.clear_parent_after_recovery();
         }
@@ -1417,6 +1439,7 @@ impl Pair {
             self.memory.retire(ordinal)?;
             self.active.pop().ok_or(EIO)?;
             packet.reset_publication_for_replay();
+            self.published_completions = None;
             self.replay.push(packet).map_err(|_| EIO)?;
         }
         Ok(true)
