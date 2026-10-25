@@ -1394,6 +1394,12 @@ impl compute::Host for ComputeHost<'_> {
     fn notify(&mut self, message: u64) -> Result {
         self.port.notify(message)
     }
+    fn notify_compute(&mut self, priority: u8, message: u64) -> Result {
+        self.port.notify_compute(priority, message)
+    }
+    fn compute_written(&self, priority: u8) -> u64 {
+        self.port.compute_written(priority)
+    }
     fn note_submission(&mut self) -> Result {
         self.effort.submit();
         super::Firmware::apply_shared_effort(self.init, self.effort, self.port, super::power::FULL_EFFORT)
@@ -1437,6 +1443,12 @@ impl compute::Host for DirectHost<'_> {
     }
     fn notify(&mut self, message: u64) -> Result {
         self.port.notify(message)
+    }
+    fn notify_compute(&mut self, priority: u8, message: u64) -> Result {
+        self.port.notify_compute(priority, message)
+    }
+    fn compute_written(&self, priority: u8) -> u64 {
+        self.port.compute_written(priority)
     }
     fn note_submission(&mut self) -> Result {
         Ok(())
@@ -1680,13 +1692,13 @@ impl super::Firmware {
             freed |= busy && queue.channel_free();
             // Withheld doorbells are rung once their command is next but one; one per
             // priority class announces every queue's work slots on that ring.
-            if let Some(doorbell) = queue.due_doorbell() {
+            if let Some(doorbell) = queue.due_doorbell(|class| port.compute_announced(class)) {
                 let class = ((doorbell >> 2) & 3) as usize;
                 doorbells[class] = doorbell;
             }
         }
         for doorbell in doorbells.into_iter().filter(|doorbell| *doorbell != 0) {
-            self.primary.notify(doorbell)?;
+            self.port.notify_compute(((doorbell >> 2) & 3) as u8, doorbell)?;
         }
         // All compute observations in this batch are latched before a VM
         // failure can settle its render peers. Exact successes win first.

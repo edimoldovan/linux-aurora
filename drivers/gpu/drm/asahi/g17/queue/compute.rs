@@ -594,15 +594,22 @@ pub(crate) struct Queue {
     source_readers: Arc<core::sync::atomic::AtomicU32>,
     source_hint: crate::g17::sync_input::ReaderHint,
     /// The doorbell withheld from publications that had [`WITHHOLD_DEPTH`] - 1 or more
-    /// unretired commands of this queue ahead of them, and the publication of the first.
-    withheld_doorbell: Option<(u64, u64)>,
+    /// unretired commands of this queue ahead of them, the publication of the first, and the
+    /// compute work slots written at its priority once its slot was.
+    withheld_doorbell: Option<(u64, u64, u64)>,
 }
 
 impl Queue {
     /// Returns the withheld doorbell once at most one unretired command of this queue
-    /// precedes the first publication it covers.
-    pub(crate) fn due_doorbell(&mut self) -> Option<u64> {
-        let (doorbell, first) = self.withheld_doorbell?;
+    /// precedes the first publication it covers. A doorbell of the same class rung after the
+    /// last withheld work slot was written announced every one of them: nothing is left to
+    /// ring. `announced` gives the slots announced per class.
+    pub(crate) fn due_doorbell(&mut self, announced: impl Fn(u8) -> u64) -> Option<u64> {
+        let (doorbell, first, written) = self.withheld_doorbell?;
+        if announced(((doorbell >> 2) & 3) as u8) >= written {
+            self.withheld_doorbell = None;
+            return None;
+        }
         if self.active.iter().filter(|active| active.published < first).count() > 1 {
             return None;
         }
@@ -1913,6 +1920,8 @@ pub(crate) trait Host {
     fn publish_outer(&mut self, priority: u8, slot: &crate::g17::fw::channels::WorkSlot)
         -> Result;
     fn notify(&mut self, message: u64) -> Result;
+    fn notify_compute(&mut self, priority: u8, message: u64) -> Result;
+    fn compute_written(&self, priority: u8) -> u64;
     fn note_submission(&mut self) -> Result;
 }
 
@@ -2260,12 +2269,14 @@ impl Queue {
             fence(Ordering::SeqCst);
             let doorbell = (0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2;
             if self.active.len >= WITHHOLD_DEPTH
-                && self.withheld_doorbell.is_none_or(|(withheld, _)| withheld == doorbell)
+                && self.withheld_doorbell.is_none_or(|(withheld, _, _)| withheld == doorbell)
             {
-                self.withheld_doorbell.get_or_insert((doorbell, published));
+                let written = host.compute_written(policy.priority());
+                let entry = self.withheld_doorbell.get_or_insert((doorbell, published, written));
+                entry.2 = written;
             } else {
-                host.notify(doorbell)?;
-                if self.withheld_doorbell.is_some_and(|(withheld, _)| withheld == doorbell) {
+                host.notify_compute(policy.priority(), doorbell)?;
+                if self.withheld_doorbell.is_some_and(|(withheld, _, _)| withheld == doorbell) {
                     self.withheld_doorbell = None;
                 }
             }
