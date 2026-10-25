@@ -510,6 +510,8 @@ static int __init t6050_wdt_arm(void)
 
 	if (!t6050_wdt_secs)
 		return 0;
+	/* The 24 MHz count is a 32-bit register: at most 178 s. */
+	t6050_wdt_secs = min(t6050_wdt_secs, U32_MAX / 24000000U);
 	w = ioremap(0x28836c000, 0x20);
 	if (!w)
 		return 0;

@@ -737,12 +737,6 @@ static void apple_rtkit_syslog_rx_log(struct apple_rtkit *rtk, u64 msg)
 		 rtk->syslog_msg_buffer);
 
 done:
-	/*
-	 * T6050: the storage coprocessor crashes on the first echoed syslog record;
-	 * the loader never acknowledges them on this chip and runs fine.
-	 */
-	if (of_machine_is_compatible("apple,t6050"))
-		return;
 	apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_SYSLOG, msg, NULL, false);
 }
 
