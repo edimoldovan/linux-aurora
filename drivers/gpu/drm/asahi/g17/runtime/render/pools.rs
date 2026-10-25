@@ -179,7 +179,7 @@ impl Pools {
     ) -> (bool, Option<u64>) {
         let mut ended = false;
         let mut next: Option<u64> = None;
-        for lease in self.leases.iter_mut().flatten() {
+        for lease in self.leases[FIRST_RENDER_POOL..].iter_mut().flatten() {
             let Some(since) = lease.lingering() else {
                 continue;
             };
@@ -212,7 +212,7 @@ impl Pools {
         fence(Ordering::Acquire);
         let consumer = init.control_consumer()?.load(Ordering::Relaxed);
         let producer = init.control_producer()?.load(Ordering::Relaxed);
-        for lease in self.leases.iter_mut().flatten() {
+        for lease in self.leases[FIRST_RENDER_POOL..].iter_mut().flatten() {
             lease.observe_releases(consumer, producer)?;
         }
         Ok(())
@@ -225,7 +225,7 @@ impl Pools {
         init: &InitData,
         mut announce: impl FnMut() -> Result,
     ) -> Result {
-        for lease in self.leases.iter_mut().flatten() {
+        for lease in self.leases[FIRST_RENDER_POOL..].iter_mut().flatten() {
             let Some(release) = lease.pending_release() else {
                 continue;
             };
