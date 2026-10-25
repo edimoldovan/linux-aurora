@@ -2,17 +2,41 @@
 
 //! Fail closed on repeated watchdog/restart traffic, even across client loss.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 const WINDOW_NS: u64 = 30_000_000_000;
 const LIMIT: u8 = 8;
+
+/// Commands retired successfully. A watchdog storm means the GPU stopped making progress;
+/// timeouts of overloaded clients while other work keeps retiring are not one.
+static RETIRED: AtomicU64 = AtomicU64::new(0);
+
+/// Called for every command that retires without error.
+pub(crate) fn note_retired() {
+    RETIRED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(super) fn retired() -> u64 {
+    RETIRED.load(Ordering::Relaxed)
+}
 
 pub(super) struct Storm {
     start: Option<u64>,
     count: u8,
     stopped: bool,
+    progress: u64,
 }
 impl Storm {
     pub(super) const fn new() -> Self {
-        Self { start: None, count: 0, stopped: false }
+        Self { start: None, count: 0, stopped: false, progress: 0 }
+    }
+    /// Like [`Self::note`], but work retired since the previous event starts a new window.
+    pub(super) fn note_unless_progress(&mut self, now: u64, progress: u64) -> bool {
+        if !self.stopped && progress != self.progress {
+            self.progress = progress;
+            self.start = None;
+        }
+        self.note(now)
     }
     pub(super) fn note(&mut self, now: u64) -> bool {
         if self.stopped { return true; }

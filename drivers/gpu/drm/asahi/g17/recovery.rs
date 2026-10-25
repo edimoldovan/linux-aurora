@@ -10,6 +10,7 @@
 mod attribution;
 mod slot;
 mod safety;
+pub(crate) use safety::note_retired;
 pub(crate) use attribution::Sources;
 use attribution::Attribution;
 
@@ -152,7 +153,9 @@ impl State {
             restarts: safety::Storm::new(),
         }
     }
-    pub(super) fn timeout_limit(&mut self, now: u64) -> bool { self.timeouts.note(now) }
+    pub(super) fn timeout_limit(&mut self, now: u64) -> bool {
+        self.timeouts.note_unless_progress(now, safety::retired())
+    }
     pub(super) fn restart_limit(&mut self, now: u64) -> bool { self.restarts.note(now) }
     pub(super) fn generation(&self) -> u64 {
         self.accepted

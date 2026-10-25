@@ -968,6 +968,7 @@ impl Queue {
                     }
                     let front = self.active.front().ok_or(EIO)?;
                     if let Some(ticket) = front.ticket {
+                        crate::g17::recovery::note_retired();
                         crate::g17::trace::complete(crate::g17::trace::COMPUTE, ticket.qid,
                             ticket.ordinal, &front.packet, [timestamps[0], timestamps[1]]);
                     }

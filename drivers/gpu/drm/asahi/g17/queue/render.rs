@@ -1260,6 +1260,7 @@ impl Pair {
             front.qos_completed = true;
             front.flist_completed = true;
         }
+        crate::g17::recovery::note_retired();
         crate::g17::trace::complete(crate::g17::trace::RENDER, qids[1], ordinal as u32,
             &front.packet, [timestamps[0], timestamps[3]]);
         defer(Deferred::Retired(
