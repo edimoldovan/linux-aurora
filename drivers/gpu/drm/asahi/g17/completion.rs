@@ -27,9 +27,9 @@ mod publication;
 pub(crate) use publication::{Prepared as PreparedPublication, Publication};
 
 struct Destination {
-    // Keep the existing GPU alias alive along with its prepared CPU view.
-    _mapping: Arc<crate::timestamp::Buffer>,
-    cpu: mmu::TimestampMapping,
+    // The buffer keeps its GPU alias and its CPU mapping alive.
+    buffer: Arc<crate::timestamp::Buffer>,
+    offset: usize,
 }
 
 impl Destination {
@@ -45,13 +45,13 @@ impl Destination {
             .get(timestamp.handle.try_into()?)
             .ok_or(ENOENT)?
             .clone();
-        let file::Object::TimestampBuffer(mapping) = object;
+        let file::Object::TimestampBuffer(buffer) = object;
         let offset: usize = timestamp.offset.try_into()?;
-        if offset.checked_add(size_of::<u64>()).ok_or(EINVAL)? > mapping.size() {
+        if offset.checked_add(size_of::<u64>()).ok_or(EINVAL)? > buffer.size() {
             return Err(ERANGE);
         }
-        let cpu = mapping.timestamp_mapping(offset)?;
-        Ok(Some(Self { _mapping: mapping, cpu }))
+        let offset = buffer.timestamp_offset(offset)?;
+        Ok(Some(Self { buffer, offset }))
     }
 
     fn write(&self, ticks: u64) {
@@ -61,13 +61,14 @@ impl Destination {
             .wrapping_add(
                 ticks % cfg::COMMAND_TIMESTAMP_HZ * NSEC_PER_SEC / cfg::COMMAND_TIMESTAMP_HZ,
             );
-        self.cpu.write(ns);
+        self.buffer.write_timestamp(self.offset, ns);
         barrier(Ordering::Release);
     }
 }
 
-/// Timestamp mappings resolved and retained before any command is enqueued.
-pub(crate) struct Destinations(Option<crate::cleanup::Deferred<[Option<Destination>; 4]>>);
+/// Timestamp destinations resolved and retained before any command is enqueued. Dropping
+/// one releases only a buffer reference; the buffer defers its own mapping release.
+pub(crate) struct Destinations([Option<Destination>; 4]);
 
 impl Destinations {
     pub(crate) fn resolve(
@@ -82,22 +83,13 @@ impl Destinations {
             destinations[2 * index] = Destination::resolve(objects, timestamp.start)?;
             destinations[2 * index + 1] = Destination::resolve(objects, timestamp.end)?;
         }
-        // Empty submissions need no cleanup allocation. Timestamped commands
-        // prepare the unique work item before any output fence is published.
-        let retained = if destinations.iter().any(Option::is_some) {
-            Some(crate::cleanup::Deferred::new(destinations)?)
-        } else {
-            None
-        };
-        Ok(Self(retained))
+        Ok(Self(destinations))
     }
 
-    pub(crate) fn has_outputs(&self) -> bool { self.0.is_some() }
+    pub(crate) fn has_outputs(&self) -> bool { self.0.iter().any(Option::is_some) }
 
     fn iter(&self) -> core::slice::Iter<'_, Option<Destination>> {
-        let destinations: &[Option<Destination>] =
-            self.0.as_deref().map_or(&[], |destinations| destinations.as_slice());
-        destinations.iter()
+        self.0.iter()
     }
 }
 

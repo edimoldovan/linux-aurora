@@ -1658,18 +1658,22 @@ impl gpu::Gpu for Gpu {
         mut bo: gem::ObjectRef,
         range: Range<usize>,
     ) -> Result<crate::timestamp::Buffer> {
-        let state = self.shared.state.lock();
-        let firmware = (*state).as_ref().ok_or(ENODEV)?;
-        let mut addresses = firmware.uat.geometry().kernel_range();
-        addresses.start += hw::t8140::dynamic::KERNEL_OFFSET;
-        crate::timestamp::Buffer::firmware(bo.map_range_into_range(
-            firmware.uat.kernel_vm(),
-            range,
-            addresses,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_FW_SHARED_RW,
-            false,
-        )?)
+        let mapping = {
+            let state = self.shared.state.lock();
+            let firmware = (*state).as_ref().ok_or(ENODEV)?;
+            let mut addresses = firmware.uat.geometry().kernel_range();
+            addresses.start += hw::t8140::dynamic::KERNEL_OFFSET;
+            bo.map_range_into_range(
+                firmware.uat.kernel_vm(),
+                range,
+                addresses,
+                mmu::UAT_PGSZ as u64,
+                mmu::PROT_FW_SHARED_RW,
+                false,
+            )?
+        };
+        // The buffer's CPU mapping takes the reservation lock: not under the device mutex.
+        crate::timestamp::Buffer::firmware(mapping)
     }
 }
 
