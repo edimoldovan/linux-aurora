@@ -571,21 +571,10 @@ impl Memory {
             (&mut *tiling).write(args)?;
             let fragment = &mut *fragment;
             fragment.write(args)?;
-            self.registers.bytes_mut().fill(0);
-            for (index, array) in fragment.descriptor.arrays.iter().enumerate() {
-                for (entry, value) in array
-                    .entries
-                    .get(..(array.size & 0xffff) as usize)
-                    .ok_or(EINVAL)?
-                    .iter()
-                    .enumerate()
-                {
-                    self.registers.write(
-                        index * size_of::<fw::kick::RegisterArray>()
-                            + entry * size_of::<fw::kick::RegisterWrite>(),
-                        *value,
-                    )?;
-                }
+            // Kick entries bind the arrays embedded in this descriptor
+            // (register_bindings); the client register page is never read.
+            for array in &fragment.descriptor.arrays {
+                array.entries.get(..(array.size & 0xffff) as usize).ok_or(EINVAL)?;
             }
             fragment.set_mcache(
                 args.fragment.descriptor_va,
