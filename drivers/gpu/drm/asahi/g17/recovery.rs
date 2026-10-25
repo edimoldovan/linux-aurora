@@ -24,7 +24,11 @@ const QIDS: u8 = 128;
 const GUILTY: u8 = 1 << 1;
 const CANCELLED: u8 = 1 << 2;
 const MAX_GUILTY_VMS: usize = 8;
-const RECOVERY_POLLS: usize = 500;
+/// One-millisecond ticks per handshake phase. The firmware finishes a restart only after the
+/// work it interrupted has drained; with several clients running long ray-traversal jobs that
+/// takes seconds, and giving up loses every client's device. Ten seconds matches the longest
+/// execution allowance (`timeout::POLL_MS` plus renewals).
+const RECOVERY_POLLS: usize = 10_000;
 
 /// Per-QID classifications from the complete firmware recovery table.
 /// Multiple records for a queue contribute all of their classification bits.
@@ -192,6 +196,8 @@ pub(super) fn service<H: Host>(
         }
     }
     if !ready {
+        pr_warn!("G17: recovery gen {} did not reach state 1 (state {:?})\n",
+            request.generation, host.recovery_state());
         return Err(ETIMEDOUT);
     }
     // Recheck ownership after the off-CPU waits, before any handshake mutation.
@@ -217,6 +223,8 @@ pub(super) fn service<H: Host>(
         host.wait_tick();
     }
     if !recovered {
+        pr_warn!("G17: recovery gen {} did not reach state 3 (state {:?})\n",
+            request.generation, host.recovery_state());
         return Err(ETIMEDOUT);
     }
     // A failed table read leaves only the explicit blamed QID as evidence of guilt.

@@ -266,7 +266,10 @@ impl Firmware {
 
     /// Preparation admission is already closed and all builders have joined.
     pub(super) fn service_runtime_recovery(&mut self, deferred: &mut DeferredBatch) -> Result {
-        if self.recovery.restart_limit(super::now_ns()) { return Err(ETIMEDOUT); }
+        if self.recovery.restart_limit(super::now_ns()) {
+            pr_warn!("G17: restart storm limit reached\n");
+            return Err(ETIMEDOUT);
+        }
         let shared = self.primary.state.shared.clone();
         let mut service = Service {
             firmware: self,
