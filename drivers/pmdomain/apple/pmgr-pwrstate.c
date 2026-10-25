@@ -337,6 +337,8 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	pr_info("pmgr: probe %s @ %#x\n", name, ps->offset); /* T6050 SError hunt */
+
 	ps->genpd.flags |= GENPD_FLAG_IRQ_SAFE;
 	ps->genpd.name = name;
 	ps->genpd.power_on = apple_pmgr_ps_power_on;
@@ -488,3 +490,19 @@ module_platform_driver(apple_pmgr_ps_driver);
 #if IS_ENABLED(CONFIG_APPLE_PMGR_PWRSTATE_KUNIT_TEST)
 #include "pmgr-pwrstate-test.c"
 #endif
+
+/* T6050 bring-up: arm the AP watchdog at the end of init so a boot that stays up resets by itself. */
+static int __init t6050_wdt_arm(void)
+{
+	void __iomem *w = ioremap(0x28836c000, 0x20);
+
+	if (!w)
+		return 0;
+	writel_relaxed(150U * 24000000U, w + 0x14);
+	writel_relaxed(0, w + 0x10);
+	writel_relaxed(4, w + 0x1c);
+	iounmap(w);
+	pr_info("pmgr: AP watchdog armed, reset in 150 s\n");
+	return 0;
+}
+late_initcall(t6050_wdt_arm);
