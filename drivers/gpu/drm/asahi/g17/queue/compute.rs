@@ -600,21 +600,52 @@ pub(crate) struct Queue {
 }
 
 impl Queue {
-    /// Returns the withheld doorbell once at most one unretired command of this queue
-    /// precedes the first publication it covers. A doorbell of the same class rung after the
-    /// last withheld work slot was written announced every one of them: nothing is left to
-    /// ring. `announced` gives the slots announced per class.
+    /// Returns the withheld doorbell once at most one command of this queue that precedes the
+    /// first publication it covers has no completion record yet. A doorbell of the same class
+    /// rung after the last withheld work slot was written announced every one of them: nothing
+    /// is left to ring. `announced` gives the slots announced per class.
+    ///
+    /// Retirement waiting for a stamp does not hold the doorbell back, and any departure from
+    /// ordinary retirement (timeout, kill, quarantine, replay, recovery or exit) rings it at
+    /// once: the firmware then sees every published command, as without withholding.
     pub(crate) fn due_doorbell(&mut self, announced: impl Fn(u8) -> u64) -> Option<u64> {
         let (doorbell, first, written) = self.withheld_doorbell?;
         if announced(((doorbell >> 2) & 3) as u8) >= written {
             self.withheld_doorbell = None;
             return None;
         }
-        if self.active.iter().filter(|active| active.published < first).count() > 1 {
+        let settling = self.settling();
+        let incomplete = self
+            .active
+            .iter()
+            .filter(|active| active.published < first && active.observed.is_none())
+            .count();
+        if !settling && incomplete > 1 {
             return None;
         }
         self.withheld_doorbell = None;
         Some(doorbell)
+    }
+
+    /// The queue has left ordinary retirement: a timeout, kill, quarantine, replay, recovery
+    /// witness or exit is in progress.
+    fn settling(&self) -> bool {
+        self.quarantined
+            || self.released
+            || self.exit.is_some()
+            || self.replays.len != 0
+            || self.replay_retirement
+            || self.awaiting_witness
+            || self.retire_pending
+            || self.retired_by_teardown
+            || self.spared_quarantine
+            || self.failure_status_pending
+            || self.terminal.is_some()
+    }
+
+    /// Takes the withheld doorbell regardless of its predecessors.
+    pub(crate) fn take_withheld_doorbell(&mut self) -> Option<u64> {
+        self.withheld_doorbell.take().map(|(doorbell, _, _)| doorbell)
     }
     /// The caller reserves a QID first, cancels it on construction failure, and retains every
     /// successfully installed queue until processor stop. Shared VM apertures precede this call.
@@ -2269,6 +2300,7 @@ impl Queue {
             fence(Ordering::SeqCst);
             let doorbell = (0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2;
             if self.active.len >= WITHHOLD_DEPTH
+                && !self.settling()
                 && self.withheld_doorbell.is_none_or(|(withheld, _, _)| withheld == doorbell)
             {
                 let written = host.compute_written(policy.priority());
