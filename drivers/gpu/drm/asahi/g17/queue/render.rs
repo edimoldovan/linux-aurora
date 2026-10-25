@@ -1333,10 +1333,9 @@ impl Pair {
             let blamed = active.packet.completion.blamed();
             let exhausted =
                 active.packet.completion.replay_count() >= crate::g17::completion::MAX_REPLAYS;
-            // decide() stops at the first group that is not abandoned, an error included.
-            let abandoned = innocent
-                && !blamed
-                && (|| -> Result<bool> {
+            // decide() stops at the first group that is still live, an error included.
+            let (abandoned, ran, lost) = if innocent && !blamed {
+                (|| -> Result<(bool, bool, bool)> {
                     let mut observer = Observer {
                         memory,
                         qids,
@@ -1347,21 +1346,33 @@ impl Pair {
                     let stamps = observer.stamps()?;
                     let (_, state) = observer.host.epoch()?;
                     // A torn sample is no proof; a later poll or the timeout looks again.
-                    // Interrupted work is run again only if it never started.
-                    Ok(matches!(
-                        retirement::abandoned(&active.ticket, snapshot, stamps, state, false),
-                        Ok(true)
-                    ) && (!active.packet.completion.interrupted() || snapshot.untouched()))
+                    let witness = |executed| {
+                        matches!(
+                            retirement::abandoned(&active.ticket, snapshot, stamps, state, executed),
+                            Ok(true)
+                        )
+                    };
+                    let unexecuted = witness(false);
+                    // Interrupted work is run again only if it never started, and work that
+                    // another queue waited on never: the wait ended when firmware retired it.
+                    let lost = (active.packet.completion.interrupted() && !snapshot.untouched())
+                        || active.packet.completion.has_firmware_consumer();
+                    Ok((unexecuted && !lost, !unexecuted && witness(true), unexecuted && lost))
                 })()
                 .unwrap_or_else(|error: Error| {
                     failure = Some(error);
-                    false
-                });
+                    (false, false, false)
+                })
+            } else {
+                (false, false, false)
+            };
             Group {
                 innocent,
                 blamed,
                 abandoned,
                 exhausted,
+                ran,
+                lost,
             }
         });
         let decision = replay::decide(groups);
@@ -1376,7 +1387,7 @@ impl Pair {
                 front.abandoned_since = None;
                 return Ok(false);
             }
-            Decision::Replay => {}
+            Decision::Replay | Decision::Fail => {}
         }
         if grace {
             let Some(since) = front.abandoned_since else {
@@ -1386,6 +1397,9 @@ impl Pair {
             if now.saturating_sub(since) < ABANDON_GRACE_NS {
                 return Ok(false);
             }
+        }
+        if decision == Decision::Fail {
+            return self.fail_dropped(host, defer);
         }
         // decide() lets only the front be exhausted. An exhausted front fails, and its
         // successors, which consume its output, fail with it rather than run without it.
@@ -1441,6 +1455,45 @@ impl Pair {
             packet.reset_publication_for_replay();
             self.published_completions = None;
             self.replay.push(packet).map_err(|_| EIO)?;
+        }
+        Ok(true)
+    }
+
+    /// Firmware retired every group of the pair after a restart, but some were dropped
+    /// unexecuted and cannot run again in order (see `replay::decide`). Every group fails now,
+    /// the ones that ran too: they consumed output the dropped ones never wrote. The work is
+    /// innocent, so it fails without poisoning its VM, with ENODATA, which its owner sees,
+    /// instead of waiting for the render timeout to fail it with ETIMEDOUT.
+    fn fail_dropped(
+        &mut self,
+        host: &mut impl Host,
+        defer: &mut impl FnMut(Deferred) -> Result,
+    ) -> Result<bool> {
+        pr_warn!(
+            "G17: render slot {}: a GPU recovery dropped groups that cannot run again in order; failing {} groups\n",
+            self.slot,
+            self.active.len()
+        );
+        let qos = self.qos_owners();
+        let buffer = self.buffer_id();
+        let pool = self.free_list.id();
+        while let Some(front) = self.active.front_mut() {
+            if !front.flist_completed {
+                host.complete_render(
+                    (!front.qos_completed).then_some(qos),
+                    pool,
+                    front.generation,
+                    buffer,
+                )?;
+                front.flist_completed = true;
+                front.qos_completed = true;
+            }
+            let ordinal = front.ticket.ordinal;
+            let completion = front.packet.completion.clone();
+            completion.classify(recovery::Class::Spared);
+            defer(Deferred::Retired(completion, Err(ENODATA)))?;
+            self.memory.retire(ordinal)?;
+            self.active.pop().ok_or(EIO)?;
         }
         Ok(true)
     }
@@ -1943,7 +1996,7 @@ impl Pair {
     pub(crate) fn own_dependencies(&self, owner: u64, packet: &Arc<Packet>) -> Result<RenderDependencies> {
         let mut dependencies = RenderDependencies::EMPTY;
         let mut frontier = crate::g17::dependency::Frontier::new();
-        self.collect_dependencies(owner, packet.completion.status(), packet.order.wait_through[0], &mut frontier)?;
+        self.collect_dependencies(owner, packet.completion.status(), packet.order.wait_through[0], &mut frontier, false)?;
         for dependency in frontier.as_slice() {
             *dependencies.render.get_mut(dependencies.render_count).ok_or(EOVERFLOW)? = *dependency;
             dependencies.render_count += 1;
