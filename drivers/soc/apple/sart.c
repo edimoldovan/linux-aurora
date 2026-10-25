@@ -341,13 +341,6 @@ int apple_sart_add_allowed_region(struct apple_sart *sart, phys_addr_t paddr,
 
 		ret = sart_set_entry(sart, i, sart->ops->flags_allow, paddr,
 				     size);
-		{
-			u8 f; phys_addr_t pa; size_t sz;
-
-			sart->ops->get_entry(sart, i, &f, &pa, &sz);
-			dev_info(sart->dev, "sart: entry %d <- paddr %pa size %#zx (ret %d), readback flags %#x paddr %pa size %#zx\n",
-				 i, &paddr, size, ret, f, &pa, sz);
-		}
 		if (ret) {
 			dev_dbg(sart->dev,
 				"unable to set entry %d to [%pa, 0x%zx]\n",

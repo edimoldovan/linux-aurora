@@ -28,7 +28,6 @@
 #include <linux/mm.h>
 #include <linux/overflow.h>
 #include <linux/module.h>
-#include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/pm_runtime.h>
 #include <linux/of.h>
@@ -1554,34 +1553,6 @@ static void apple_nvme_wait_freeze(struct apple_nvme *anv)
  * the firmware set (IOSQES 7, 128-byte entries), as the loader does. The core's
  * nvme_enable_ctrl composes CC with the standard IOSQES 6.
  */
-static bool t6050_skip_enable;
-module_param_named(skip_enable, t6050_skip_enable, bool, 0444);
-
-static unsigned long t6050_fixed_qmem; /* physical base of a test window for the queue memory */
-module_param_named(fixed_qmem, t6050_fixed_qmem, ulong, 0444);
-static void *t6050_qmem_virt;
-static size_t t6050_qmem_used;
-
-static void *t6050_qalloc(struct apple_nvme *anv, size_t size, dma_addr_t *dma)
-{
-	void *v;
-
-	if (!t6050_qmem_virt) {
-		t6050_qmem_virt = memremap(t6050_fixed_qmem, SZ_4M, MEMREMAP_WB);
-		if (!t6050_qmem_virt)
-			return NULL;
-	}
-	size = ALIGN(size, SZ_16K);
-	if (t6050_qmem_used + size > SZ_4M)
-		return NULL;
-	v = t6050_qmem_virt + t6050_qmem_used;
-	*dma = t6050_fixed_qmem + t6050_qmem_used;
-	t6050_qmem_used += size;
-	memset(v, 0, size);
-	dev_info(anv->dev, "fixed_qmem: %zu bytes at %pad\n", size, dma);
-	return v;
-}
-
 static int apple_nvme_enable_ctrl_keep_cc(struct apple_nvme *anv)
 {
 	u32 cc, csts, timeout_ms;
@@ -1590,18 +1561,6 @@ static int apple_nvme_enable_ctrl_keep_cc(struct apple_nvme *anv)
 	cc = readl(anv->mmio_nvme + NVME_REG_CC);
 	cc &= ~(NVME_CC_SHN_MASK | NVME_CC_ENABLE);
 	cc |= NVME_CC_ENABLE;
-	dev_info(anv->dev, "pre-enable CC=%x AQA=%x ASQ=%x:%x ACQ=%x:%x IOSQ=%x:%x IOCQ=%x:%x MAXPEND=%x LSQ=%x NVMMU_NUM=%x ASQ_TCB=%x:%x IOSQ_TCB=%x:%x\n",
-		 cc, readl(anv->mmio_nvme + NVME_REG_AQA), readl(anv->mmio_nvme + NVME_REG_ASQ + 4), readl(anv->mmio_nvme + NVME_REG_ASQ),
-		 readl(anv->mmio_nvme + NVME_REG_ACQ + 4), readl(anv->mmio_nvme + NVME_REG_ACQ), readl(anv->mmio_nvme + APPLE_ANS_IOSQ_REGISTER + 4), readl(anv->mmio_nvme + APPLE_ANS_IOSQ_REGISTER),
-		 readl(anv->mmio_nvme + APPLE_ANS_IOCQ_REGISTER + 4), readl(anv->mmio_nvme + APPLE_ANS_IOCQ_REGISTER), readl(anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL),
-		 readl(anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL), readl(anv->mmio_nvmmu + APPLE_NVMMU_NUM_TCBS), readl(anv->mmio_nvmmu + APPLE_NVMMU_ASQ_TCB_BASE + 4),
-		 readl(anv->mmio_nvmmu + APPLE_NVMMU_ASQ_TCB_BASE), readl(anv->mmio_nvmmu + APPLE_NVMMU_IOSQ_TCB_BASE + 4), readl(anv->mmio_nvmmu + APPLE_NVMMU_IOSQ_TCB_BASE));
-	if (t6050_skip_enable) {
-		dev_info(anv->dev, "skip_enable: not writing CC, waiting 5 s\n");
-		msleep(5000);
-		dev_info(anv->dev, "skip_enable: CSTS=%#x after 5 s\n", readl(anv->mmio_nvme + NVME_REG_CSTS));
-		return -ENODEV;
-	}
 	anv->ctrl.ctrl_config = cc;
 	writel(cc, anv->mmio_nvme + NVME_REG_CC);
 	timeout_ms = min_t(u32, max_t(u32, (NVME_CAP_TIMEOUT(anv->ctrl.cap) + 1) * 500, 1000), 10000);
@@ -2147,7 +2106,7 @@ static void apple_nvme_free_queue(void *data)
 	size_t sq_size = anv->hw->has_lsq_nvmmu ?
 		depth * sizeof(struct nvme_command) : depth << APPLE_NVME_IOSQES;
 
-	if (READ_ONCE(anv->quarantined) || t6050_fixed_qmem)
+	if (READ_ONCE(anv->quarantined))
 		return;
 	if (q->tcbs)
 		dma_free_coherent(anv->dev,
@@ -2170,8 +2129,7 @@ static int apple_nvme_queue_alloc(struct apple_nvme *anv,
 	ret = devm_add_action_or_reset(anv->dev, apple_nvme_free_queue, q);
 	if (ret)
 		return ret;
-	q->cqes = t6050_fixed_qmem ? t6050_qalloc(anv, depth * sizeof(struct nvme_completion), &q->cq_dma_addr) :
-		  dma_alloc_coherent(anv->dev,
+	q->cqes = dma_alloc_coherent(anv->dev,
 				     depth * sizeof(struct nvme_completion),
 				     &q->cq_dma_addr, GFP_KERNEL);
 	if (!q->cqes)
@@ -2182,8 +2140,7 @@ static int apple_nvme_queue_alloc(struct apple_nvme *anv,
 	else
 		iosq_size = depth << APPLE_NVME_IOSQES;
 
-	q->sqes = t6050_fixed_qmem ? t6050_qalloc(anv, iosq_size, &q->sq_dma_addr) :
-		  dma_alloc_coherent(anv->dev, iosq_size,
+	q->sqes = dma_alloc_coherent(anv->dev, iosq_size,
 				     &q->sq_dma_addr, GFP_KERNEL);
 	if (!q->sqes)
 		return -ENOMEM;
@@ -2193,8 +2150,7 @@ static int apple_nvme_queue_alloc(struct apple_nvme *anv,
 		 * We need the maximum queue depth here because the NVMMU only
 		 * has a single depth configuration shared between both queues.
 		 */
-		q->tcbs = t6050_fixed_qmem ? t6050_qalloc(anv, anv->hw->max_queue_depth * sizeof(struct apple_nvmmu_tcb), &q->tcb_dma_addr) :
-			  dma_alloc_coherent(anv->dev,
+		q->tcbs = dma_alloc_coherent(anv->dev,
 					     anv->hw->max_queue_depth *
 					     sizeof(struct apple_nvmmu_tcb),
 					     &q->tcb_dma_addr, GFP_KERNEL);

@@ -337,8 +337,6 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	pr_info("pmgr: probe %s @ %#x\n", name, ps->offset); /* T6050 SError hunt */
-
 	ps->genpd.flags |= GENPD_FLAG_IRQ_SAFE;
 	ps->genpd.name = name;
 	ps->genpd.power_on = apple_pmgr_ps_power_on;
@@ -492,11 +490,11 @@ module_platform_driver(apple_pmgr_ps_driver);
 #endif
 
 /*
- * T6050 bring-up: arm the AP watchdog at the end of init so a boot that stays
- * up resets by itself. t6050_wdt=<seconds> on the command line sets the
- * timeout; 0 leaves the watchdog alone.
+ * T6050 development loop: t6050_wdt=<seconds> on the command line arms the AP
+ * watchdog at the end of init so a boot that stays up resets by itself. The
+ * default, 0, leaves the watchdog alone.
  */
-static unsigned int t6050_wdt_secs = 150;
+static unsigned int t6050_wdt_secs;
 
 static int __init t6050_wdt_setup(char *s)
 {
