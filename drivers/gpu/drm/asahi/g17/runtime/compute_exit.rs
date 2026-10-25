@@ -9,6 +9,7 @@ use crate::g17::{
     fw::channels::{ContextKill, ControlRecord},
     queue::compute::exit,
     recovery::Memory as _,
+    timeout::LIVENESS_NS,
     Firmware, MSG_CONTROL_NOTIFY,
 };
 use core::sync::atomic::{fence, Ordering};
@@ -82,7 +83,7 @@ impl Firmware {
         }) else {
             return Ok(());
         };
-        if self.render_control_backpressured() {
+        if self.render_control_backpressured() || self.kill_unsafe(context, now) {
             return Ok(());
         }
         let (owner, target) = {
@@ -147,6 +148,29 @@ impl Firmware {
             );
         }
         Ok(())
+    }
+
+    /// A kill while other contexts' commands run makes the firmware restart the
+    /// GPU, and repeated ones crash it; on an otherwise idle GPU it is safe. A
+    /// closed context's commands left alone retire like any others once the GPU
+    /// reaches them, so its queues stay quarantined and retained until then. Only
+    /// a GPU that retired nothing for [`LIVENESS_NS`] has stopped, and then the
+    /// kill proceeds.
+    fn kill_unsafe(&self, context: &Arc<Context>, now: u64) -> bool {
+        let stalled = crate::g17::recovery::since_retired(now).is_none_or(|since| since >= LIVENESS_NS);
+        if stalled {
+            return false;
+        }
+        self.queues.render.foreign_in_flight(context)
+            || self
+                .queues
+                .compute
+                .iter()
+                .flatten()
+                .filter_map(|entry| entry.queue.as_deref())
+                .any(|queue| {
+                    queue.in_flight() && !queue.context().is_some_and(|bound| Arc::ptr_eq(bound, context))
+                })
     }
 
     pub(in crate::g17) fn compute_exit_polling(&self, now: u64) -> bool {
