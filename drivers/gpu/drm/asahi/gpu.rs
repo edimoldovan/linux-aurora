@@ -11,7 +11,6 @@
 //! are unified, so that the top level of the driver itself (in `driver`) does not have to concern
 //! itself with version dependence.
 
-use crate::module_parameters;
 use core::any::Any;
 use core::ops::Range;
 use core::slice;
