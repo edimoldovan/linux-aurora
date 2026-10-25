@@ -374,6 +374,7 @@ impl Pair {
         }
         let ordinal = self.ordinal;
         ordinal.checked_add(1).ok_or(EOVERFLOW)?;
+        self.memory.prefetch_descriptors(ordinal);
         let work = packet.completion.work_state()?;
         let node = work.node_va()?;
         let word = work.word();

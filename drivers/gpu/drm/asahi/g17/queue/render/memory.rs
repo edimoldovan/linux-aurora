@@ -537,6 +537,26 @@ const _: () = {
 };
 
 impl Memory {
+    /// Requests the tiling descriptor slot of `ordinal` for writing. The firmware accessed
+    /// that slot for the command that used it last, so the host no longer holds its lines;
+    /// requesting them before the rest of the preparation overlaps those transfers with it
+    /// instead of stalling the descriptor write one line at a time.
+    pub(super) fn prefetch_descriptors(&self, ordinal: u64) {
+        const LINE: usize = 64;
+        let size = size_of::<abi::TaDescriptor>();
+        let Ok(base) = self.graph.descriptors.pointer(Graph::offset(0, ordinal), size) else {
+            return;
+        };
+        for offset in (0..size).step_by(LINE) {
+            // SAFETY: A prefetch hint inside the retained mapping; it has no
+            // architectural effect on memory.
+            unsafe {
+                core::arch::asm!("prfm pstl1keep, [{0}]", in(reg) base.add(offset),
+                    options(nostack, preserves_flags, readonly));
+            }
+        }
+    }
+
     pub(super) fn write_descriptors(
         &mut self,
         args: &abi::RenderArgs<'_>,
