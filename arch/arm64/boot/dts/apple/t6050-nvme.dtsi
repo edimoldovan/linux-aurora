@@ -43,9 +43,13 @@
 		interrupts = <AIC_IRQ 2338 IRQ_TYPE_LEVEL_HIGH>;
 		mboxes = <&ans_mbox>;
 		apple,sart = <&sart>;
+		/*
+		 * The port-0 lane PHY must stay on for the controller: with it
+		 * powered down as unused, enable never reaches CSTS.RDY.
+		 */
 		power-domains = <&ps_ans>, <&ps_apcie_sys_st0>,
-				<&ps_apcie_phy_sw>;
-		power-domain-names = "ans", "apcie0", "apcie_phy";
+				<&ps_apcie_phy_sw>, <&ps_aphy_st0_aus5>;
+		power-domain-names = "ans", "apcie0", "apcie_phy", "aphy_st0";
 		resets = <&ps_ans>;
 	};
 };

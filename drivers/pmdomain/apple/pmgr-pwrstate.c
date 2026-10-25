@@ -491,18 +491,33 @@ module_platform_driver(apple_pmgr_ps_driver);
 #include "pmgr-pwrstate-test.c"
 #endif
 
-/* T6050 bring-up: arm the AP watchdog at the end of init so a boot that stays up resets by itself. */
+/*
+ * T6050 bring-up: arm the AP watchdog at the end of init so a boot that stays
+ * up resets by itself. t6050_wdt=<seconds> on the command line sets the
+ * timeout; 0 leaves the watchdog alone.
+ */
+static unsigned int t6050_wdt_secs = 150;
+
+static int __init t6050_wdt_setup(char *s)
+{
+	return kstrtouint(s, 0, &t6050_wdt_secs) == 0;
+}
+__setup("t6050_wdt=", t6050_wdt_setup);
+
 static int __init t6050_wdt_arm(void)
 {
-	void __iomem *w = ioremap(0x28836c000, 0x20);
+	void __iomem *w;
 
+	if (!t6050_wdt_secs)
+		return 0;
+	w = ioremap(0x28836c000, 0x20);
 	if (!w)
 		return 0;
-	writel_relaxed(150U * 24000000U, w + 0x14);
+	writel_relaxed(t6050_wdt_secs * 24000000U, w + 0x14);
 	writel_relaxed(0, w + 0x10);
 	writel_relaxed(4, w + 0x1c);
 	iounmap(w);
-	pr_info("pmgr: AP watchdog armed, reset in 150 s\n");
+	pr_info("pmgr: AP watchdog armed, reset in %u s\n", t6050_wdt_secs);
 	return 0;
 }
 late_initcall(t6050_wdt_arm);
