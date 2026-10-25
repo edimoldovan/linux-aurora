@@ -369,6 +369,10 @@ use crate::g17::{
 };
 use retirement::{Batch, Observation, Recordless, Ticket, IN_FLIGHT};
 
+/// Position in its queue's active ring from which a publication withholds its doorbell:
+/// with two unretired commands ahead, it cannot be the next to start.
+const WITHHOLD_DEPTH: usize = 3;
+
 struct Fifo<T> {
     entries: [Option<T>; IN_FLIGHT],
     head: usize,
@@ -589,9 +593,22 @@ pub(crate) struct Queue {
     retirement_proved: bool,
     source_readers: Arc<core::sync::atomic::AtomicU32>,
     source_hint: crate::g17::sync_input::ReaderHint,
+    /// The doorbell withheld from publications that had [`WITHHOLD_DEPTH`] - 1 or more
+    /// unretired commands of this queue ahead of them, and the publication of the first.
+    withheld_doorbell: Option<(u64, u64)>,
 }
 
 impl Queue {
+    /// Returns the withheld doorbell once at most one unretired command of this queue
+    /// precedes the first publication it covers.
+    pub(crate) fn due_doorbell(&mut self) -> Option<u64> {
+        let (doorbell, first) = self.withheld_doorbell?;
+        if self.active.iter().filter(|active| active.published < first).count() > 1 {
+            return None;
+        }
+        self.withheld_doorbell = None;
+        Some(doorbell)
+    }
     /// The caller reserves a QID first, cancels it on construction failure, and retains every
     /// successfully installed queue until processor stop. Shared VM apertures precede this call.
     pub(crate) fn new(
@@ -656,6 +673,7 @@ impl Queue {
             retirement_proved: false,
             source_readers: Arc::new(core::sync::atomic::AtomicU32::new(0), GFP_KERNEL)?,
             source_hint: crate::g17::sync_input::ReaderHint::new(),
+            withheld_doorbell: None,
         })
     }
     pub(crate) fn qid(&self) -> u8 {
@@ -1599,6 +1617,7 @@ impl Queue {
         ring: DescriptorRing,
     ) -> Result<(u16, u64)> {
         if !self.can_rearm() { return Err(EAGAIN); }
+        self.withheld_doorbell = None;
         self.graph.rearm_ring(ring)?;
         self.pool.rearm(pages)?;
         self.pool_phase = PoolPhase::Populated;
@@ -2226,12 +2245,30 @@ impl Queue {
                     previous.publication = Some((packet.order.sequence, epoch));
                 }
             }
-            // Every publication rings its own pipe and priority class, as render
+            // A publication rings its own pipe and priority class, as render
             // publication does: pipe 2 (compute) in bits 1:0, priority class in
             // bits 3:2. The generic work doorbell left the firmware to find the
             // ring itself and delayed dispatch.
+            //
+            // A doorbell makes the firmware read the whole work ring of its class,
+            // and each one it handles while finishing a command delays that
+            // command's completion and the release of its waiters. A command with
+            // two or more unretired commands of its queue ahead cannot start soon:
+            // its doorbell is withheld until at most one precedes it (see
+            // `due_doorbell`), and any doorbell rung meanwhile on the same ring
+            // announces its work slot earlier.
             fence(Ordering::SeqCst);
-            host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
+            let doorbell = (0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2;
+            if self.active.len >= WITHHOLD_DEPTH
+                && self.withheld_doorbell.is_none_or(|(withheld, _)| withheld == doorbell)
+            {
+                self.withheld_doorbell.get_or_insert((doorbell, published));
+            } else {
+                host.notify(doorbell)?;
+                if self.withheld_doorbell.is_some_and(|(withheld, _)| withheld == doorbell) {
+                    self.withheld_doorbell = None;
+                }
+            }
             crate::g17::trace::publish(crate::g17::trace::COMPUTE, qid, ordinal, &packet);
             host.note_submission()
         })();

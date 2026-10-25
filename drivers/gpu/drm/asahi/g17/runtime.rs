@@ -1661,6 +1661,7 @@ impl super::Firmware {
         let port = &self.port;
         let retired = deferred.pending();
         let mut freed = false;
+        let mut doorbells = [0u64; 4];
         for mut queue in registry
             .compute
             .iter_mut()
@@ -1677,6 +1678,15 @@ impl super::Firmware {
                 &mut |event| deferred.push(event),
             )?;
             freed |= busy && queue.channel_free();
+            // Withheld doorbells are rung once their command is next but one; one per
+            // priority class announces every queue's work slots on that ring.
+            if let Some(doorbell) = queue.due_doorbell() {
+                let class = ((doorbell >> 2) & 3) as usize;
+                doorbells[class] = doorbell;
+            }
+        }
+        for doorbell in doorbells.into_iter().filter(|doorbell| *doorbell != 0) {
+            self.primary.notify(doorbell)?;
         }
         // All compute observations in this batch are latched before a VM
         // failure can settle its render peers. Exact successes win first.
