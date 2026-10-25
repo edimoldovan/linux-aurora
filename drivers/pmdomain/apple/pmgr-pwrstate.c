@@ -521,3 +521,57 @@ static int __init t6050_wdt_arm(void)
 	return 0;
 }
 late_initcall(t6050_wdt_arm);
+
+/*
+ * t6050_wdtmon=<seconds> prints the AP watchdog registers (WD0/WD1/WD2 at
+ * 0x28836c000) and the secondary watchdog word at 0x288330008 on the console
+ * at that interval, to see which one is counting on a boot that resets.
+ */
+#include <linux/workqueue.h>
+#include <linux/ktime.h>
+
+static unsigned int t6050_wdtmon, t6050_wdtmon_ping;
+
+static int __init t6050_wdtmon_setup(char *s)
+{
+	return kstrtouint(s, 0, &t6050_wdtmon) == 0;
+}
+__setup("t6050_wdtmon=", t6050_wdtmon_setup);
+
+static int __init t6050_wdtmon_ping_setup(char *s)
+{
+	return kstrtouint(s, 0, &t6050_wdtmon_ping) == 0;
+}
+__setup("t6050_wdtmon_ping=", t6050_wdtmon_ping_setup);
+
+static void __iomem *t6050_wdtmon_w, *t6050_wdtmon_s;
+static struct delayed_work t6050_wdtmon_work;
+
+static void t6050_wdtmon_fn(struct work_struct *work)
+{
+	void __iomem *w = t6050_wdtmon_w;
+
+	pr_emerg("wdtmon %4lld s: wd0 %08x/%08x/%08x c%x  wd1 %08x/%08x c%x  wd2 %08x/%08x c%x  sec %08x\n",
+		 (long long)ktime_get_boottime_seconds(),
+		 readl_relaxed(w), readl_relaxed(w + 4), readl_relaxed(w + 8), readl_relaxed(w + 0xc),
+		 readl_relaxed(w + 0x10), readl_relaxed(w + 0x14), readl_relaxed(w + 0x1c),
+		 readl_relaxed(w + 0x20), readl_relaxed(w + 0x24), readl_relaxed(w + 0x2c),
+		 readl_relaxed(t6050_wdtmon_s));
+	if (t6050_wdtmon_ping)
+		writel_relaxed(0, w + 0x10);
+	schedule_delayed_work(&t6050_wdtmon_work, t6050_wdtmon * HZ);
+}
+
+static int __init t6050_wdtmon_start(void)
+{
+	if (!t6050_wdtmon)
+		return 0;
+	t6050_wdtmon_w = ioremap(0x28836c000, 0x40);
+	t6050_wdtmon_s = ioremap(0x288330008, 0x4);
+	if (!t6050_wdtmon_w || !t6050_wdtmon_s)
+		return 0;
+	INIT_DELAYED_WORK(&t6050_wdtmon_work, t6050_wdtmon_fn);
+	schedule_delayed_work(&t6050_wdtmon_work, 0);
+	return 0;
+}
+late_initcall(t6050_wdtmon_start);
