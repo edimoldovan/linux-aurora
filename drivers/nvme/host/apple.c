@@ -28,6 +28,7 @@
 #include <linux/mm.h>
 #include <linux/overflow.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/pm_runtime.h>
 #include <linux/of.h>
@@ -198,6 +199,10 @@ struct apple_nvme_hw {
 	bool has_queue_count;
 	bool has_separate_nvmmu;
 	bool needs_ioq_registers;
+	/* The coprocessor waits for AP readiness before acknowledging IOP power. */
+	bool early_ap_power;
+	/* Enable with the firmware's CC fields (128-byte SQ entries) instead of the core's. */
+	bool keep_cc_fields;
 	u32 max_queue_depth;
 	unsigned long quirks;
 };
@@ -343,6 +348,13 @@ static bool apple_nvme_can_adopt_rtkit(struct apple_nvme *anv)
 	 * and ready identifies a live session. Borrowed buffers still require
 	 * reserved RAM and protected SART ranges.
 	 */
+	/*
+	 * T6050: the loader hands over the controller disabled with the RTKit
+	 * session live (it cannot be restarted after a stop). Adopt on RUN and
+	 * BOOT_STATUS alone there; the enable below starts the controller.
+	 */
+	if (anv->hw->keep_cc_fields && (cc & NVME_CC_ENABLE))
+		return !(csts & NVME_CSTS_CFS);
 	return (cc & NVME_CC_ENABLE) && (csts & NVME_CSTS_RDY) &&
 	       !(csts & NVME_CSTS_CFS);
 }
@@ -360,7 +372,8 @@ static unsigned int apple_nvme_queue_depth(struct apple_nvme_queue *q)
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
 
 	if (q->is_adminq)
-		return APPLE_NVME_AQ_DEPTH;
+		return anv->hw->keep_cc_fields ? anv->hw->max_queue_depth :
+						  APPLE_NVME_AQ_DEPTH;
 
 	return anv->hw->max_queue_depth;
 }
@@ -1535,6 +1548,72 @@ static void apple_nvme_wait_freeze(struct apple_nvme *anv)
 	}
 }
 
+
+/*
+ * T6050: the controller only reports ready when CC keeps the entry-size fields
+ * the firmware set (IOSQES 7, 128-byte entries), as the loader does. The core's
+ * nvme_enable_ctrl composes CC with the standard IOSQES 6.
+ */
+static bool t6050_skip_enable;
+module_param_named(skip_enable, t6050_skip_enable, bool, 0444);
+
+static unsigned long t6050_fixed_qmem; /* physical base of a test window for the queue memory */
+module_param_named(fixed_qmem, t6050_fixed_qmem, ulong, 0444);
+static void *t6050_qmem_virt;
+static size_t t6050_qmem_used;
+
+static void *t6050_qalloc(struct apple_nvme *anv, size_t size, dma_addr_t *dma)
+{
+	void *v;
+
+	if (!t6050_qmem_virt) {
+		t6050_qmem_virt = memremap(t6050_fixed_qmem, SZ_4M, MEMREMAP_WB);
+		if (!t6050_qmem_virt)
+			return NULL;
+	}
+	size = ALIGN(size, SZ_16K);
+	if (t6050_qmem_used + size > SZ_4M)
+		return NULL;
+	v = t6050_qmem_virt + t6050_qmem_used;
+	*dma = t6050_fixed_qmem + t6050_qmem_used;
+	t6050_qmem_used += size;
+	memset(v, 0, size);
+	dev_info(anv->dev, "fixed_qmem: %zu bytes at %pad\n", size, dma);
+	return v;
+}
+
+static int apple_nvme_enable_ctrl_keep_cc(struct apple_nvme *anv)
+{
+	u32 cc, csts, timeout_ms;
+
+	anv->ctrl.cap = readq(anv->mmio_nvme + NVME_REG_CAP);
+	cc = readl(anv->mmio_nvme + NVME_REG_CC);
+	cc &= ~(NVME_CC_SHN_MASK | NVME_CC_ENABLE);
+	cc |= NVME_CC_ENABLE;
+	dev_info(anv->dev, "pre-enable CC=%x AQA=%x ASQ=%x:%x ACQ=%x:%x IOSQ=%x:%x IOCQ=%x:%x MAXPEND=%x LSQ=%x NVMMU_NUM=%x ASQ_TCB=%x:%x IOSQ_TCB=%x:%x\n",
+		 cc, readl(anv->mmio_nvme + NVME_REG_AQA), readl(anv->mmio_nvme + NVME_REG_ASQ + 4), readl(anv->mmio_nvme + NVME_REG_ASQ),
+		 readl(anv->mmio_nvme + NVME_REG_ACQ + 4), readl(anv->mmio_nvme + NVME_REG_ACQ), readl(anv->mmio_nvme + APPLE_ANS_IOSQ_REGISTER + 4), readl(anv->mmio_nvme + APPLE_ANS_IOSQ_REGISTER),
+		 readl(anv->mmio_nvme + APPLE_ANS_IOCQ_REGISTER + 4), readl(anv->mmio_nvme + APPLE_ANS_IOCQ_REGISTER), readl(anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL),
+		 readl(anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL), readl(anv->mmio_nvmmu + APPLE_NVMMU_NUM_TCBS), readl(anv->mmio_nvmmu + APPLE_NVMMU_ASQ_TCB_BASE + 4),
+		 readl(anv->mmio_nvmmu + APPLE_NVMMU_ASQ_TCB_BASE), readl(anv->mmio_nvmmu + APPLE_NVMMU_IOSQ_TCB_BASE + 4), readl(anv->mmio_nvmmu + APPLE_NVMMU_IOSQ_TCB_BASE));
+	if (t6050_skip_enable) {
+		dev_info(anv->dev, "skip_enable: not writing CC, waiting 5 s\n");
+		msleep(5000);
+		dev_info(anv->dev, "skip_enable: CSTS=%#x after 5 s\n", readl(anv->mmio_nvme + NVME_REG_CSTS));
+		return -ENODEV;
+	}
+	anv->ctrl.ctrl_config = cc;
+	writel(cc, anv->mmio_nvme + NVME_REG_CC);
+	timeout_ms = min_t(u32, max_t(u32, (NVME_CAP_TIMEOUT(anv->ctrl.cap) + 1) * 500, 1000), 10000);
+	if (readl_poll_timeout(anv->mmio_nvme + NVME_REG_CSTS, csts,
+			       csts & NVME_CSTS_RDY, 100, timeout_ms * 1000)) {
+		dev_err(anv->dev, "controller not ready after enable, CC=%#x CSTS=%#x\n",
+			readl(anv->mmio_nvme + NVME_REG_CC), readl(anv->mmio_nvme + NVME_REG_CSTS));
+		return -ENODEV;
+	}
+	return 0;
+}
+
 static void apple_nvme_reset_work(struct work_struct *work)
 {
 	unsigned int nr_io_queues = 1;
@@ -1646,7 +1725,8 @@ static void apple_nvme_reset_work(struct work_struct *work)
 				"post-M4 firmware handoff: restarting stopped ANS without reset\n");
 			writel(APPLE_ANS_COPROC_CPU_CONTROL_RUN,
 			       anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
-			ret = apple_rtkit_boot(anv->rtk);
+			ret = anv->hw->early_ap_power ? apple_rtkit_boot_early_ap(anv->rtk) :
+							 apple_rtkit_boot(anv->rtk);
 			goto booted;
 		}
 
@@ -1665,9 +1745,11 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		writel(APPLE_ANS_COPROC_CPU_CONTROL_RUN,
 		       anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 
-		ret = apple_rtkit_boot(anv->rtk);
+		ret = anv->hw->early_ap_power ? apple_rtkit_boot_early_ap(anv->rtk) :
+						 apple_rtkit_boot(anv->rtk);
 	} else {
-		ret = apple_rtkit_wake(anv->rtk);
+		ret = anv->hw->early_ap_power ? apple_rtkit_wake_early_ap(anv->rtk) :
+						 apple_rtkit_wake(anv->rtk);
 	}
 
 booted:
@@ -1710,8 +1792,13 @@ rtkit_ready:
 		 * Enable NVMMU and linear submission queues which is required
 		 * since T6000.
 		 */
-		writel(APPLE_ANS_LINEAR_SQ_EN,
-			anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL);
+		if (anv->hw->keep_cc_fields)
+			writel(readl(anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL) |
+			       APPLE_ANS_LINEAR_SQ_EN,
+			       anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL);
+		else
+			writel(APPLE_ANS_LINEAR_SQ_EN,
+			       anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL);
 		if (anv->hw->needs_ioq_registers) {
 			u32 lsq_ctrl = readl(anv->mmio_nvme +
 					     APPLE_ANS_LINEAR_SQ_CTRL);
@@ -1750,15 +1837,28 @@ rtkit_ready:
 	}
 
 	/* Setup the admin queue */
-	aqa = APPLE_NVME_AQ_DEPTH - 1;
+	aqa = apple_nvme_queue_depth(&anv->adminq) - 1;
 	aqa |= aqa << 16;
-	writel(aqa, anv->mmio_nvme + NVME_REG_AQA);
-	apple_nvme_writeq(anv, anv->adminq.sq_dma_addr,
-			  anv->mmio_nvme + NVME_REG_ASQ);
-	apple_nvme_writeq(anv, anv->adminq.cq_dma_addr,
-			  anv->mmio_nvme + NVME_REG_ACQ);
+	if (anv->hw->keep_cc_fields) {
+		/* T6050: the loader's order, NVMMU TCB bases, ASQ, ACQ, then AQA. */
+		apple_nvme_writeq(anv, anv->adminq.tcb_dma_addr,
+				  anv->mmio_nvmmu + APPLE_NVMMU_ASQ_TCB_BASE);
+		apple_nvme_writeq(anv, anv->ioq.tcb_dma_addr,
+				  anv->mmio_nvmmu + APPLE_NVMMU_IOSQ_TCB_BASE);
+		apple_nvme_writeq(anv, anv->adminq.sq_dma_addr,
+				  anv->mmio_nvme + NVME_REG_ASQ);
+		apple_nvme_writeq(anv, anv->adminq.cq_dma_addr,
+				  anv->mmio_nvme + NVME_REG_ACQ);
+		writel(aqa, anv->mmio_nvme + NVME_REG_AQA);
+	} else {
+		writel(aqa, anv->mmio_nvme + NVME_REG_AQA);
+		apple_nvme_writeq(anv, anv->adminq.sq_dma_addr,
+				  anv->mmio_nvme + NVME_REG_ASQ);
+		apple_nvme_writeq(anv, anv->adminq.cq_dma_addr,
+				  anv->mmio_nvme + NVME_REG_ACQ);
+	}
 
-	if (anv->hw->has_lsq_nvmmu) {
+	if (anv->hw->has_lsq_nvmmu && !anv->hw->keep_cc_fields) {
 		/* Setup NVMMU for both queues */
 		apple_nvme_writeq(anv, anv->adminq.tcb_dma_addr,
 				  anv->mmio_nvmmu + APPLE_NVMMU_ASQ_TCB_BASE);
@@ -1771,7 +1871,8 @@ rtkit_ready:
 	anv->ctrl.cap = readq(anv->mmio_nvme + NVME_REG_CAP);
 
 	dev_dbg(anv->dev, "Enabling controller now");
-	ret = nvme_enable_ctrl(&anv->ctrl);
+	ret = anv->hw->keep_cc_fields ? apple_nvme_enable_ctrl_keep_cc(anv) :
+					 nvme_enable_ctrl(&anv->ctrl);
 	if (ret)
 		goto out;
 
@@ -2046,7 +2147,7 @@ static void apple_nvme_free_queue(void *data)
 	size_t sq_size = anv->hw->has_lsq_nvmmu ?
 		depth * sizeof(struct nvme_command) : depth << APPLE_NVME_IOSQES;
 
-	if (READ_ONCE(anv->quarantined))
+	if (READ_ONCE(anv->quarantined) || t6050_fixed_qmem)
 		return;
 	if (q->tcbs)
 		dma_free_coherent(anv->dev,
@@ -2069,7 +2170,8 @@ static int apple_nvme_queue_alloc(struct apple_nvme *anv,
 	ret = devm_add_action_or_reset(anv->dev, apple_nvme_free_queue, q);
 	if (ret)
 		return ret;
-	q->cqes = dma_alloc_coherent(anv->dev,
+	q->cqes = t6050_fixed_qmem ? t6050_qalloc(anv, depth * sizeof(struct nvme_completion), &q->cq_dma_addr) :
+		  dma_alloc_coherent(anv->dev,
 				     depth * sizeof(struct nvme_completion),
 				     &q->cq_dma_addr, GFP_KERNEL);
 	if (!q->cqes)
@@ -2080,7 +2182,8 @@ static int apple_nvme_queue_alloc(struct apple_nvme *anv,
 	else
 		iosq_size = depth << APPLE_NVME_IOSQES;
 
-	q->sqes = dma_alloc_coherent(anv->dev, iosq_size,
+	q->sqes = t6050_fixed_qmem ? t6050_qalloc(anv, iosq_size, &q->sq_dma_addr) :
+		  dma_alloc_coherent(anv->dev, iosq_size,
 				     &q->sq_dma_addr, GFP_KERNEL);
 	if (!q->sqes)
 		return -ENOMEM;
@@ -2090,7 +2193,8 @@ static int apple_nvme_queue_alloc(struct apple_nvme *anv,
 		 * We need the maximum queue depth here because the NVMMU only
 		 * has a single depth configuration shared between both queues.
 		 */
-		q->tcbs = dma_alloc_coherent(anv->dev,
+		q->tcbs = t6050_fixed_qmem ? t6050_qalloc(anv, anv->hw->max_queue_depth * sizeof(struct apple_nvmmu_tcb), &q->tcb_dma_addr) :
+			  dma_alloc_coherent(anv->dev,
 					     anv->hw->max_queue_depth *
 					     sizeof(struct apple_nvmmu_tcb),
 					     &q->tcb_dma_addr, GFP_KERNEL);
@@ -2642,11 +2746,28 @@ static const struct apple_nvme_hw apple_nvme_t8140_hw = {
 	.quirks = NVME_QUIRK_BROKEN_FUA,
 };
 
+/* T6050: T8140 queue setup; its ANS acknowledges IOP power only after AP readiness. */
+static const struct apple_nvme_hw apple_nvme_t6050_hw = {
+	.has_lsq_nvmmu = true,
+	.has_separate_nvmmu = true,
+	.needs_ioq_registers = true,
+	.max_queue_depth = 64,
+	/*
+	 * An fsynced overwrite completed and later reverted after an abrupt
+	 * reset; explicit flushes persisted the preceding data. Let the block
+	 * layer follow each FUA write with a flush.
+	 */
+	.quirks = NVME_QUIRK_BROKEN_FUA,
+	.early_ap_power = false,
+	.keep_cc_fields = true,
+};
+
 static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t8015-nvme-ans2", .data = &apple_nvme_t8015_hw },
 	{ .compatible = "apple,t8103-nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{ .compatible = "apple,t8132-nvme-ans2", .data = &apple_nvme_t8132_hw },
 	{ .compatible = "apple,t8140-nvme-ans2", .data = &apple_nvme_t8140_hw },
+	{ .compatible = "apple,t6050-nvme-ans2", .data = &apple_nvme_t6050_hw },
 	{ .compatible = "apple,nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{},
 };

@@ -162,6 +162,12 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk);
 int apple_rtkit_boot(struct apple_rtkit *rtk);
 
 /*
+ * apple_rtkit_boot with AP readiness signalled before the IOP power ack is
+ * awaited, for coprocessors that wait for it (T6050 ANS).
+ */
+int apple_rtkit_boot_early_ap(struct apple_rtkit *rtk);
+
+/*
  * Mark an instance created with apple_rtkit_init() as running without a
  * handshake, see apple_rtkit_init_adopted().
  */

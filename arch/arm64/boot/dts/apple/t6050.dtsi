@@ -31,3 +31,4 @@
 /* T6050 is a single die: no multi-die templating. */
 #include "t6050-die0.dtsi"
 #include "t6050-pmgr.dtsi"
+#include "t6050-nvme.dtsi"

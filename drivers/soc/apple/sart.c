@@ -62,6 +62,18 @@
 
 #define APPLE_SART3_FLAGS_ALLOW 0xff
 
+/* SARTv4: the T6050 layout, config at 0x00, paddr at 0x60, size at 0xc0 */
+#define APPLE_SART4_CONFIG(idx) (0x00 + 4 * (idx))
+
+#define APPLE_SART4_PADDR(idx)	(0x60 + 4 * (idx))
+#define APPLE_SART4_PADDR_SHIFT 12
+
+#define APPLE_SART4_SIZE(idx)  (0xc0 + 4 * (idx))
+#define APPLE_SART4_SIZE_SHIFT 12
+#define APPLE_SART4_SIZE_MAX   GENMASK(29, 0)
+
+#define APPLE_SART4_FLAGS_ALLOW 0xff
+
 struct apple_sart_ops {
 	void (*get_entry)(struct apple_sart *sart, int index, u8 *flags,
 			  phys_addr_t *paddr, size_t *size);
@@ -176,6 +188,34 @@ static struct apple_sart_ops sart_ops_v3 = {
 	.size_shift = APPLE_SART3_SIZE_SHIFT,
 	.paddr_shift = APPLE_SART3_PADDR_SHIFT,
 	.size_max = APPLE_SART3_SIZE_MAX,
+};
+
+static void sart4_get_entry(struct apple_sart *sart, int index, u8 *flags,
+			    phys_addr_t *paddr, size_t *size)
+{
+	phys_addr_t paddr_ = readl(sart->regs + APPLE_SART4_PADDR(index));
+	size_t size_ = readl(sart->regs + APPLE_SART4_SIZE(index));
+
+	*flags = readl(sart->regs + APPLE_SART4_CONFIG(index));
+	*size = size_ << APPLE_SART4_SIZE_SHIFT;
+	*paddr = paddr_ << APPLE_SART4_PADDR_SHIFT;
+}
+
+static void sart4_set_entry(struct apple_sart *sart, int index, u8 flags,
+			    phys_addr_t paddr_shifted, size_t size_shifted)
+{
+	writel(paddr_shifted, sart->regs + APPLE_SART4_PADDR(index));
+	writel(size_shifted, sart->regs + APPLE_SART4_SIZE(index));
+	writel(flags, sart->regs + APPLE_SART4_CONFIG(index));
+}
+
+static struct apple_sart_ops sart_ops_v4 = {
+	.get_entry = sart4_get_entry,
+	.set_entry = sart4_set_entry,
+	.flags_allow = APPLE_SART4_FLAGS_ALLOW,
+	.size_shift = APPLE_SART4_SIZE_SHIFT,
+	.paddr_shift = APPLE_SART4_PADDR_SHIFT,
+	.size_max = APPLE_SART4_SIZE_MAX,
 };
 
 static int apple_sart_probe(struct platform_device *pdev)
@@ -301,6 +341,13 @@ int apple_sart_add_allowed_region(struct apple_sart *sart, phys_addr_t paddr,
 
 		ret = sart_set_entry(sart, i, sart->ops->flags_allow, paddr,
 				     size);
+		{
+			u8 f; phys_addr_t pa; size_t sz;
+
+			sart->ops->get_entry(sart, i, &f, &pa, &sz);
+			dev_info(sart->dev, "sart: entry %d <- paddr %pa size %#zx (ret %d), readback flags %#x paddr %pa size %#zx\n",
+				 i, &paddr, size, ret, f, &pa, sz);
+		}
 		if (ret) {
 			dev_dbg(sart->dev,
 				"unable to set entry %d to [%pa, 0x%zx]\n",
@@ -372,6 +419,10 @@ static void apple_sart_shutdown(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_sart_of_match[] = {
+	{
+		.compatible = "apple,t6050-sart",
+		.data = &sart_ops_v4,
+	},
 	{
 		.compatible = "apple,t6000-sart",
 		.data = &sart_ops_v3,

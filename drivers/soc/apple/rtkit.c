@@ -230,7 +230,17 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 	if (!(msg & APPLE_RTKIT_MGMT_EPMAP_LAST))
 		return;
 
-	for_each_set_bit(ep, rtk->endpoints, APPLE_RTKIT_APP_ENDPOINT_START) {
+	/* T6050 bring-up: start the system endpoints in the loader's order, 3 1 2 4 8. */
+	static const u8 t6050_order[] = { APPLE_RTKIT_EP_DEBUG, APPLE_RTKIT_EP_CRASHLOG,
+					   APPLE_RTKIT_EP_SYSLOG, APPLE_RTKIT_EP_IOREPORT,
+					   APPLE_RTKIT_EP_OSLOG };
+	bool loader_order = of_machine_is_compatible("apple,t6050");
+	int oi;
+
+	for (oi = 0; oi < (loader_order ? ARRAY_SIZE(t6050_order) : APPLE_RTKIT_APP_ENDPOINT_START); oi++) {
+		ep = loader_order ? t6050_order[oi] : oi;
+		if (!test_bit(ep, rtk->endpoints))
+			continue;
 		switch (ep) {
 		/* the management endpoint is started by default */
 		case APPLE_RTKIT_EP_MGMT:
@@ -243,6 +253,9 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		case APPLE_RTKIT_EP_IOREPORT:
 		case APPLE_RTKIT_EP_OSLOG:
 		case APPLE_RTKIT_EP_TRACEKIT:
+			/* T6050 bring-up: the loader never starts tracekit and boots fine; test without it. */
+			if (ep == APPLE_RTKIT_EP_TRACEKIT)
+				break;
 			/* already started while handling the map */
 			if (ep == APPLE_RTKIT_EP_CRASHLOG &&
 			    apple_rtkit_coproc_places_buffers(rtk))
@@ -724,6 +737,12 @@ static void apple_rtkit_syslog_rx_log(struct apple_rtkit *rtk, u64 msg)
 		 rtk->syslog_msg_buffer);
 
 done:
+	/*
+	 * T6050: the storage coprocessor crashes on the first echoed syslog record;
+	 * the loader never acknowledges them on this chip and runs fine.
+	 */
+	if (of_machine_is_compatible("apple,t6050"))
+		return;
 	apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_SYSLOG, msg, NULL, false);
 }
 
@@ -756,7 +775,8 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 	/* Preserve the tested Neo/M5 and synchronous-log no-ACK policy. */
 	if (type == APPLE_RTKIT_OSLOG_LOG &&
 	    (rtk->sync_syslog_ack || of_machine_is_compatible("apple,t8140") ||
-	     of_machine_is_compatible("apple,t8142"))) {
+	     of_machine_is_compatible("apple,t8142") ||
+	     of_machine_is_compatible("apple,t6050"))) {
 		dev_dbg(rtk->dev, "RTKit: oslog notification: %016llx\n", msg);
 		return;
 	}
@@ -890,6 +910,8 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	struct apple_rtkit_rx_work *work;
 	u8 ep = msg.msg1;
 
+	if (of_machine_is_compatible("apple,t6050"))
+		dev_info(rtk->dev, "RTKit: rx ep=%02x msg=%016llx\n", (unsigned)msg.msg1, msg.msg0);
 	if (READ_ONCE(rtk->shutting_down))
 		return;
 
@@ -950,6 +972,8 @@ int apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 message,
 		.msg1 = ep,
 	};
 
+	if (of_machine_is_compatible("apple,t6050"))
+		dev_info(rtk->dev, "RTKit: tx ep=%02x msg=%016llx\n", (unsigned)ep, message);
 	if (rtk->crashed) {
 		dev_warn(rtk->dev,
 			 "RTKit: Device is crashed, cannot send message\n");
@@ -1313,6 +1337,10 @@ static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
 	if (ret)
 		return ret;
 
+	/* T6050 bring-up: the loader never waits for this acknowledgement. */
+	if (of_machine_is_compatible("apple,t6050"))
+		return 0;
+
 	ret = apple_rtkit_wait(rtk, &rtk->ap_pwr_ack_completion);
 	if (ret)
 		return ret;
@@ -1379,6 +1407,29 @@ static int apple_rtkit_boot_common(struct apple_rtkit *rtk, bool early_ap_power)
 		return ret;
 	}
 
+	/*
+	 * T6050 bring-up: the loader only proceeds once the IOP reports ON, and
+	 * intermediate states can be acknowledged first. Wait for ON here too.
+	 */
+	if (of_machine_is_compatible("apple,t6050")) {
+		int tries = 10;
+
+		while ((rtk->iop_power_state & 0xff) != APPLE_RTKIT_PWR_STATE_ON && tries--) {
+			dev_info(rtk->dev, "RTKit: IOP power state 0x%x, waiting for ON\n",
+				 rtk->iop_power_state);
+			reinit_completion(&rtk->iop_pwr_ack_completion);
+			if ((rtk->iop_power_state & 0xff) == APPLE_RTKIT_PWR_STATE_ON)
+				break;
+			ret = apple_rtkit_wait(rtk, &rtk->iop_pwr_ack_completion);
+			if (ret) {
+				dev_err(rtk->dev, "RTKit: IOP never reached ON (state 0x%x): %d\n",
+					rtk->iop_power_state, ret);
+				return ret;
+			}
+		}
+		dev_info(rtk->dev, "RTKit: IOP power state 0x%x\n", rtk->iop_power_state);
+	}
+
 	return early_ap_power ? 0 :
 		apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
 }
@@ -1388,6 +1439,12 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 	return apple_rtkit_boot_common(rtk, false);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_boot);
+
+int apple_rtkit_boot_early_ap(struct apple_rtkit *rtk)
+{
+	return apple_rtkit_boot_common(rtk, true);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_boot_early_ap);
 
 int apple_rtkit_adopt_running(struct apple_rtkit *rtk)
 {
