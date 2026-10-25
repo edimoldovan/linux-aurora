@@ -38,6 +38,26 @@ pub(crate) struct ComputeCompletion<'a> {
     offset: usize,
 }
 
+/// Records in the compute completion ring that the host scans.
+pub(super) const COMPUTE_COMPLETION_SLOTS: usize = {
+    let slots = abi::COMPLETION_RING_SIZE / 0x40;
+    if slots < 0x800 { slots } else { 0x800 }
+};
+
+/// Timestamp bits of a completion record's start and end words.
+const COMPLETION_TIME_MASK: u64 = 0x003f_ffff_ffff_ffff;
+
+/// What one completion-ring slot gave a scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompletionFold {
+    /// No new observation of a pending request; the scan continues.
+    Passed,
+    /// Every request now has an observation.
+    Done,
+    /// A pending request's record whose payload the firmware is still writing.
+    Incomplete,
+}
+
 impl ComputeCompletion<'_> {
     pub(crate) fn read(&self, word: usize) -> Result<u64> {
         if word >= 8 {
@@ -711,28 +731,66 @@ impl InitData {
 
     /// Snapshot the shared compute completion ring once per service transaction. The queue
     /// scanner latches exact identities; firmware retains sole ownership of these slots.
-    /// Visits ring slots from `start`, wrapping once, until `record` reports
-    /// that nothing more is wanted. Returns the slot after the last one visited
-    /// when the scan stopped early, or `start` after a complete wrap.
-    pub(super) fn scan_compute_completions(
+    /// Folds the compute completion records the firmware appended since `start`, in ring
+    /// order. `seen` holds every slot's control word as of the previous pass over it: the
+    /// first slot still holding it is where the firmware writes next, and the pass ends there
+    /// instead of reading the rest of the ring. A pass also ends once `record` has found every
+    /// request, or at a requested record whose payload is still being written, which the next
+    /// pass reads again. Returns the slot the next pass starts at.
+    pub(super) fn fold_compute_completions(
         &self,
         start: usize,
-        mut record: impl FnMut(ComputeCompletion<'_>) -> Result<bool>,
+        seen: &mut [u64],
+        mut record: impl FnMut(ComputeCompletion<'_>) -> Result<CompletionFold>,
     ) -> Result<usize> {
         let object = self.object(self.completion_rings[0])?;
-        let slots = (abi::COMPLETION_RING_SIZE / 0x40).min(0x800);
-        let start = start % slots;
+        if seen.len() != COMPUTE_COMPLETION_SLOTS {
+            return Err(EINVAL);
+        }
         fence(Ordering::Acquire);
-        for step in 0..slots {
-            let slot = (start + step) % slots;
-            if record(ComputeCompletion {
+        let completion = |slot: usize| ComputeCompletion {
+            object,
+            offset: slot * 0x40,
+        };
+        super::queue::compute::retirement::walk_completions(
+            start,
+            seen,
+            |slot| completion(slot).read(0),
+            |slot| record(completion(slot)),
+        )
+    }
+
+    /// Folds every slot of the compute completion ring and records its control word in
+    /// `seen`. For a pass that stopped before a record the firmware must already have
+    /// written. Returns the slot after the newest record (latest end timestamp), where the
+    /// firmware writes next.
+    pub(super) fn resync_compute_completions(
+        &self,
+        seen: &mut [u64],
+        mut record: impl FnMut(ComputeCompletion<'_>) -> Result,
+    ) -> Result<usize> {
+        let object = self.object(self.completion_rings[0])?;
+        if seen.len() != COMPUTE_COMPLETION_SLOTS {
+            return Err(EINVAL);
+        }
+        fence(Ordering::Acquire);
+        let mut newest = None;
+        for slot in 0..COMPUTE_COMPLETION_SLOTS {
+            let completion = ComputeCompletion {
                 object,
                 offset: slot * 0x40,
-            })? {
-                return Ok((slot + 1) % slots);
+            };
+            let control = completion.read(0)?;
+            seen[slot] = control;
+            if control != 0 {
+                let end = completion.read(5)? & COMPLETION_TIME_MASK;
+                if newest.is_none_or(|(_, latest)| end > latest) {
+                    newest = Some((slot, end));
+                }
             }
+            record(completion)?;
         }
-        Ok(start)
+        Ok(newest.map_or(0, |(slot, _)| (slot + 1) % COMPUTE_COMPLETION_SLOTS))
     }
 
     fn object(&self, index: usize) -> Result<&KernelObject> {

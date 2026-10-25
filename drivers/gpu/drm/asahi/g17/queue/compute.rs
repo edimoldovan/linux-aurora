@@ -786,33 +786,32 @@ impl Queue {
             || self.retire_pending
             || masks.is_none_or(|m| m[self.qid() as usize / 64] & (1 << (self.qid() % 64)) != 0)
     }
-    /// Stage every unlatched exact identity before the device's single shared-ring scan.
-    pub(crate) fn request_observations(
-        &self,
-        batch: &mut Batch,
-        masks: Option<[u64; 2]>,
-    ) -> Result<bool> {
-        if self.quarantined || !self.selected(masks) {
+    /// Stage every unlatched exact identity before the device's single shared-ring scan,
+    /// whichever queues the scan's batch retires.
+    pub(crate) fn request_observations(&self, batch: &mut Batch) -> Result<bool> {
+        if self.quarantined {
             return Ok(false);
         }
+        batch.stage_frontier(self.qid(), self.kick.timestamp().get())?;
         let mut requested = false;
+        let mut stamp = None;
         for active in self.active.iter() {
             let Some(ticket) = active.ticket else {
                 break;
             };
             if active.observed.is_none() {
-                batch.request(&ticket)?;
+                let stamp = match stamp {
+                    Some(stamp) => stamp,
+                    None => *stamp.insert(self.graph.stamp()?),
+                };
+                batch.request(&ticket, retirement::stamp_covers(stamp, ticket.kick))?;
                 requested = true;
             }
         }
         Ok(requested)
     }
-    pub(crate) fn latch_observations(
-        &mut self,
-        batch: &mut Batch,
-        masks: Option<[u64; 2]>,
-    ) -> Result {
-        if self.quarantined || !self.selected(masks) {
+    pub(crate) fn latch_observations(&mut self, batch: &mut Batch) -> Result {
+        if self.quarantined {
             return Ok(());
         }
         for active in self.active.iter_mut() {

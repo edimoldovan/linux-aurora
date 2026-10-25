@@ -178,6 +178,8 @@ pub(super) struct Registry {
     pub(super) observations: compute::retirement::Batch,
     /// Completion-ring slot where the next compute scan starts.
     completion_cursor: usize,
+    /// Control word of each completion-ring slot as of the last scan that read it.
+    completion_seen: KVVec<u64>,
     worker_deferred: Option<DeferredBatch>,
     teardown: super::teardown::Pending,
 }
@@ -227,6 +229,14 @@ impl Registry {
             replay_outer_wait: None,
             observations: compute::retirement::Batch::new()?,
             completion_cursor: 0,
+            completion_seen: {
+                let slots = super::initdata::COMPUTE_COMPLETION_SLOTS;
+                let mut seen = KVVec::with_capacity(slots, GFP_KERNEL)?;
+                for _ in 0..slots {
+                    seen.push_within_capacity(0).map_err(|_| ENOMEM)?;
+                }
+                seen
+            },
             worker_deferred: Some(DeferredBatch::worker()?),
             teardown: super::teardown::Pending::new()?,
         })
@@ -1620,25 +1630,33 @@ impl super::Firmware {
         let registry = &mut self.queues;
         registry.observations.clear();
         let mut requested = false;
+        // Every queue's pending identities are staged, not only the ones this batch
+        // retires: the scan passes each new record once, and a queue retired by a later
+        // batch finds its observation already latched.
         for queue in registry
             .compute
             .iter()
             .flatten()
             .filter_map(|entry| entry.queue.as_deref())
         {
-            requested |= queue.request_observations(&mut registry.observations, masks)?;
+            requested |= queue.request_observations(&mut registry.observations)?;
         }
-        // Completion records are appended in order: resume after the last
-        // record a previous scan needed and stop once every request is found.
+        // Completion records are appended in order: fold only the records written since
+        // the previous scan. A request whose stamp already covers it has its record in the
+        // ring; if the scan ended before finding one, read the whole ring once.
         if requested {
             let observations = &mut registry.observations;
-            registry.completion_cursor = self.init.scan_compute_completions(
+            let seen = &mut registry.completion_seen;
+            registry.completion_cursor = self.init.fold_compute_completions(
                 registry.completion_cursor,
-                |record| {
-                    observations.fold(record)?;
-                    Ok(observations.complete())
-                },
+                seen,
+                |record| observations.fold(record),
             )?;
+            if observations.covered_pending() {
+                registry.completion_cursor = self
+                    .init
+                    .resync_compute_completions(seen, |record| observations.fold_any(record))?;
+            }
         }
         let port = &self.port;
         let retired = deferred.pending();
@@ -1650,7 +1668,7 @@ impl super::Firmware {
             .filter_map(|entry| entry.queue.as_deref_mut())
         {
             let busy = !queue.channel_free();
-            queue.latch_observations(&mut registry.observations, masks)?;
+            queue.latch_observations(&mut registry.observations)?;
             queue.retire(
                 masks,
                 generation,
