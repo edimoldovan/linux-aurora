@@ -2,6 +2,8 @@
 #include <linux/dma-fence.h>
 #include <asm/arch_timer.h>
 
+#include "trace_api.h"
+
 #define CREATE_TRACE_POINTS
 #include "trace.h"
 

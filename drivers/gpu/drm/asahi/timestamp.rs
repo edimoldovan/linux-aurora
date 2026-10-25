@@ -66,6 +66,7 @@ impl Buffer {
         }
     }
 
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
     pub(crate) fn timestamp_mapping(&self, offset: usize) -> Result<mmu::TimestampMapping> {
         match self {
             Self::Firmware(buffer) => buffer.mapping.timestamp_mapping(offset),

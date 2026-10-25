@@ -1950,7 +1950,6 @@ pub(crate) trait Host {
     fn publish_qid(&mut self, id: kick::Id) -> Result;
     fn publish_outer(&mut self, priority: u8, slot: &crate::g17::fw::channels::WorkSlot)
         -> Result;
-    fn notify(&mut self, message: u64) -> Result;
     fn notify_compute(&mut self, priority: u8, message: u64) -> Result;
     fn compute_written(&self, priority: u8) -> u64;
     fn note_submission(&mut self) -> Result;

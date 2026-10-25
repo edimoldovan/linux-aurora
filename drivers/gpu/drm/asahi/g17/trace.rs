@@ -3,7 +3,7 @@
 //! Command lifecycle tracepoints (tracefs `events/asahi_g17`). Each call is a
 //! static-key test in C while its event is disabled.
 
-use kernel::{bindings, dma_fence::RawDmaFence, prelude::*, sync::Arc};
+use kernel::{bindings, dma_fence::RawDmaFence, sync::Arc};
 
 unsafe extern "C" {
     fn asahi_g17_trace_publish_enabled() -> bool;

@@ -31,7 +31,6 @@ use kernel::{prelude::*, sync::Arc};
 
 const QIDS: usize = 128;
 const FIRST_COMPUTE_QID: u8 = 4;
-const RECOVERY_SETTLE_POLLS: usize = 200;
 const WORK_RING_WAIT_NS: u64 = super::job::TIMEOUT_MS as u64 * 1_000_000;
 
 /// Pending admission keeps exactly retired compute backing available for reuse.
@@ -1391,9 +1390,6 @@ impl compute::Host for ComputeHost<'_> {
     fn publish_outer(&mut self, _priority: u8, slot: &super::fw::channels::WorkSlot) -> Result {
         self.port.publish_compute(self.outer.take().ok_or(EIO)?, slot).map(|_| ())
     }
-    fn notify(&mut self, message: u64) -> Result {
-        self.port.notify(message)
-    }
     fn notify_compute(&mut self, priority: u8, message: u64) -> Result {
         self.port.notify_compute(priority, message)
     }
@@ -1440,9 +1436,6 @@ impl compute::Host for DirectHost<'_> {
     }
     fn publish_outer(&mut self, _priority: u8, slot: &super::fw::channels::WorkSlot) -> Result {
         self.port.publish_compute(self.outer.take().ok_or(EIO)?, slot).map(|_| ())
-    }
-    fn notify(&mut self, message: u64) -> Result {
-        self.port.notify(message)
     }
     fn notify_compute(&mut self, priority: u8, message: u64) -> Result {
         self.port.notify_compute(priority, message)
@@ -2396,12 +2389,6 @@ impl Registry {
 }
 
 impl Backend {
-    fn wait_compute_capacity(&self, admission: &Admission<'_>, reclaim_backing: bool) -> Result {
-        self.reclaim_capacity(admission, reclaim_backing)?;
-        kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
-        admission.check()
-    }
-
     /// Compute admission without a channel: give back what pressure allows, then block until a
     /// channel is released after `observed` (sampled before the failed check).
     fn wait_channels(&self, observed: u64, admission: &Admission<'_>, reclaim_backing: bool) -> Result {

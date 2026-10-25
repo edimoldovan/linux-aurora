@@ -1255,11 +1255,13 @@ impl TimestampVmap {
 
 /// Prepared CPU timestamp access with its own vmap; destruction happens after completion
 /// signalling.
+#[cfg(CONFIG_DRM_ASAHI_G16)]
 pub(crate) struct TimestampMapping {
     mapping: TimestampVmap,
     offset: usize,
 }
 
+#[cfg(CONFIG_DRM_ASAHI_G16)]
 impl TimestampMapping {
     /// Prepare one bounded CPU timestamp destination on retained GEM backing.
     pub(crate) fn new(gem: &gem::Object, offset: usize) -> Result<Self> {
@@ -1312,6 +1314,7 @@ impl KernelMapping {
     /// use a complete atomic store; byte stores support unaligned destinations without
     /// creating mutable aliases. An unaligned complete timestamp is not atomic.
     /// Retain CPU access before this destination's completion fence is published.
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
     pub(crate) fn timestamp_mapping(&self, offset: usize) -> Result<TimestampMapping> {
         let gem = self.0._gem.as_ref().ok_or(EINVAL)?;
         TimestampMapping::new(gem, self.timestamp_offset(offset)?)
