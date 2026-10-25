@@ -75,6 +75,7 @@
 	wdt: watchdog@28836c000 {
 		compatible = "apple,t6050-wdt", "apple,t8103-wdt";
 		reg = <0x2 0x8836c000 0x0 0x4000>;
+		clocks = <&clkref>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 721 IRQ_TYPE_LEVEL_HIGH>;
 	};
