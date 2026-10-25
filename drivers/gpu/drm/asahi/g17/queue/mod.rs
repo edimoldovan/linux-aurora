@@ -95,6 +95,9 @@ pub(crate) struct Queue<B: Backend> {
     proof: Proof,
     sequence: [u64; 2],
     frontiers: [KVec<(u64, Fences)>; 2],
+    /// Finished frontier entries pruned during this ioctl. Their last references
+    /// can tear a whole completion down; that waits until the ioctl has published.
+    finished: KVec<Fences>,
     failures: [Option<(u64, Fence)>; 2],
     // Closing the userspace queue releases admission even if firmware still
     // retains one of its execution contexts or installed physical graphs.
@@ -133,6 +136,7 @@ impl<B: Backend> Queue<B> {
             proof: Proof::new(),
             sequence: [0; 2],
             frontiers: core::array::from_fn(|_| KVec::new()),
+            finished: KVec::new(),
             failures: [None, None],
             _slot: slot,
         })
@@ -154,10 +158,19 @@ impl<B: Backend> Queue<B> {
 
     fn prune_frontier(&mut self, index: usize) {
         let failure = &mut self.failures[index];
+        // Without room the entries are released here, as they always could be.
+        let mut finished = if self.finished.reserve(self.frontiers[index].len(), GFP_KERNEL).is_ok() {
+            Some(&mut self.finished)
+        } else {
+            None
+        };
         self.frontiers[index].retain(|(sequence, fences)| {
             let status = fences.status();
             if status == 0 {
                 return true;
+            }
+            if let Some(finished) = finished.as_mut() {
+                let _ = finished.push_within_capacity(fences.clone());
             }
             // One earliest failed ordinal covers every later prefix without
             // retaining its packet, mappings, or every failed fence.
@@ -461,6 +474,8 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             }
             Ok(())
         })();
+        // Everything this ioctl publishes is visible; release what it pruned.
+        self.finished.clear();
         if let Err(error) = result {
             self.context.status().record_if_device_loss(error);
             if [EIO, ETIMEDOUT, ENODEV].contains(&error) || self.context.status().get() != 0 {
