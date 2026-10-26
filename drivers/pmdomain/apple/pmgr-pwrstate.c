@@ -63,12 +63,50 @@ struct apple_pmgr_ps {
  */
 static bool t6050_noauto, t6050_nomin, t6050_nopower, t6050_noalways;
 
+/*
+ * t6050_nopower alone makes every power transition a no-op; t6050_nopower=a,b
+ * only those domains. t6050_pmlog prints every transition on the console.
+ */
+static char t6050_nopower_list[256];
+static bool t6050_pmlog;
+
 static int __init t6050_nopower_setup(char *s)
 {
-	t6050_nopower = true;
+	if (s && *s == '=')
+		s++;
+	if (s && *s)
+		strscpy(t6050_nopower_list, s, sizeof(t6050_nopower_list));
+	else
+		t6050_nopower = true;
 	return 1;
 }
 __setup("t6050_nopower", t6050_nopower_setup);
+
+static int __init t6050_pmlog_setup(char *s)
+{
+	t6050_pmlog = true;
+	return 1;
+}
+__setup("t6050_pmlog", t6050_pmlog_setup);
+
+static bool t6050_skip(struct generic_pm_domain *genpd, const char *what)
+{
+	bool skip = t6050_nopower;
+	char buf[256], *p, *tok;
+
+	if (!skip && t6050_nopower_list[0]) {
+		strscpy(buf, t6050_nopower_list, sizeof(buf));
+		p = buf;
+		while ((tok = strsep(&p, ",")) != NULL)
+			if (!strcmp(tok, genpd->name)) {
+				skip = true;
+				break;
+			}
+	}
+	if (t6050_pmlog)
+		pr_emerg("pmgr %s %s%s\n", what, genpd->name, skip ? " (skipped)" : "");
+	return skip;
+}
 
 static int __init t6050_noalways_setup(char *s)
 {
@@ -200,7 +238,7 @@ static int apple_pmgr_ps_power_on(struct generic_pm_domain *genpd)
 	int ret;
 
 	/* Its coprocessor's firmware owns the state; Linux only holds a vote. */
-	if (ps->firmware_owned || t6050_nopower)
+	if (ps->firmware_owned || t6050_skip(genpd, "on"))
 		return 0;
 
 	ret = apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_ACTIVE, !ps->no_auto_pm);
@@ -215,7 +253,7 @@ static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
 	struct apple_pmgr_ps *ps = genpd_to_apple_pmgr_ps(genpd);
 	int ret;
 
-	if (ps->firmware_owned || t6050_nopower)
+	if (ps->firmware_owned || t6050_skip(genpd, "off"))
 		return 0;
 
 	ret = apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_PWRGATE, false);
