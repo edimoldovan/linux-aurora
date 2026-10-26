@@ -68,7 +68,21 @@ static bool t6050_noauto, t6050_nomin, t6050_nopower, t6050_noalways;
  * only those domains. t6050_pmlog prints every transition on the console.
  */
 static char t6050_nopower_list[256];
-static bool t6050_pmlog;
+static bool t6050_pmlog, t6050_nooff, t6050_noon;
+
+static int __init t6050_nooff_setup(char *s)
+{
+	t6050_nooff = true;
+	return 1;
+}
+__setup("t6050_nooff", t6050_nooff_setup);
+
+static int __init t6050_noon_setup(char *s)
+{
+	t6050_noon = true;
+	return 1;
+}
+__setup("t6050_noon", t6050_noon_setup);
 
 static int __init t6050_nopower_setup(char *s)
 {
@@ -91,17 +105,23 @@ __setup("t6050_pmlog", t6050_pmlog_setup);
 
 static bool t6050_skip(struct generic_pm_domain *genpd, const char *what)
 {
-	bool skip = t6050_nopower;
+	bool skip = t6050_nopower || (t6050_nooff && what[1] == 'f') ||
+		    (t6050_noon && what[1] == 'n');
 	char buf[256], *p, *tok;
+	size_t n;
 
+	/* The list takes exact names or prefixes ending in '*'. */
 	if (!skip && t6050_nopower_list[0]) {
 		strscpy(buf, t6050_nopower_list, sizeof(buf));
 		p = buf;
-		while ((tok = strsep(&p, ",")) != NULL)
-			if (!strcmp(tok, genpd->name)) {
+		while ((tok = strsep(&p, ",")) != NULL) {
+			n = strlen(tok);
+			if (n && tok[n - 1] == '*' ? !strncmp(tok, genpd->name, n - 1)
+						   : !strcmp(tok, genpd->name)) {
 				skip = true;
 				break;
 			}
+		}
 	}
 	if (t6050_pmlog)
 		pr_emerg("pmgr %s %s%s\n", what, genpd->name, skip ? " (skipped)" : "");
