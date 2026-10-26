@@ -1,0 +1,146 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * USB-C port 0 of the MacBook Pro 14" (M5 Max, J714c), after the M5 Air
+ * description (t8142-j813-usb.dtsi). Addresses from the ADT: usb-drd0,
+ * dart-usb0, atc-phy0, nub-spmi-a0/hpm0, arm-io base 0x200000000.
+ * Ports 1 and 2 (usb-drd1/2, hpm1 on nub-spmi-a0, hpm2 on nub-spmi-a1)
+ * follow once port 0 works.
+ *
+ * NOT INCLUDED YET: the T6050 Type-C PHY is a new generation. Its ADT node
+ * has 44 register windows and a tunable set (AUS40CMN, CIO4PLL,
+ * LN0/1_RX_CFG_TX_OF_RXCLK, ...) that no loader table or kernel PHY
+ * generation describes; with the T8142 description the PHY probe fails on
+ * the missing tunables and the controller never binds. Needs a T6050
+ * generation in drivers/phy/apple/atc.c and a tunable table in the loader.
+ */
+
+#include <dt-bindings/phy/phy.h>
+#include <dt-bindings/spmi/spmi.h>
+
+/ {
+	aliases {
+		atcphy0 = &atcphy0;
+		usb0 = &dwc3_0;
+	};
+};
+
+&soc {
+	nub_spmi_a0: spmi@28a188000 {
+		compatible = "apple,t6050-spmi", "apple,t8142-spmi";
+		reg = <0x2 0x8a188000 0x0 0x4000>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		power-domains = <&ps_nub_spmi_a0>;
+
+		hpm0: usb-pd@c {
+			compatible = "apple,sn201202x";
+			reg = <0xc SPMI_USID>;
+
+			typec0: connector {
+				compatible = "usb-c-connector";
+				label = "USB-C port 0";
+				power-role = "dual";
+				data-role = "host";
+
+				ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+					port@0 {
+						reg = <0>;
+						typec0_hs: endpoint {
+							remote-endpoint = <&dwc3_0_hs>;
+						};
+					};
+					port@1 {
+						reg = <1>;
+						typec0_ss: endpoint {
+							remote-endpoint = <&atcphy0_typec>;
+						};
+					};
+				};
+			};
+		};
+	};
+
+	dwc3_0: usb@2a2280000 {
+		compatible = "apple,t6050-dwc3", "apple,t8142-dwc3", "apple,t8103-dwc3";
+		reg = <0x2 0xa2280000 0x0 0xcd00>, <0x2 0xa228cd00 0x0 0x4b00>;
+		reg-names = "dwc3-core", "dwc3-apple";
+		interrupts = <AIC_IRQ 1419 IRQ_TYPE_LEVEL_HIGH>;
+		dr_mode = "host";
+		usb-role-switch;
+		role-switch-default-mode = "host";
+		iommus = <&dwc3_0_dart_0 0>, <&dwc3_0_dart_1 1>;
+		power-domains = <&ps_atc0_usb>;
+		resets = <&atcphy0>;
+		phys = <&atcphy0 PHY_TYPE_USB2>, <&atcphy0 PHY_TYPE_USB3>;
+		phy-names = "usb2-phy", "usb3-phy";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			port@0 {
+				reg = <0>;
+				dwc3_0_hs: endpoint {
+					remote-endpoint = <&typec0_hs>;
+				};
+			};
+			port@1 {
+				reg = <1>;
+				dwc3_0_ss: endpoint {
+					remote-endpoint = <&atcphy0_usb>;
+				};
+			};
+		};
+	};
+
+	dwc3_0_dart_0: iommu@2a2f00000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x2 0xa2f00000 0x0 0xc000>;
+		interrupts = <AIC_IRQ 1423 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc0_usb>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x4000 0 0xffff0000>;
+	};
+
+	dwc3_0_dart_1: iommu@2a2f80000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x2 0xa2f80000 0x0 0xc000>;
+		interrupts = <AIC_IRQ 1423 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc0_usb>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x4000 0 0xffff0000>;
+	};
+
+	atcphy0: phy@2a3000000 {
+		compatible = "apple,t6050-atcphy", "apple,t8142-atcphy";
+		reg = <0x2 0xa3000000 0x0 0x4c000>,
+		      <0x2 0xa3050000 0x0 0x8000>,
+		      <0x2 0xa2800000 0x0 0x8000>,
+		      <0x2 0xa2a90000 0x0 0x4000>,
+		      <0x2 0xa2a84000 0x0 0x4000>;
+		reg-names = "core", "lpdptx", "axi2af", "usb2phy", "pipehandler";
+		#phy-cells = <1>;
+		#reset-cells = <0>;
+		orientation-switch;
+		mode-switch;
+		power-domains = <&ps_atc0_usb>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			port@0 {
+				reg = <0>;
+				atcphy0_typec: endpoint {
+					remote-endpoint = <&typec0_ss>;
+				};
+			};
+			port@1 {
+				reg = <1>;
+				atcphy0_usb: endpoint {
+					remote-endpoint = <&dwc3_0_ss>;
+				};
+			};
+		};
+	};
+};
