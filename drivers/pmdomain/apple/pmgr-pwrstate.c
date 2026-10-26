@@ -61,7 +61,21 @@ struct apple_pmgr_ps {
  * T6050 bring-up switches: t6050_noauto=1 skips the probe-time auto-PM enable,
  * t6050_nomin=1 skips the probe-time minimum-state write.
  */
-static bool t6050_noauto, t6050_nomin;
+static bool t6050_noauto, t6050_nomin, t6050_nopower, t6050_noalways;
+
+static int __init t6050_nopower_setup(char *s)
+{
+	t6050_nopower = true;
+	return 1;
+}
+__setup("t6050_nopower", t6050_nopower_setup);
+
+static int __init t6050_noalways_setup(char *s)
+{
+	t6050_noalways = true;
+	return 1;
+}
+__setup("t6050_noalways", t6050_noalways_setup);
 
 static int __init t6050_noauto_setup(char *s)
 {
@@ -186,7 +200,7 @@ static int apple_pmgr_ps_power_on(struct generic_pm_domain *genpd)
 	int ret;
 
 	/* Its coprocessor's firmware owns the state; Linux only holds a vote. */
-	if (ps->firmware_owned)
+	if (ps->firmware_owned || t6050_nopower)
 		return 0;
 
 	ret = apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_ACTIVE, !ps->no_auto_pm);
@@ -201,7 +215,7 @@ static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
 	struct apple_pmgr_ps *ps = genpd_to_apple_pmgr_ps(genpd);
 	int ret;
 
-	if (ps->firmware_owned)
+	if (ps->firmware_owned || t6050_nopower)
 		return 0;
 
 	ret = apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_PWRGATE, false);
@@ -399,7 +413,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		active = true;
 	} else if (of_property_read_bool(node, "apple,always-on")) {
 		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
-		if (!active) {
+		if (!active && !t6050_noalways) {
 			/*
 			 * The boot loader need not leave an always-on domain on,
 			 * so this is not an error: apple_pmgr_ps_set() reports a
