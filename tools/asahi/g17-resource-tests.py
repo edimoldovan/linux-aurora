@@ -134,7 +134,7 @@ def queue_tests(root, source):
      return s[at:end]
     s=(source/'kick.rs').read_text()
     fw=(source/'fw/kick.rs').read_text()
-    constants=re.search(r'const QID_MAX: [^;]+;',fw).group(0)+'\n'+'\n'.join(re.search(r'const '+name+r': [^;]+;',s).group(0) for name in ['QID_COUNT','COMPUTE_RENDER_RESERVE'])
+    constants=re.search(r'const QID_MAX: [^;]+;',fw).group(0)+'\n'+'\n'.join(re.search(r'const '+name+r': [^;]+;',s).group(0) for name in ['QID_COUNT','RENDER_HEADROOM','FULL_RENDER_RESERVE'])
     header='''#![allow(dead_code, unused_macros)]
     type Result<T=()> = std::result::Result<T,i32>;
     mod g17 { pub mod capacity {
@@ -148,16 +148,19 @@ def queue_tests(root, source):
     #[derive(Clone,Copy,PartialEq,Eq,Debug)] enum DataMaster {Compute,Tiling,Fragment}
     #[derive(Clone,Copy,PartialEq,Eq,Debug)] struct Id {qid:u8,owner:u64,engine:DataMaster}
     #[derive(Clone,Copy)] struct Identity {id:Id,published:bool}
-    '''+constants+'\n'+item(s,'pub(crate) struct QueueIds')+'\nimpl QueueIds {\n'+''.join(item(s,'pub(crate) fn '+name+'(')+'\n' for name in ['reserve_initial_render','reserve','publish','can_cancel_unpublished','cancel_unpublished'])+'}\n'
+    '''+constants+'\n'+item(s,'const fn render_reserve(')+'\n'+item(s,'pub(crate) struct QueueIds')+'\nimpl QueueIds {\n'+''.join(item(s,'pub(crate) fn '+name+'(')+'\n' for name in ['reserve_initial_render','reserve','reserve_for','publish','can_cancel_unpublished','cancel_unpublished'])+''.join(item(s, sig)+'\n' for sig in ['fn render_ids(', 'fn compute_room('])+'}\n'
     test='''
-    fn fresh()->QueueIds {QueueIds {entries:[None;QID_COUNT],initial_render:[None;2],compute_publication:0,leased:0}}
+    fn fresh()->QueueIds {QueueIds {entries:[None;QID_COUNT],initial_render:[None;2],leased:0,floor:0}}
     fn main(){
-     for render in [0,2,16,32,112,126] {
-      let mut q=fresh();
+     for floor in [0,32] {
+     for render in [0,2,16,32,80,96,112,126].into_iter().filter(|render|*render<=QID_COUNT-floor) {
+      let mut q=fresh();q.floor=floor;
       for i in 0..render {q.reserve(i as u64+1,if i%2==0 {DataMaster::Tiling}else{DataMaster::Fragment},None).unwrap();}
       let mut compute=0;
       while q.reserve(1000+compute,DataMaster::Compute,None).is_ok(){compute+=1;}
-      assert_eq!(compute as usize,QID_COUNT-render.max(COMPUTE_RENDER_RESERVE));
+      assert_eq!(compute as usize,QID_COUNT-floor-render.max(FULL_RENDER_RESERVE-floor));
+      assert!(q.entries[..floor].iter().all(Option::is_none));
+     }
      }
      let mut q=fresh();let first=q.reserve(1,DataMaster::Tiling,None).unwrap();
      assert!(q.can_cancel_unpublished(first));q.publish(first).unwrap();
@@ -165,7 +168,7 @@ def queue_tests(root, source):
      let unused=q.reserve(2,DataMaster::Fragment,None).unwrap();q.cancel_unpublished(unused).unwrap();assert_eq!(q.leased,1);
      let next=q.reserve(3,DataMaster::Fragment,None).unwrap();assert_eq!(next.qid,unused.qid);
      assert!(!q.can_cancel_unpublished(unused));assert_eq!(q.cancel_unpublished(unused),Err(EINVAL));
-     println!("queue IDs: six render/compute capacity boundaries; compute-only render reserve retained; published and stale identities protected");
+     println!("queue IDs: render/compute capacity boundaries at zero and reserved floors; compute-only render reserve retained; published and stale identities protected");
      // Reproduce the hardware snapshot: 124 installed render identities, two
      // installed compute identities, and two initial reservations fill128 IDs.
      let mut q=fresh();q.reserve_initial_render().unwrap();
@@ -192,8 +195,8 @@ def queue_tests(root, source):
      assert_eq!(q.entries[0].unwrap().id,protected);
      // Replacement must not consume the protected render minimum.
      let mut q=fresh();q.reserve_initial_render().unwrap();
-     for owner in 3..=COMPUTE_RENDER_RESERVE as u64 {q.reserve(owner,DataMaster::Tiling,None).unwrap();}
-     for owner in 1000..1000+(QID_COUNT-COMPUTE_RENDER_RESERVE) as u64 {q.reserve(owner,DataMaster::Compute,None).unwrap();}
+     for owner in 3..=FULL_RENDER_RESERVE as u64 {q.reserve(owner,DataMaster::Tiling,None).unwrap();}
+     for owner in 1000..1000+(QID_COUNT-FULL_RENDER_RESERVE) as u64 {q.reserve(owner,DataMaster::Compute,None).unwrap();}
      assert_eq!(q.leased,QID_COUNT);assert_eq!(q.reserve(2000,DataMaster::Compute,None),Err(ENOSPC));
      assert!(q.initial_render.iter().all(Option::is_some));
      // Ordinary free capacity leaves the initialization reservations untouched.
