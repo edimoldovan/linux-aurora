@@ -1437,6 +1437,7 @@
 		#power-domain-cells = <0>;
 		power-domains = <&ps_nub_spmi_ahb>;
 		#reset-cells = <0>;
+		apple,always-on;
 	};
 
 	ps_nub_spmi1: power-controller@128 {
@@ -1456,6 +1457,7 @@
 		#power-domain-cells = <0>;
 		power-domains = <&ps_nub_spmi_ahb>;
 		#reset-cells = <0>;
+		apple,always-on;
 	};
 
 	ps_nub_spmi3: power-controller@138 {
@@ -1465,6 +1467,7 @@
 		#power-domain-cells = <0>;
 		power-domains = <&ps_nub_spmi_ahb>;
 		#reset-cells = <0>;
+		apple,always-on;
 	};
 
 	ps_nub_spmi4: power-controller@140 {
@@ -1474,6 +1477,7 @@
 		#power-domain-cells = <0>;
 		power-domains = <&ps_nub_spmi_ahb>;
 		#reset-cells = <0>;
+		apple,always-on;
 	};
 
 	ps_atc0_usb_aon: power-controller@148 {
