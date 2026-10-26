@@ -752,7 +752,8 @@ static void t6050_hcrst_try(const char *when)
 	op = ioremap(t6050_hcrst_addr, 0x1000);
 	if (!op)
 		return;
-	pr_emerg("hcrst %s: before USBCMD %#x USBSTS %#x\n", when, readl(op), readl(op + 4));
+	pr_emerg("hcrst %s: before USBCMD %#x USBSTS %#x PORTSC0 %#x PORTSC1 %#x\n", when,
+		 readl(op), readl(op + 4), readl(op + 0x400), readl(op + 0x410));
 	writel(readl(op) & ~1, op);
 	for (i = 0; i < 2000 && !(readl(op + 4) & 1); i++)
 		udelay(10);
