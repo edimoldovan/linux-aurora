@@ -2547,7 +2547,7 @@ mod shared_capacity_tests {
 
     #[test]
     fn compute_grows_with_free_qids_and_narrows_queue_admission() {
-        let mut registry = KBox::init(Registry::new(1, [0; 2]), GFP_KERNEL).unwrap();
+        let mut registry = KBox::init(Registry::new(1, Deflake::ONE_CLUSTER, [0; 2], &V26A428), GFP_KERNEL).unwrap();
         let mut slots = KVec::with_capacity(20, GFP_KERNEL).unwrap();
         for _ in 0..20 {
             slots.push(registry.admission.reserve_queue().unwrap(), GFP_KERNEL).unwrap();
