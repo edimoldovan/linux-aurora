@@ -634,7 +634,10 @@ impl Queue {
     }
 
     /// The queue has left ordinary retirement: a timeout, kill, quarantine, replay, recovery
-    /// witness or exit is in progress.
+    /// witness or exit is in progress, or retirement stopped at a command the firmware
+    /// finished without a completion record. A front whose record has arrived and that only
+    /// waits for its stamp is ordinary retirement: [`Self::due_doorbell`] counts it as
+    /// finished, and ringing at once there rang most withheld doorbells early.
     fn settling(&self) -> bool {
         self.quarantined
             || self.released
@@ -642,7 +645,8 @@ impl Queue {
             || self.replays.len != 0
             || self.replay_retirement
             || self.awaiting_witness
-            || self.retire_pending
+            || (self.retire_pending
+                && self.active.front().is_none_or(|active| active.observed.is_none()))
             || self.retired_by_teardown
             || self.spared_quarantine
             || self.failure_status_pending
