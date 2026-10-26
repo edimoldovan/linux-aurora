@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * USB 2.0 host on USB-C port 2 of the MacBook Pro 14" (M5 Max, J714c).
+ *
+ * The T6050 Type-C PHY has no Linux driver yet (see t6050-j714c-usb.dtsi).
+ * The loader leaves the port's usb2phy in USB 2.0 host mode before starting
+ * the kernel (usb_t6050_host_prep) with the controller already flipped to
+ * host, so only the xHCI registers are described, for the generic xHCI
+ * platform driver. Addresses from
+ * the ADT: usb-drd2 0x382280000, dart-usb2 0x382f00000/0x382f80000.
+ * Port 0 follows the same pattern; port 1 is the proxy cable.
+ */
+
+/ {
+	aliases {
+		usb2 = &dwc3_2;
+	};
+};
+
+&soc {
+	dwc3_2: usb@382280000 {
+		/*
+		 * The loader leaves the controller in host mode with the USB2
+		 * PHY running (usb_t6050_host_prep); only the xHCI host registers
+		 * are driven here, by the generic xHCI platform driver.
+		 */
+		compatible = "generic-xhci";
+		reg = <0x3 0x82280000 0x0 0x8000>;
+		interrupts = <AIC_IRQ 1483 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&dwc3_2_dart_0 0>, <&dwc3_2_dart_1 1>;
+		power-domains = <&ps_atc2_usb>;
+	};
+
+	dwc3_2_dart_0: iommu@382f00000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x3 0x82f00000 0x0 0xc000>;
+		interrupts = <AIC_IRQ 1487 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc2_usb>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x4000 0 0xffff0000>;
+	};
+
+	dwc3_2_dart_1: iommu@382f80000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x3 0x82f80000 0x0 0xc000>;
+		interrupts = <AIC_IRQ 1487 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc2_usb>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x4000 0 0xffff0000>;
+	};
+};

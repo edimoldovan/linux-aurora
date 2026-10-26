@@ -92,3 +92,4 @@
 	tp_accel {
 	};
 };
+#include "t6050-j714c-usb2.dtsi"

@@ -674,6 +674,22 @@ static int __init t6050_wdtmon_ping_setup(char *s)
 __setup("t6050_wdtmon_ping=", t6050_wdtmon_ping_setup);
 
 static void __iomem *t6050_wdtmon_w, *t6050_wdtmon_s, *t6050_wdtmon_p, *t6050_wdtmon_q;
+
+/* t6050_peek=<addr>[,<addr>...] (up to 8): 32-bit words printed with the monitor. */
+static u64 t6050_peek_addr[8];
+static void __iomem *t6050_peek_map[8];
+static unsigned int t6050_peek_n;
+
+static int __init t6050_peek_setup(char *s)
+{
+	char *tok;
+
+	while ((tok = strsep(&s, ",")) != NULL && t6050_peek_n < 8)
+		if (!kstrtoull(tok, 0, &t6050_peek_addr[t6050_peek_n]))
+			t6050_peek_n++;
+	return 1;
+}
+__setup("t6050_peek=", t6050_peek_setup);
 static struct delayed_work t6050_wdtmon_work;
 
 static void t6050_wdtmon_fn(struct work_struct *work)
@@ -687,6 +703,10 @@ static void t6050_wdtmon_fn(struct work_struct *work)
 		 readl_relaxed(w + 0x20), readl_relaxed(w + 0x24), readl_relaxed(w + 0x2c),
 		 readl_relaxed(t6050_wdtmon_s), readl_relaxed(t6050_wdtmon_p + 0x20),
 		 readl_relaxed(t6050_wdtmon_p + 0x2c), readl_relaxed(t6050_wdtmon_q));
+	for (unsigned int i = 0; i < t6050_peek_n; i++)
+		if (t6050_peek_map[i])
+			pr_emerg("peek %#llx = %#010x\n", t6050_peek_addr[i],
+				 readl_relaxed(t6050_peek_map[i]));
 	if (t6050_wdtmon_ping)
 		writel_relaxed(0, w + 0x10);
 	schedule_delayed_work(&t6050_wdtmon_work, t6050_wdtmon * HZ);
@@ -702,8 +722,66 @@ static int __init t6050_wdtmon_start(void)
 	t6050_wdtmon_q = ioremap(0x288335260, 0x4);
 	if (!t6050_wdtmon_w || !t6050_wdtmon_s || !t6050_wdtmon_p || !t6050_wdtmon_q)
 		return 0;
+	for (unsigned int i = 0; i < t6050_peek_n; i++)
+		t6050_peek_map[i] = ioremap(t6050_peek_addr[i] & ~3ULL, 4);
 	INIT_DELAYED_WORK(&t6050_wdtmon_work, t6050_wdtmon_fn);
 	schedule_delayed_work(&t6050_wdtmon_work, 0);
 	return 0;
 }
 late_initcall(t6050_wdtmon_start);
+
+/*
+ * t6050_hcrst=<xHCI operational base>: before the host driver probes, do an
+ * xHCI reset by hand from the kernel and print how long the reset bit takes
+ * to clear (the same experiment as the proxy script, from kernel context).
+ */
+static u64 t6050_hcrst_addr;
+
+static int __init t6050_hcrst_setup(char *s)
+{
+	return kstrtoull(s, 0, &t6050_hcrst_addr) == 0;
+}
+__setup("t6050_hcrst=", t6050_hcrst_setup);
+
+static void t6050_hcrst_try(const char *when)
+{
+	void __iomem *op;
+	u32 cmd, first;
+	int i;
+
+	op = ioremap(t6050_hcrst_addr, 0x1000);
+	if (!op)
+		return;
+	pr_emerg("hcrst %s: before USBCMD %#x USBSTS %#x\n", when, readl(op), readl(op + 4));
+	writel(readl(op) & ~1, op);
+	for (i = 0; i < 2000 && !(readl(op + 4) & 1); i++)
+		udelay(10);
+	pr_emerg("hcrst %s: halted after %d x 10us, USBSTS %#x\n", when, i, readl(op + 4));
+	cmd = readl(op) | 2;
+	writel(cmd, op);
+	first = readl(op);
+	for (i = 0; i < 20000 && (readl(op) & 2); i++)
+		udelay(1000);
+	pr_emerg("hcrst %s: read-back %#x, HCRST clear after %d ms (limit 20000)\n", when, first, i);
+	for (i = 0; i < 20000 && (readl(op + 4) & BIT(11)); i++)
+		udelay(1000);
+	pr_emerg("hcrst %s: CNR clear after %d ms, USBCMD %#x USBSTS %#x PORTSC0 %#x\n", when, i,
+		 readl(op), readl(op + 4), readl(op + 0x400));
+	iounmap(op);
+}
+
+static int __init t6050_hcrst_early(void)
+{
+	if (t6050_hcrst_addr)
+		t6050_hcrst_try("early");
+	return 0;
+}
+subsys_initcall(t6050_hcrst_early);
+
+static int __init t6050_hcrst_late(void)
+{
+	if (t6050_hcrst_addr)
+		t6050_hcrst_try("late");
+	return 0;
+}
+late_initcall_sync(t6050_hcrst_late);

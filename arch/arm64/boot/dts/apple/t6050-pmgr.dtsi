@@ -248,6 +248,7 @@
 		#power-domain-cells = <0>;
 		power-domains = <&ps_fab5_soc>;
 		#reset-cells = <0>;
+		apple,firmware-owned;
 	};
 
 	ps_auss: power-controller@248 {
@@ -312,6 +313,12 @@
 		apple,firmware-owned;
 	};
 
+/*
+ * atc0-3_cio and atc3_common are left to the firmware for now: the kernel's
+ * boot-time power-on of these domains (2026-10-26, J714c) breaks the USB 2.0
+ * host on the parked Type-C PHY (the xHCI reset never completes). USB4 needs
+ * them driven in sequence with the PHY, by the PHY driver, later.
+ */
 	ps_atc0_cio: power-controller@280 {
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x280 4>;
@@ -319,6 +326,7 @@
 		#power-domain-cells = <0>;
 		power-domains = <&ps_atc0_common>;
 		#reset-cells = <0>;
+		apple,firmware-owned;
 	};
 
 	ps_atc0_pcie: power-controller@288 {
@@ -337,6 +345,7 @@
 		#power-domain-cells = <0>;
 		power-domains = <&ps_atc1_common>;
 		#reset-cells = <0>;
+		apple,firmware-owned;
 	};
 
 	ps_atc1_pcie: power-controller@298 {
@@ -442,6 +451,7 @@
 		#power-domain-cells = <0>;
 		power-domains = <&ps_atc2_common>;
 		#reset-cells = <0>;
+		apple,firmware-owned;
 	};
 
 	ps_atc2_pcie: power-controller@2f0 {
@@ -460,6 +470,7 @@
 		#power-domain-cells = <0>;
 		power-domains = <&ps_atc3_common>;
 		#reset-cells = <0>;
+		apple,firmware-owned;
 	};
 
 	ps_atc3_pcie: power-controller@300 {
