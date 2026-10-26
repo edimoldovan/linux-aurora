@@ -16,6 +16,7 @@
 #include <linux/mfd/syscon.h>
 #include <linux/reset-controller.h>
 #include <linux/module.h>
+#include <linux/workqueue.h>
 
 #define APPLE_PMGR_RESET        BIT(31)
 #define APPLE_PMGR_AUTO_ENABLE  BIT(28)
@@ -103,6 +104,41 @@ static int __init t6050_pmlog_setup(char *s)
 }
 __setup("t6050_pmlog", t6050_pmlog_setup);
 
+/* The transition log is compact: many entries per console line. */
+static char t6050_pmlog_buf[8192];
+static unsigned int t6050_pmlog_len, t6050_pmlog_shown;
+static struct delayed_work t6050_pmlog_work;
+
+static void t6050_pmlog_add(const char *what, const char *name, bool skip)
+{
+	int n = snprintf(t6050_pmlog_buf + t6050_pmlog_len,
+			 sizeof(t6050_pmlog_buf) - t6050_pmlog_len, "%s%s:%s ",
+			 skip ? "-" : "", what, name);
+	if (n > 0 && t6050_pmlog_len + n < sizeof(t6050_pmlog_buf))
+		t6050_pmlog_len += n;
+}
+
+static void t6050_pmlog_flush(struct work_struct *work)
+{
+	while (t6050_pmlog_shown < t6050_pmlog_len) {
+		unsigned int n = min(140U, t6050_pmlog_len - t6050_pmlog_shown);
+
+		pr_emerg("pm: %.*s\n", n, t6050_pmlog_buf + t6050_pmlog_shown);
+		t6050_pmlog_shown += n;
+	}
+	schedule_delayed_work(&t6050_pmlog_work, 10 * HZ);
+}
+
+static int __init t6050_pmlog_start(void)
+{
+	if (!t6050_pmlog)
+		return 0;
+	INIT_DELAYED_WORK(&t6050_pmlog_work, t6050_pmlog_flush);
+	schedule_delayed_work(&t6050_pmlog_work, HZ);
+	return 0;
+}
+late_initcall_sync(t6050_pmlog_start);
+
 static bool t6050_skip(struct generic_pm_domain *genpd, const char *what)
 {
 	bool skip = t6050_nopower || (t6050_nooff && what[1] == 'f') ||
@@ -124,7 +160,7 @@ static bool t6050_skip(struct generic_pm_domain *genpd, const char *what)
 		}
 	}
 	if (t6050_pmlog)
-		pr_emerg("pmgr %s %s%s\n", what, genpd->name, skip ? " (skipped)" : "");
+		t6050_pmlog_add(what, genpd->name, skip);
 	return skip;
 }
 
