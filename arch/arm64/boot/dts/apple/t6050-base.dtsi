@@ -10,6 +10,11 @@
 	#size-cells = <2>;
 
 	cpus {
+	/*
+	 * cpu reg is the MPIDR affinity. On T6050 the boot core reads
+	 * MPIDR_EL1 0x80040000: Aff2 is 4, cluster in Aff1, core in Aff0.
+	 * Clusters 1 and 2 follow that pattern; their cores do not start today.
+	 */
 		#address-cells = <2>;
 		#size-cells = <0>;
 
@@ -50,61 +55,73 @@
 		cpu_m00: cpu@0 {
 			compatible = "apple,sotra";
 			device_type = "cpu";
-			reg = <0x0 0x0>;
+			reg = <0x0 0x40000>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* to be filled by loader */
 			next-level-cache = <&l2_cache_0>;
+			operating-points-v2 = <&mcluster0_opp>;
+			performance-domains = <&cpufreq_m0>;
 		};
 
 		cpu_m01: cpu@1 {
 			compatible = "apple,sotra";
 			device_type = "cpu";
-			reg = <0x0 0x1>;
+			reg = <0x0 0x40001>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* to be filled by loader */
 			next-level-cache = <&l2_cache_0>;
+			operating-points-v2 = <&mcluster0_opp>;
+			performance-domains = <&cpufreq_m0>;
 		};
 
 		cpu_m02: cpu@2 {
 			compatible = "apple,sotra";
 			device_type = "cpu";
-			reg = <0x0 0x2>;
+			reg = <0x0 0x40002>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* to be filled by loader */
 			next-level-cache = <&l2_cache_0>;
+			operating-points-v2 = <&mcluster0_opp>;
+			performance-domains = <&cpufreq_m0>;
 		};
 
 		cpu_m03: cpu@3 {
 			compatible = "apple,sotra";
 			device_type = "cpu";
-			reg = <0x0 0x3>;
+			reg = <0x0 0x40003>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* to be filled by loader */
 			next-level-cache = <&l2_cache_0>;
+			operating-points-v2 = <&mcluster0_opp>;
+			performance-domains = <&cpufreq_m0>;
 		};
 
 		cpu_m04: cpu@4 {
 			compatible = "apple,sotra";
 			device_type = "cpu";
-			reg = <0x0 0x4>;
+			reg = <0x0 0x40004>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* to be filled by loader */
 			next-level-cache = <&l2_cache_0>;
+			operating-points-v2 = <&mcluster0_opp>;
+			performance-domains = <&cpufreq_m0>;
 		};
 
 		cpu_m05: cpu@5 {
 			compatible = "apple,sotra";
 			device_type = "cpu";
-			reg = <0x0 0x5>;
+			reg = <0x0 0x40005>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* to be filled by loader */
 			next-level-cache = <&l2_cache_0>;
+			operating-points-v2 = <&mcluster0_opp>;
+			performance-domains = <&cpufreq_m0>;
 		};
 
 		cpu_m10: cpu@100 {
 			compatible = "apple,sotra";
 			device_type = "cpu";
-			reg = <0x0 0x100>;
+			reg = <0x0 0x41004>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* to be filled by loader */
 			next-level-cache = <&l2_cache_1>;
@@ -113,7 +130,7 @@
 		cpu_m11: cpu@101 {
 			compatible = "apple,sotra";
 			device_type = "cpu";
-			reg = <0x0 0x101>;
+			reg = <0x0 0x41005>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* to be filled by loader */
 			next-level-cache = <&l2_cache_1>;
@@ -122,7 +139,7 @@
 		cpu_m12: cpu@102 {
 			compatible = "apple,sotra";
 			device_type = "cpu";
-			reg = <0x0 0x102>;
+			reg = <0x0 0x41100>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* to be filled by loader */
 			next-level-cache = <&l2_cache_1>;
@@ -131,7 +148,7 @@
 		cpu_m13: cpu@103 {
 			compatible = "apple,sotra";
 			device_type = "cpu";
-			reg = <0x0 0x103>;
+			reg = <0x0 0x41101>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* to be filled by loader */
 			next-level-cache = <&l2_cache_1>;
@@ -140,7 +157,7 @@
 		cpu_m14: cpu@104 {
 			compatible = "apple,sotra";
 			device_type = "cpu";
-			reg = <0x0 0x104>;
+			reg = <0x0 0x41102>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* to be filled by loader */
 			next-level-cache = <&l2_cache_1>;
@@ -149,7 +166,7 @@
 		cpu_m15: cpu@105 {
 			compatible = "apple,sotra";
 			device_type = "cpu";
-			reg = <0x0 0x105>;
+			reg = <0x0 0x41103>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* to be filled by loader */
 			next-level-cache = <&l2_cache_1>;
@@ -158,7 +175,7 @@
 		cpu_p00: cpu@200 {
 			compatible = "apple,sotra";
 			device_type = "cpu";
-			reg = <0x0 0x200>;
+			reg = <0x0 0x42102>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* to be filled by loader */
 			next-level-cache = <&l2_cache_2>;
@@ -167,7 +184,7 @@
 		cpu_p01: cpu@201 {
 			compatible = "apple,sotra";
 			device_type = "cpu";
-			reg = <0x0 0x201>;
+			reg = <0x0 0x42103>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* to be filled by loader */
 			next-level-cache = <&l2_cache_2>;
@@ -176,7 +193,7 @@
 		cpu_p02: cpu@202 {
 			compatible = "apple,sotra";
 			device_type = "cpu";
-			reg = <0x0 0x202>;
+			reg = <0x0 0x42104>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* to be filled by loader */
 			next-level-cache = <&l2_cache_2>;
@@ -185,7 +202,7 @@
 		cpu_p03: cpu@203 {
 			compatible = "apple,sotra";
 			device_type = "cpu";
-			reg = <0x0 0x203>;
+			reg = <0x0 0x42105>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* to be filled by loader */
 			next-level-cache = <&l2_cache_2>;
@@ -194,7 +211,7 @@
 		cpu_p04: cpu@204 {
 			compatible = "apple,sotra";
 			device_type = "cpu";
-			reg = <0x0 0x204>;
+			reg = <0x0 0x42200>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* to be filled by loader */
 			next-level-cache = <&l2_cache_2>;
@@ -203,7 +220,7 @@
 		cpu_p05: cpu@205 {
 			compatible = "apple,sotra";
 			device_type = "cpu";
-			reg = <0x0 0x205>;
+			reg = <0x0 0x42201>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* to be filled by loader */
 			next-level-cache = <&l2_cache_2>;
@@ -267,4 +284,76 @@
 		#size-cells = <2>;
 		ranges;
 	};
+
+	/*
+	 * Cluster 0 (M) P-states from the ADT, voltage-states22-sram: the
+	 * frequency in kHz per hardware P-state; opp-level is that P-state.
+	 * No clock-latency-ns, not measured. Clusters 1 and 2 follow when their
+	 * cores start (CPU-START.md).
+	 */
+	mcluster0_opp: opp-table-0 {
+		compatible = "operating-points-v2";
+		opp-shared;
+		opp01 {
+			opp-hz = /bits/ 64 <1344000000>;
+			opp-level = <1>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <1644000000>;
+			opp-level = <2>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <1992000000>;
+			opp-level = <3>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <2304000000>;
+			opp-level = <4>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <2652000000>;
+			opp-level = <5>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <2964000000>;
+			opp-level = <6>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <3240000000>;
+			opp-level = <7>;
+		};
+		opp08 {
+			opp-hz = /bits/ 64 <3504000000>;
+			opp-level = <8>;
+		};
+		opp09 {
+			opp-hz = /bits/ 64 <3696000000>;
+			opp-level = <9>;
+		};
+		opp10 {
+			opp-hz = /bits/ 64 <3876000000>;
+			opp-level = <10>;
+		};
+		opp11 {
+			opp-hz = /bits/ 64 <4044000000>;
+			opp-level = <11>;
+		};
+		opp12 {
+			opp-hz = /bits/ 64 <4176000000>;
+			opp-level = <12>;
+		};
+		opp13 {
+			opp-hz = /bits/ 64 <4284000000>;
+			opp-level = <13>;
+		};
+		opp14 {
+			opp-hz = /bits/ 64 <4308000000>;
+			opp-level = <14>;
+		};
+		opp15 {
+			opp-hz = /bits/ 64 <4380000000>;
+			opp-level = <15>;
+		};
+	};
+
 };
