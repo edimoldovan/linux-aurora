@@ -15,6 +15,7 @@
 #include <linux/jiffies.h>
 #include <linux/kconfig.h>
 #include <linux/kernel.h>
+#include <linux/kref.h>
 #include <linux/module.h>
 #include <linux/mux/driver.h>
 #include <linux/soc/apple/dp-tunnel.h>
@@ -55,6 +56,7 @@
 #include "dptx-service.h"
 #include "iomfb.h"
 #include "ibootep.h"
+#include "iomfb_internal.h"
 #include "parser.h"
 #include "trace.h"
 
@@ -208,6 +210,32 @@ static bool unstable_edid = true;
 module_param(unstable_edid, bool, 0644);
 MODULE_PARM_DESC(unstable_edid, "Enable unstable EDID retrival support");
 
+/* The firmware 27 pair shares dcp_peer_lock and dcp_peer_forget(). */
+static DEFINE_MUTEX(dcp_peer_lock);
+
+static void dcp_peer_forget(struct apple_dcp *dcp)
+{
+	guard(mutex)(&dcp_peer_lock);
+	dcp->peer_unbinding = true;
+	if (dcp->peer_reserved) {
+		dcp->peer_reserved->peer_owner = NULL;
+		memset(&dcp->peer_reserved->peer_tiling, 0,
+		       sizeof(dcp->peer_reserved->peer_tiling));
+		dcp->peer_reserved = NULL;
+		memset(&dcp->peer_tiling, 0, sizeof(dcp->peer_tiling));
+	}
+	if (dcp->peer_owner) {
+		memset(&dcp->peer_owner->peer_tiling, 0,
+		       sizeof(dcp->peer_owner->peer_tiling));
+		memset(&dcp->peer_tiling, 0, sizeof(dcp->peer_tiling));
+		dcp->peer_owner->peer_reserved = NULL;
+		dcp->peer_owner = NULL;
+	}
+}
+
+#include "dcp-peer-v27.inc"
+#include "dcp-peer-probe-v27.inc"
+
 static void disconnected_hpd_event(struct apple_connector *connector);
 
 bool dcp_is_external_h17p(struct apple_dcp *dcp)
@@ -322,7 +350,7 @@ void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now)
 	spin_unlock_irqrestore(&crtc->base.dev->event_lock, flags);
 }
 
-static bool dcp_firmware_metadata_enabled(struct apple_dcp *dcp)
+bool dcp_firmware_metadata_enabled(struct apple_dcp *dcp)
 {
 	return dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL;
 }
@@ -772,6 +800,7 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
 		return;
 	}
 	dcp->crashed = true;
+	dcp_peer_forget(dcp);
 	dev_err(dcp->dev, "DCP has crashed\n");
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
 	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
@@ -2429,6 +2458,7 @@ int dcp_start(struct platform_device *pdev)
 	init_completion(&dcp->start_done);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6)
 		return iomfb_v26_6_start(dcp);
+	init_completion(&dcp->typec_display_ready);
 
 	/*
 	 * The T6030 firmware session is adopted for the internal panel.
@@ -2470,7 +2500,9 @@ int dcp_start(struct platform_device *pdev)
 				 ret);
 	}
 
-	if (dcp->phy && dcp->fw_compat >= DCP_FIRMWARE_V_13_5) {
+	if ((dcp->phy || (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+			  dcp->hw.num_dptx_ports)) &&
+	    dcp->fw_compat >= DCP_FIRMWARE_V_13_5) {
 		ret = ibootep_init(dcp);
 		if (ret)
 			dev_warn(dcp->dev, "Failed to start IBOOT endpoint: %d\n",
@@ -2604,6 +2636,9 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_H17P:
 		iomfb_poweroff_h17p(dcp);
 		break;
+	case DCP_FIRMWARE_V_27_0:
+		iomfb_poweroff_v27(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -2695,6 +2730,9 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_H17P:
 		iomfb_sleep_h17p(dcp);
 		break;
+	case DCP_FIRMWARE_V_27_0:
+		iomfb_sleep_v27(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -2705,8 +2743,10 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 
 static bool dcp_uses_soft_dpms(struct apple_dcp *dcp)
 {
-	return (dcp_backlight_active(dcp) && dcp_has_panel(dcp)) ||
-	       (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	/* The 14.7 panel has its own known-level blank and restore hooks. */
+	return (!iomfb_v14_7_panel_nits(dcp) &&
+		dcp_backlight_active(dcp) && dcp_has_panel(dcp)) ||
+	       ((dcp->fw_compat == DCP_FIRMWARE_H17P || dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
 		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 		dcp->connector_type == DRM_MODE_CONNECTOR_eDP);
 }
@@ -2754,10 +2794,13 @@ void dcp_poweron(struct platform_device *pdev)
 	}
 
 	if (dcp_uses_soft_dpms(dcp)) {
-		if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		if ((dcp->fw_compat == DCP_FIRMWARE_H17P || dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
 		    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 		    !READ_ONCE(dcp->pipe_enabled_h17p)) {
-			iomfb_poweron_h17p(dcp);
+			if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+				iomfb_poweron_v27(dcp);
+			else
+				iomfb_poweron_h17p(dcp);
 			if (!READ_ONCE(dcp->pipe_enabled_h17p)) {
 				dev_err(dcp->dev, "initial display pipe enable failed\n");
 				WRITE_ONCE(dcp->crashed, true);
@@ -2844,6 +2887,9 @@ void dcp_poweron(struct platform_device *pdev)
 		break;
 	case DCP_FIRMWARE_H17P:
 		iomfb_poweron_h17p(dcp);
+		break;
+	case DCP_FIRMWARE_V_27_0:
+		iomfb_poweron_v27(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -3359,6 +3405,23 @@ static int dcp_get_disp_regs(struct apple_dcp *dcp)
 	}
 
 	dcp->nr_disp_registers = count;
+	for (i = 0; i < count; i++)
+		dcp->disp_firmware_base[i] = dcp->disp_registers[i]->start;
+	if (of_property_present(dcp->dev->of_node, "apple,firmware-physical-regs")) {
+		if (of_property_count_u64_elems(dcp->dev->of_node,
+					       "apple,firmware-physical-regs") != count)
+			return -EINVAL;
+		ret = of_property_read_u64_array(dcp->dev->of_node,
+					       "apple,firmware-physical-regs",
+					       dcp->disp_firmware_base, count);
+		if (ret)
+			return ret;
+		for (i = 0; i < count; i++)
+			if (!IS_ALIGNED(dcp->disp_firmware_base[i], 4) ||
+			    resource_size(dcp->disp_registers[i]) >
+			    U64_MAX - dcp->disp_firmware_base[i])
+				return -EINVAL;
+	}
 	return 0;
 }
 
@@ -3413,6 +3476,13 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	char compat_str[DCP_FW_VERSION_STR_LEN];
 	char fw_str[DCP_FW_VERSION_STR_LEN];
 	int ret;
+
+	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
+		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
+		if (ret < 0 || strcmp(compat_str, "27.0.0"))
+			return DCP_FIRMWARE_UNKNOWN;
+		return DCP_FIRMWARE_V_27_0;
+	}
 
 	/*
 	 * SoCs introduced with H17-generation firmware pin its interface; the
@@ -3593,6 +3663,43 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 	}
 }
 
+static int dcp_firmware_metadata_v27(struct apple_dcp *dcp)
+{
+	struct device *dev = dcp->dev;
+	struct device_node *fb;
+	struct resource resource;
+	int clocks, index, ret;
+
+	index = of_property_match_string(dev->of_node, "memory-region-names",
+					 "framebuffer");
+	if (index < 0)
+		return -EINVAL;
+	fb = of_parse_phandle(dev->of_node, "memory-region", index);
+	if (!fb)
+		return -EINVAL;
+	ret = of_address_to_resource(fb, 0, &resource);
+	of_node_put(fb);
+	if (ret)
+		return ret;
+	dcp->dfb_region_size = resource_size(&resource);
+	if (!dcp->dfb_region_size)
+		return -EINVAL;
+
+	clocks = of_property_count_u32_elems(dev->of_node, "apple,clock-ids");
+	if (clocks == -ENODATA &&
+	    of_property_present(dev->of_node, "apple,clock-ids"))
+		clocks = 0;
+	if (clocks < 0 || clocks > 64)
+		return -EINVAL;
+	ret = devm_clk_bulk_get_all(dev, &dcp->firmware_clocks);
+	if (ret < 0)
+		return ret;
+	if (ret != clocks)
+		return -EINVAL;
+	dcp->num_firmware_clocks = clocks;
+	return 0;
+}
+
 static bool dcp_external_is_idle(struct apple_dcp *dcp)
 {
 	u32 control = readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
@@ -3690,6 +3797,14 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	u32 cpu_ctrl;
 	int ret;
 
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		INIT_LIST_HEAD(&dcp->iomfb_boolean_properties);
+		ret = devm_add_action_or_reset(dev,
+				       iomfb_firmware_state_cleanup_v27, dcp);
+		if (ret)
+			return ret;
+	}
+
 	if (READ_ONCE(dcp->quiescing))
 		return dev_err_probe(dev, -EBUSY,
 				     "Live DCP session cannot be rebound; reboot required\n");
@@ -3713,7 +3828,8 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		return dev_err_probe(dev, ret,
 				     "Previous scanout has not been stopped\n");
 
-	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
+	ret = dma_set_mask_and_coherent(dev,
+				DMA_BIT_MASK(dcp->hw.firmware_dma_bits ?: 42));
 	if (ret)
 		return ret;
 
@@ -3838,7 +3954,17 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		goto err_piodma;
 	}
 
-	dcp->clk = devm_clk_get(dev, NULL);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		ret = dcp_firmware_metadata_v27(dcp);
+		if (ret)
+			goto err_piodma;
+	}
+	/*
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp->num_firmware_clocks)
+		dcp->clk = devm_clk_get_optional(dev, NULL);
+	else
+		dcp->clk = devm_clk_get(dev, NULL);
 	if (IS_ERR(dcp->clk)) {
 		ret = dev_err_probe(dev, PTR_ERR(dcp->clk),
 				    "Unable to find clock\n");
@@ -3963,6 +4089,7 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 
 	if (!dcp)
 		return;
+	dcp_peer_forget(dcp);
 	/*
 	 * Stop the native initializer before looking up its owner, including
 	 * the dead-session path. Owner allocation may have landed in an open
@@ -5074,7 +5201,24 @@ static const struct apple_dcp_hw_data apple_dcp_hw_dcpext = {
 	.num_dptx_ports = 2,
 };
 
+/* T6050 (J714c): firmware 27, the session the boot loader leaves running. */
+static const struct apple_dcp_hw_data apple_dcp_hw_t6050 = {
+	.firmware_dma_bits = 41,
+	.num_dptx_ports = 0,
+	.adopt_live_session = true,
+	.firmware_compat = DCP_FIRMWARE_V_27_0,
+};
+
+static const struct apple_dcp_hw_data apple_dcp_hw_t6050_dcpext = {
+	.firmware_dma_bits = 41,
+	.num_dptx_ports = 2,
+	.adopt_live_session = true,
+	.firmware_compat = DCP_FIRMWARE_V_27_0,
+};
+
 static const struct of_device_id of_match[] = {
+	{ .compatible = "apple,t6050-dcp", .data = &apple_dcp_hw_t6050 },
+	{ .compatible = "apple,t6050-dcpext", .data = &apple_dcp_hw_t6050_dcpext },
 	{ .compatible = "apple,t6020-dcp", .data = &apple_dcp_hw_t6020,  },
 	{ .compatible = "apple,t6020-dcpext", .data = &apple_dcp_hw_t6020_dcpext, },
 	{ .compatible = "apple,t8112-dcp", .data = &apple_dcp_hw_t8112,  },
@@ -5099,6 +5243,7 @@ static struct platform_driver apple_platform_driver = {
 	.shutdown	= dcp_platform_shutdown,
 	.driver	= {
 		.name = "apple-dcp",
+		.dev_groups = dcp_peer_probe_groups,
 		.of_match_table	= of_match,
 		.pm = pm_sleep_ptr(&dcp_platform_pm_ops),
 	},

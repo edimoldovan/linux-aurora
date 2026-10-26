@@ -75,4 +75,13 @@ void iomfb_v14_7_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
 void iomfb_v14_7_poweron(struct apple_dcp *dcp);
 void iomfb_v14_7_poweroff(struct apple_dcp *dcp);
 
+/*
+ * The 14.7 nits backlight policy (T6030 board record) is not in this tree;
+ * the firmware-27 port's callers see no 14.7 panel.
+ */
+static inline bool iomfb_v14_7_panel_nits(struct apple_dcp *dcp)
+{
+	return false;
+}
+
 #endif /* __APPLE_IOMFB_V14_7_H__ */

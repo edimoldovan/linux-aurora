@@ -17,6 +17,15 @@
  * H17-generation firmware (26.0 and later) keeps the earlier layout and
  * extends it with its own fields.
  */
+/* Desktop 26.x firmware flag (no desktop DCP is driven in this tree). */
+#define DCP_FW_DESKTOP (1 << 24)
+#define DCP_FW_VERSION_DESKTOP(x, y, z) (DCP_FW_VERSION(x, y, z) | DCP_FW_DESKTOP)
+#define DCP_FW_H17(ver) \
+	((ver) >= DCP_FW_VERSION(26, 0, 0) && !((ver) & DCP_FW_DESKTOP))
+#define DCP_FW_DESKTOP_26(ver) \
+	(((ver) & DCP_FW_DESKTOP) && \
+	 ((ver) & ~DCP_FW_DESKTOP) >= DCP_FW_VERSION(26, 0, 0))
+
 #define DCP_FW_LAYOUT_14_7(ver) \
 	((ver) >= DCP_FW_VERSION(14, 7, 0) && (ver) < DCP_FW_VERSION(26, 0, 0))
 
@@ -38,6 +47,12 @@ enum dcp_firmware_version {
 	DCP_FIRMWARE_H17P,
 	/* J613 macOS 26.6.2 (25G83) IOMFB over DCPLink (iomfb_v26_6.c). */
 	DCP_FIRMWARE_V_26_6,
+	/* T8132/J713 retained EP37 session (not driven in this tree). */
+	DCP_FIRMWARE_M4,
+	/* T6041 desktop 26.6 IOMFB (not driven in this tree). */
+	DCP_FIRMWARE_V_26_6_DESKTOP,
+	/* T6050 (J714c) firmware 27 over DCPLink (iomfb_v27.c). */
+	DCP_FIRMWARE_V_27_0,
 };
 
 #endif /*__APPLE_VERSION_UTILS_H__*/

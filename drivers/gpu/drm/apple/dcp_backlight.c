@@ -93,6 +93,13 @@ static u32 brightness_part2[] = {
 #define DCP_BL_FADE_MS		250U
 #define DCP_BL_FADE_STEP_MS	16U
 
+static bool dcp_backlight_presents_nits(struct apple_dcp *dcp)
+{
+	return ((dcp->fw_compat == DCP_FIRMWARE_H17P || dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
+		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) ||
+	       iomfb_v14_7_panel_nits(dcp);
+}
+
 bool dcp_backlight_active(struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_H17P &&
@@ -144,8 +151,9 @@ int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,
 	unsigned long flags;
 	int ret;
 
-	if (dcp->fw_compat != DCP_FIRMWARE_H17P || !dcp_has_panel(dcp) ||
-	    !dcp->crtc || !kick)
+	if ((dcp->fw_compat != DCP_FIRMWARE_H17P && dcp->fw_compat != DCP_FIRMWARE_V_27_0 &&
+	     !iomfb_is_m4(dcp) && !iomfb_v14_7_panel_nits(dcp)) ||
+	    !dcp_has_panel(dcp) || !dcp->crtc || !kick)
 		return -EINVAL;
 
 	mutex_lock(&dcp->bl_register_mutex);
