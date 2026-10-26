@@ -544,19 +544,20 @@ static int __init t6050_wdtmon_ping_setup(char *s)
 }
 __setup("t6050_wdtmon_ping=", t6050_wdtmon_ping_setup);
 
-static void __iomem *t6050_wdtmon_w, *t6050_wdtmon_s;
+static void __iomem *t6050_wdtmon_w, *t6050_wdtmon_s, *t6050_wdtmon_p, *t6050_wdtmon_q;
 static struct delayed_work t6050_wdtmon_work;
 
 static void t6050_wdtmon_fn(struct work_struct *work)
 {
 	void __iomem *w = t6050_wdtmon_w;
 
-	pr_emerg("wdtmon %4lld s: wd0 %08x/%08x/%08x c%x  wd1 %08x/%08x c%x  wd2 %08x/%08x c%x  sec %08x\n",
+	pr_emerg("wdtmon %4lld s: wd0 %08x/%08x/%08x c%x  wd1 %08x/%08x c%x  wd2 %08x/%08x c%x  sec %08x  p20 %08x p2c %08x p5260 %08x\n",
 		 (long long)ktime_get_boottime_seconds(),
 		 readl_relaxed(w), readl_relaxed(w + 4), readl_relaxed(w + 8), readl_relaxed(w + 0xc),
 		 readl_relaxed(w + 0x10), readl_relaxed(w + 0x14), readl_relaxed(w + 0x1c),
 		 readl_relaxed(w + 0x20), readl_relaxed(w + 0x24), readl_relaxed(w + 0x2c),
-		 readl_relaxed(t6050_wdtmon_s));
+		 readl_relaxed(t6050_wdtmon_s), readl_relaxed(t6050_wdtmon_p + 0x20),
+		 readl_relaxed(t6050_wdtmon_p + 0x2c), readl_relaxed(t6050_wdtmon_q));
 	if (t6050_wdtmon_ping)
 		writel_relaxed(0, w + 0x10);
 	schedule_delayed_work(&t6050_wdtmon_work, t6050_wdtmon * HZ);
@@ -568,7 +569,9 @@ static int __init t6050_wdtmon_start(void)
 		return 0;
 	t6050_wdtmon_w = ioremap(0x28836c000, 0x40);
 	t6050_wdtmon_s = ioremap(0x288330008, 0x4);
-	if (!t6050_wdtmon_w || !t6050_wdtmon_s)
+	t6050_wdtmon_p = ioremap(0x288330000, 0x40);
+	t6050_wdtmon_q = ioremap(0x288335260, 0x4);
+	if (!t6050_wdtmon_w || !t6050_wdtmon_s || !t6050_wdtmon_p || !t6050_wdtmon_q)
 		return 0;
 	INIT_DELAYED_WORK(&t6050_wdtmon_work, t6050_wdtmon_fn);
 	schedule_delayed_work(&t6050_wdtmon_work, 0);
