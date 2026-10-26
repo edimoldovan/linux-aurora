@@ -164,7 +164,8 @@ impl crate::g17::Shared {
             let firmware = (*state).as_deref_mut().ok_or(EIO)?;
             self.note_changed();
             if firmware.render_grow_pending() || firmware.queues.render.take_missed_event(slot as u8) {
-                self.queue_events();
+                // Observation and the growth check run on every pass.
+                self.queue_event_records();
             }
             if !epoch.is_current()
                 || firmware.recovery.pending()

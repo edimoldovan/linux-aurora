@@ -65,6 +65,7 @@ use core::ops::Range;
 use core::sync::atomic::{
     AtomicBool,
     AtomicU32,
+    AtomicU64,
     Ordering, //
 };
 
@@ -369,7 +370,7 @@ impl rtkit::Operations for RoleOps {
         if !is_events_message(ep, msg) {
             return false;
         }
-        data.shared.queue_events();
+        data.shared.queue_event_records();
         true
     }
 
@@ -859,6 +860,11 @@ struct Shared {
     compute_demand: AtomicU32,
     #[pin]
     work: Work<Shared, EVENT_WORK>,
+    /// The next event pass runs every housekeeping step: set by every [`Self::queue_events`]
+    /// request, not by the firmware's event notification ([`Self::queue_event_records`]).
+    housekeeping: AtomicBool,
+    /// When an event pass last ran every housekeeping step, in ns.
+    housekeeping_ns: AtomicU64,
     #[pin]
     poll: DelayedWork<Shared, POLL_WORK>,
     #[pin]
@@ -991,8 +997,17 @@ impl Shared {
         self.port.store(core::ptr::null_mut(), Ordering::Release);
     }
 
-    /// Queues the event worker. Callable from any context.
+    /// Queues the event worker for a pass that runs every housekeeping step. Callable from any
+    /// context.
     fn queue_events(self: &Arc<Self>) {
+        self.housekeeping.store(true, Ordering::Release);
+        self.queue_event_records();
+    }
+
+    /// Queues the event worker for firmware records alone: completions, or records that arrived
+    /// during a pass. The pass skips the housekeeping that nothing needs (see
+    /// `runtime_event_turn`). Callable from any context.
+    fn queue_event_records(self: &Arc<Self>) {
         // Already queued if this fails, which is just as good.
         let _ = workqueue::system_highpri().enqueue::<Arc<Shared>, EVENT_WORK>(self.clone());
     }
@@ -1191,6 +1206,8 @@ impl Gpu {
                 renders,
                 compute_demand: AtomicU32::new(0),
                 work <- new_work!("g17::Shared::work"),
+                housekeeping: AtomicBool::new(true),
+                housekeeping_ns: AtomicU64::new(0),
                 poll <- new_delayed_work!("g17::Shared::poll"),
                 idle <- new_delayed_work!("g17::Shared::idle"),
                 grow <- new_work!("g17::Shared::grow"),

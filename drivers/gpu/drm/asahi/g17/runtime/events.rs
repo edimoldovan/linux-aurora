@@ -15,6 +15,9 @@ use kernel::{prelude::*, sync::Arc};
 
 /// Wake interval while a tiler heap may still shrink: the native check period.
 const SHRINK_WAKE_NS: u64 = 1_000_000_000;
+/// Longest interval between two event passes that run every housekeeping step while
+/// completion records alone keep the worker busy.
+const HOUSEKEEPING_NS: u64 = 1_000_000;
 
 struct Service<'a> {
     firmware: &'a mut Firmware,
@@ -390,6 +393,10 @@ impl crate::g17::Shared {
     }
 
     fn runtime_event_turn(self: &Arc<Self>, deferred: &mut DeferredBatch) -> Result {
+        // Taken before consuming records: a request made during this pass gets the next one.
+        let requested = self
+            .housekeeping
+            .swap(false, core::sync::atomic::Ordering::AcqRel);
         let (recover, masks) = {
             let mut state = self.state.lock();
             let Some(firmware) = (*state).as_deref_mut() else {
@@ -450,24 +457,42 @@ impl crate::g17::Shared {
             .any(|queue| queue.in_flight());
         let in_flight = compute || firmware.queues.render_in_flight();
         let idle = firmware.idle_check(now, in_flight)?;
-        let lingers = if firmware.recovery.pending() {
-            None
-        } else {
-            firmware.expire_render_lingers(now)?
-        };
-        firmware.reclaim_drained_renders(deferred)?;
-        firmware.service_compute_exit(deferred)?;
-        let pools = firmware.service_compute_pools(deferred, now)?;
+        // Expiries, drained pairs, exits, pool and heap trimming and teardown give back what
+        // retirement freed; a completion needs none of them to retire or to signal. While work
+        // is in flight and nothing waits for capacity, a pass for firmware records alone skips
+        // them. Any requested pass, recovery, teardown, a waiter, the last retirement and, at
+        // the latest, the first pass after HOUSEKEEPING_NS run them all.
+        let housekeeping = requested
+            || recover
+            || !in_flight
+            || firmware.recovery.pending()
+            || !firmware.queues.teardown.is_empty()
+            || self.channels.has_waiters()
+            || self.progress.has_waiters()
+            || self.queues.has_waiters()
+            || self.renders.has_waiters()
+            || now.saturating_sub(self.housekeeping_ns.load(core::sync::atomic::Ordering::Relaxed))
+                >= HOUSEKEEPING_NS;
+        let mut lingers = None;
+        let mut pools = None;
         let mut shrinking = false;
-        if !firmware.recovery.pending() {
-            firmware
-                .queues
-                .vacate_evicted_render_pools(&firmware.init, deferred)?;
-            shrinking = firmware
-                .queues
-                .shrink_render_heaps(&firmware.init, now, deferred);
-        }
-        {
+        if housekeeping {
+            self.housekeeping_ns
+                .store(now, core::sync::atomic::Ordering::Relaxed);
+            if !firmware.recovery.pending() {
+                lingers = firmware.expire_render_lingers(now)?;
+            }
+            firmware.reclaim_drained_renders(deferred)?;
+            firmware.service_compute_exit(deferred)?;
+            pools = firmware.service_compute_pools(deferred, now)?;
+            if !firmware.recovery.pending() {
+                firmware
+                    .queues
+                    .vacate_evicted_render_pools(&firmware.init, deferred)?;
+                shrinking = firmware
+                    .queues
+                    .shrink_render_heaps(&firmware.init, now, deferred);
+            }
             let mut reclaim = self.reclaim.lock();
             firmware.service_teardown(&mut reclaim)?;
             if !reclaim.is_empty() {
@@ -519,7 +544,7 @@ impl crate::g17::Shared {
         {
             // A full bounded pass must not depend on a fresh notification for
             // records that arrived while it was consuming the same ring.
-            self.queue_events();
+            self.queue_event_records();
         }
         let grow_ready = firmware.render_grow_ready();
         drop(state);

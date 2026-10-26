@@ -220,7 +220,8 @@ impl crate::g17::Firmware {
     ) -> Result {
         self.queues.render.return_pair(slot, &mut loan.pair)?;
         if self.queues.render.take_missed_event(slot) {
-            self.primary.state.shared.queue_events();
+            // The record is retired by the next pass's observation, like any completion.
+            self.primary.state.shared.queue_event_records();
         }
         let entry = self.queues.render.entry_mut(slot)?;
         // A failure or timeout recorded against the lent pair is settled by the
