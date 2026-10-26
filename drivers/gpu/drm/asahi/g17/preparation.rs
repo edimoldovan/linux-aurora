@@ -361,9 +361,9 @@ mod compute_deadline_tests {
     #[test]
     fn recovery_and_binding_retry_churn_cannot_renew_budget() {
         let gate = Gate::new().unwrap();
-        let start = super::super::now_ns();
+        let deadline = super::super::now_ns() + 20_000_000;
         let check = || Ok(());
-        let admission = Admission::new(start + 20_000_000, &check);
+        let admission = Admission::new(deadline, &check);
         loop {
             // Re-entry models a channel taken between admission/publication.
             // Recovery joins each dropped lease, then wakes the same budget.
@@ -371,12 +371,17 @@ mod compute_deadline_tests {
             gate.changed.notify_all();
             gate.wait_drained();
             assert!(gate.reopen());
+            // However often the gate reopened, an attempt that starts at the deadline
+            // is refused. Timing the whole loop would also count time descheduled.
+            let attempted = super::super::now_ns();
             match gate.enter_until(&admission) {
-                Ok(lease) => drop(lease),
+                Ok(lease) => {
+                    assert!(attempted < deadline);
+                    drop(lease);
+                }
                 Err(error) => { assert_eq!(error, EBUSY); break; }
             }
         }
-        assert!(super::super::now_ns() - start < 500_000_000);
         assert_eq!(gate.state.load(Ordering::Acquire) & COUNT_MASK, 0);
     }
 
