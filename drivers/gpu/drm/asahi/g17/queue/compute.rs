@@ -600,8 +600,9 @@ pub(crate) struct Queue {
     source_readers: Arc<core::sync::atomic::AtomicU32>,
     source_hint: crate::g17::sync_input::ReaderHint,
     /// The doorbell withheld from publications that had [`WITHHOLD_DEPTH`] - 1 or more
-    /// unretired commands of this queue ahead of them, the publication of the first, and the
-    /// compute work slots written at its priority once its slot was.
+    /// unretired commands of this queue ahead of them, the publication of the first of them
+    /// that no doorbell has announced, and the compute work slots written at its priority once
+    /// the last one's slot was.
     withheld_doorbell: Option<(u64, u64, u64)>,
 }
 
@@ -2007,6 +2008,8 @@ pub(crate) trait Host {
         -> Result;
     fn notify_compute(&mut self, priority: u8, message: u64) -> Result;
     fn compute_written(&self, priority: u8) -> u64;
+    /// Compute work slots at `priority` that a doorbell has announced.
+    fn compute_announced(&self, priority: u8) -> u64;
     fn note_submission(&mut self) -> Result;
 }
 
@@ -2358,6 +2361,15 @@ impl Queue {
                 && self.withheld_doorbell.is_none_or(|(withheld, _, _)| withheld == doorbell)
             {
                 let written = host.compute_written(policy.priority());
+                // Once another doorbell announced every slot the withheld one covered, it
+                // starts over from this publication: it then waits for this command's own
+                // predecessors rather than for those of slots already announced.
+                if self
+                    .withheld_doorbell
+                    .is_some_and(|(_, _, last)| host.compute_announced(policy.priority()) >= last)
+                {
+                    self.withheld_doorbell = None;
+                }
                 let entry = self.withheld_doorbell.get_or_insert((doorbell, published, written));
                 entry.2 = written;
             } else {
