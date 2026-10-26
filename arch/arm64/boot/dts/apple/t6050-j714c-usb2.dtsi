@@ -2,11 +2,12 @@
 /*
  * USB 2.0 host on USB-C ports 0, 1 and 2 of the MacBook Pro 14" (M5 Max, J714c).
  *
- * The T6050 Type-C PHY has no Linux driver yet (see t6050-j714c-usb.dtsi).
- * The loader leaves the port's usb2phy in USB 2.0 host mode before starting
- * the kernel (usb_t6050_host_prep) with the controller already flipped to
- * host, so only the xHCI registers are described, for the generic xHCI
- * platform driver. Addresses from
+ * The full T6050 Type-C PHY has no Linux driver yet (see t6050-j714c-usb.dtsi).
+ * Each port's apple,t6050-usb2-phy puts its usb2phy, pipe handler and dwc3
+ * core into USB 2.0 host mode (the loader's usb_t6050_host_prep sequence),
+ * and the generic xHCI platform driver drives the xHCI registers after
+ * phy_init(). PHY windows: atc-phyN reg 0 (usb2phy) and usb-drdN reg 3
+ * (pipe handler). Addresses from
  * the ADT: usb-drd0 0x2a2280000, dart-usb0 0x2a2f00000/0x2a2f80000,
  * usb-drd1 0x2aa280000, dart-usb1 0x2aaf00000/0x2aaf80000,
  * usb-drd2 0x382280000, dart-usb2 0x382f00000/0x382f80000.
@@ -22,12 +23,23 @@
 };
 
 &soc {
+	usb2phy_0: phy@2a2a90000 {
+		compatible = "apple,t6050-usb2-phy";
+		reg = <0x2 0xa2a90000 0x0 0x4000>, <0x2 0xa2a84000 0x0 0x4000>,
+		      <0x2 0xa2280000 0x0 0x11800>;
+		reg-names = "usb2phy", "pipehandler", "core";
+		#phy-cells = <0>;
+		power-domains = <&ps_atc0_usb>;
+	};
+
 	dwc3_0: usb@2a2280000 {
 		compatible = "generic-xhci";
 		reg = <0x2 0xa2280000 0x0 0x8000>;
 		interrupts = <AIC_IRQ 1419 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&dwc3_0_dart_0 0>, <&dwc3_0_dart_1 1>;
 		power-domains = <&ps_atc0_usb>;
+		phys = <&usb2phy_0>;
+		phy-names = "usb2-phy";
 	};
 
 	dwc3_0_dart_0: iommu@2a2f00000 {
@@ -48,12 +60,23 @@
 		apple,dma-range = <0x100 0x4000 0 0xffff0000>;
 	};
 
+	usb2phy_1: phy@2aaa90000 {
+		compatible = "apple,t6050-usb2-phy";
+		reg = <0x2 0xaaa90000 0x0 0x4000>, <0x2 0xaaa84000 0x0 0x4000>,
+		      <0x2 0xaa280000 0x0 0x11800>;
+		reg-names = "usb2phy", "pipehandler", "core";
+		#phy-cells = <0>;
+		power-domains = <&ps_atc1_usb>;
+	};
+
 	dwc3_1: usb@2aa280000 {
 		compatible = "generic-xhci";
 		reg = <0x2 0xaa280000 0x0 0x8000>;
 		interrupts = <AIC_IRQ 1451 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&dwc3_1_dart_0 0>, <&dwc3_1_dart_1 1>;
 		power-domains = <&ps_atc1_usb>;
+		phys = <&usb2phy_1>;
+		phy-names = "usb2-phy";
 	};
 
 	dwc3_1_dart_0: iommu@2aaf00000 {
@@ -74,17 +97,23 @@
 		apple,dma-range = <0x100 0x4000 0 0xffff0000>;
 	};
 
+	usb2phy_2: phy@382a90000 {
+		compatible = "apple,t6050-usb2-phy";
+		reg = <0x3 0x82a90000 0x0 0x4000>, <0x3 0x82a84000 0x0 0x4000>,
+		      <0x3 0x82280000 0x0 0x11800>;
+		reg-names = "usb2phy", "pipehandler", "core";
+		#phy-cells = <0>;
+		power-domains = <&ps_atc2_usb>;
+	};
+
 	dwc3_2: usb@382280000 {
-		/*
-		 * The loader leaves the controller in host mode with the USB2
-		 * PHY running (usb_t6050_host_prep); only the xHCI host registers
-		 * are driven here, by the generic xHCI platform driver.
-		 */
 		compatible = "generic-xhci";
 		reg = <0x3 0x82280000 0x0 0x8000>;
 		interrupts = <AIC_IRQ 1483 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&dwc3_2_dart_0 0>, <&dwc3_2_dart_1 1>;
 		power-domains = <&ps_atc2_usb>;
+		phys = <&usb2phy_2>;
+		phy-names = "usb2-phy";
 	};
 
 	dwc3_2_dart_0: iommu@382f00000 {

@@ -40,3 +40,14 @@ config PHY_APPLE_DPTX
 	  such as the M2.
 	  This driver provides support for DisplayPort and is used on the
 	  Mac mini (M2 and M2 Pro, 2023).
+
+config PHY_APPLE_T6050_USB2
+	tristate "Apple T6050 Type-C port USB 2.0 host PHY"
+	depends on (ARM64 && ARCH_APPLE) || COMPILE_TEST
+	select GENERIC_PHY
+	help
+	  Puts a USB-C port of the Apple T6050 (M5 Pro/Max) into USB 2.0
+	  host mode for the generic xHCI platform driver. SuperSpeed and
+	  USB4 are not supported by this driver.
+
+	  If M is selected the module will be called 'phy-apple-t6050-usb2'.
