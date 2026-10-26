@@ -5474,11 +5474,30 @@ static const struct atcphy_hw atcphy_hw_t8142 = {
 	.has_usb4 = true,
 };
 
+static const struct atcphy_hw atcphy_hw_t6050 = {
+	/*
+	 * M5 Pro/Max Type-C PHY. Same T8122-family core as the M5 Air (t8142),
+	 * but the pipehandler mux uses the T8103 field layout - live silicon
+	 * parks the dummy PHY at MUX_CTRL=0x22, which only decodes as
+	 * DUMMY/DUMMY in the T8103 fields. The SuperSpeed/CIO tunables this
+	 * generation does not ship are optional: USB2 comes up without them.
+	 */
+	.configure_post_tunable = atcphy_configure_post_tunable_all_modes,
+	.gen = ATCPHY_GENERATION_T8122,
+	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8122,
+	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8122,
+	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8103,
+	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
+	.has_usb4 = true,
+	.optional_tunables = true,
+};
+
 static const struct of_device_id atcphy_match[] = {
 	{ .compatible = "apple,t8103-atcphy", .data = &atcphy_hw_t8103 },
 	{ .compatible = "apple,t8122-atcphy", .data = &atcphy_hw_t8122 },
 	{ .compatible = "apple,t8142-atcphy", .data = &atcphy_hw_t8142 },
 	{ .compatible = "apple,t8140-atcphy", .data = &atcphy_hw_t8140 },
+	{ .compatible = "apple,t6050-atcphy", .data = &atcphy_hw_t6050 },
 	{},
 };
 MODULE_DEVICE_TABLE(of, atcphy_match);
