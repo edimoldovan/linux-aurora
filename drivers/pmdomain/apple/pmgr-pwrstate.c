@@ -784,16 +784,19 @@ static int __init t6050_hcrst_early(void)
 			iounmap(m);
 		}
 	}
-	/* The loader's host-prep record: per port attempts, PORTSC after prep, before jump. */
+	/*
+	 * The loader's host-prep record: per port attempts, PORTSC after prep,
+	 * PORTSC before jump, ms until the connection showed.
+	 */
 	if (t6050_peek_n && of_chosen) {
-		u32 rec[12];
+		u32 rec[32];
 		int n = of_property_read_variable_u32_array(of_chosen, "apple,t6050-usbprep",
 							    rec, 1, ARRAY_SIZE(rec));
 
-		for (int i = 0; i + 2 < n; i += 3)
+		for (int i = 0; i + 3 < n; i += 4)
 			if (rec[i])
-				pr_emerg("usbprep port %d: %u attempts, portsc after prep %#x, before jump %#x\n",
-					 i / 3, rec[i], rec[i + 1], rec[i + 2]);
+				pr_emerg("usbprep port %d: %u attempts, ccs after %u ms, portsc after prep %#x, before jump %#x\n",
+					 i / 4, rec[i], rec[i + 3], rec[i + 1], rec[i + 2]);
 	}
 	return 0;
 }
