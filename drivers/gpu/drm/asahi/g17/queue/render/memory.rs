@@ -528,6 +528,8 @@ impl Memory {
 }
 
 const _: () = {
+    // Every unretired render of a pair holds its own command record.
+    assert!(DEPTH <= RECORDS);
     assert!(abi::TA_DESCRIPTOR_SIZE * RECORDS <= TA_BYTES);
     assert!(abi::FRAGMENT_SLOT_SIZE * RECORDS <= FRAGMENT_BYTES);
     assert!(RECORDS * CONFIG_STRIDE <= 0x4000);
