@@ -2508,9 +2508,6 @@ mod shared_capacity_tests {
             GFP_KERNEL,
         )
         .unwrap();
-        for owner in 1..=super::super::kick::COMPUTE_CHANNELS as u64 {
-            registry.reserve_compute(owner).unwrap();
-        }
         let mut slots = KVec::with_capacity(limit as usize, GFP_KERNEL).unwrap();
         let mut leases = KVec::with_capacity(limit as usize, GFP_KERNEL).unwrap();
         for owner in 1..=u64::from(limit) {
