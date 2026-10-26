@@ -57,6 +57,26 @@ struct apple_pmgr_ps {
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
 #define rcdev_to_apple_pmgr_ps(_rcdev) container_of(_rcdev, struct apple_pmgr_ps, rcdev)
 
+/*
+ * T6050 bring-up switches: t6050_noauto=1 skips the probe-time auto-PM enable,
+ * t6050_nomin=1 skips the probe-time minimum-state write.
+ */
+static bool t6050_noauto, t6050_nomin;
+
+static int __init t6050_noauto_setup(char *s)
+{
+	t6050_noauto = true;
+	return 1;
+}
+__setup("t6050_noauto", t6050_noauto_setup);
+
+static int __init t6050_nomin_setup(char *s)
+{
+	t6050_nomin = true;
+	return 1;
+}
+__setup("t6050_nomin", t6050_nomin_setup);
+
 static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool auto_enable)
 {
 	int ret;
@@ -350,7 +370,8 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	ps->firmware_owned = of_property_read_bool(node, "apple,firmware-owned");
 
 	ret = of_property_read_u32(node, "apple,min-state", &ps->min_state);
-	if (ret == 0 && ps->min_state <= APPLE_PMGR_PS_ACTIVE && !ps->firmware_owned)
+	if (ret == 0 && ps->min_state <= APPLE_PMGR_PS_ACTIVE && !ps->firmware_owned &&
+	    !t6050_nomin)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_PS_MIN,
 				   FIELD_PREP(APPLE_PMGR_PS_MIN, ps->min_state));
 
@@ -399,7 +420,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	}
 
 	/* Turn on auto-PM if the domain is already on, unless it must stay off */
-	if (active && !ps->firmware_owned)
+	if (active && !ps->firmware_owned && !t6050_noauto)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
 				   ps->no_auto_pm ? 0 : APPLE_PMGR_AUTO_ENABLE);
 
