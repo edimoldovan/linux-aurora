@@ -775,6 +775,26 @@ static int __init t6050_hcrst_early(void)
 {
 	if (t6050_hcrst_addr)
 		t6050_hcrst_try("early");
+	/* t6050_peek= words once, before the drivers probe. */
+	for (unsigned int i = 0; i < t6050_peek_n; i++) {
+		void __iomem *m = ioremap(t6050_peek_addr[i] & ~3ULL, 4);
+
+		if (m) {
+			pr_emerg("peek-entry %#llx = %#010x\n", t6050_peek_addr[i], readl(m));
+			iounmap(m);
+		}
+	}
+	/* The loader's host-prep record: per port attempts, PORTSC after prep, before jump. */
+	if (t6050_peek_n && of_chosen) {
+		u32 rec[12];
+		int n = of_property_read_variable_u32_array(of_chosen, "apple,t6050-usbprep",
+							    rec, 1, ARRAY_SIZE(rec));
+
+		for (int i = 0; i + 2 < n; i += 3)
+			if (rec[i])
+				pr_emerg("usbprep port %d: %u attempts, portsc after prep %#x, before jump %#x\n",
+					 i / 3, rec[i], rec[i + 1], rec[i + 2]);
+	}
 	return 0;
 }
 subsys_initcall(t6050_hcrst_early);
