@@ -108,6 +108,8 @@ pub(crate) use pgtable::{
     UAT_TOP_LEVEL_SHIFT, //
 };
 
+use pin_init;
+
 const DEBUG_CLASS: DebugFlags = DebugFlags::Mmu;
 
 mod bind;
@@ -366,7 +368,6 @@ struct VmInner {
     va_range: Range<u64>,
     page_table: UatPageTable,
     mapping_epoch: Option<Arc<MappingEpoch>>,
-    bind_sequence: Arc<AtomicU64>,
     epoch: Option<u64>,
     mm: mm::Allocator<(), KernelMappingInner>,
     uat_inner: Arc<UatInner>,
@@ -425,11 +426,6 @@ struct VmBinding {
 /// Data associated with a VM <=> BO pairing
 #[pin_data]
 struct VmBoData {
-    /// Highest sequence assigned to a GPUVA linked to this VM/BO pair.
-    ///
-    /// Map steps update this monotonically under the VM reservation before
-    /// linking the GPUVA. Remap pieces keep their original sequence.
-    newest_bind: AtomicU64,
     #[pin]
     segments: Mutex<Option<SgSegments>>,
 }
@@ -485,9 +481,6 @@ struct StepContext<'ctx> {
 
     /// Preallocated resources that can be used when executing the request.
     resources: &'ctx mut VmOpResources,
-
-    /// Sequence assigned by the successful map for its related metadata.
-    bind_sequence: u64,
 }
 
 impl<'ctx> StepContext<'ctx> {
@@ -500,7 +493,6 @@ impl<'ctx> StepContext<'ctx> {
             dev,
             prot,
             resources,
-            bind_sequence: 0,
         })
     }
 
@@ -531,7 +523,6 @@ impl<'ctx> StepContext<'ctx> {
 #[derive(Default, Clone)]
 struct VmGpuVa {
     prot: Option<Prot>,
-    bind_sequence: u64,
 }
 
 impl gpuvm::DriverGpuVm for VmInner {
@@ -550,11 +541,6 @@ impl gpuvm::DriverGpuVm for VmInner {
         op: OpMap<'op, Self>,
         ctx: &mut Self::SmContext<'ctx>,
     ) -> Result<OpMapped<'op, Self>, Error> {
-        let bind_sequence = self.bind_sequence.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |value| value.checked_add(1),
-        ).map_err(|_| EOVERFLOW)? + 1;
         let _mutation = self.mapping_mutation();
         let (map_addr, map_length) = (op.addr(), op.length() as usize);
         let mut iova = op.addr();
@@ -627,18 +613,12 @@ impl gpuvm::DriverGpuVm for VmInner {
                 return Err(error);
             }
         };
-        op.vm_bo()
-            .data()
-            .newest_bind
-            .fetch_max(bind_sequence, Ordering::Relaxed);
         let op = op.insert(
             gpuva,
             VmGpuVa {
                 prot: Some(ctx.prot),
-                bind_sequence,
             },
         );
-        ctx.bind_sequence = bind_sequence;
 
         self.tlbi_contexts_naming_root(map_addr, map_length);
         Ok(op)
@@ -664,7 +644,6 @@ impl gpuvm::DriverGpuVm for VmInner {
         ctx: &mut Self::SmContext<'ctx>,
     ) -> Result<OpRemapped<'op, Self>, Error> {
         let orig_prot = op.va_to_unmap().data().prot.ok_or(EINVAL)?;
-        let orig_bind_sequence = op.va_to_unmap().data().bind_sequence;
         let orig_invalidated = op.va_to_unmap().flags().contains(GpuVaFlag::INVALIDATED);
 
         // Only unmap the hole between prev/next, if they exist
@@ -730,11 +709,9 @@ impl gpuvm::DriverGpuVm for VmInner {
             [prev_gpuva, next_gpuva],
             VmGpuVa {
                 prot: Some(orig_prot),
-                bind_sequence: orig_bind_sequence,
             },
             VmGpuVa {
                 prot: Some(orig_prot),
-                bind_sequence: orig_bind_sequence,
             },
         );
 
@@ -1015,11 +992,9 @@ impl VmInner {
 /// Shared reference to a virtual memory address space ([`Vm`]).
 #[derive(Clone)]
 pub(crate) struct Vm {
-    device_binding: Arc<crate::binding::Gate>,
     dev: ARef<device::Device>,
     id: u64,
     mapping_epoch: Option<Arc<MappingEpoch>>,
-    bind_sequence: Arc<AtomicU64>,
     lifetime: Option<Arc<lifetime::VmLifetime>>,
     residency: Option<Arc<residency::Gate>>,
     context_bindings: Option<Arc<context::ContextBindings>>,
@@ -1245,17 +1220,14 @@ impl TimestampVmap {
     /// aliases. An unaligned complete timestamp is not atomic. Out-of-range offsets are refused
     /// when the destination is prepared, and ignored here.
     pub(crate) fn write(&self, offset: usize, value: u64) {
-        if offset
-            .checked_add(size_of::<u64>())
-            .is_none_or(|end| end > self.size())
-        {
+        if offset.checked_add(size_of::<u64>()).is_none_or(|end| end > self.size()) {
             return;
         }
         // Completion runs in task context. Bindings of the same BO share this lock,
         // so aligned u64 and overlapping unaligned byte stores never race in Rust.
         let _guard = self.0.owner().timestamp_lock.lock();
-        let base = self.0.addr.cast::<u8>();
         // SAFETY: The complete extent was checked above, inside this pinned vmap.
+        let base = self.0.addr.cast::<u8>();
         let pointer = unsafe { base.add(offset) };
         if pointer as usize % core::mem::align_of::<AtomicU64>() == 0 {
             // SAFETY: All eight bytes were checked above; the vmap pins the backing.
@@ -1476,7 +1448,7 @@ impl KernelMapping {
         } else {
             // Otherwise, check if this slot is the active one, otherwise return
             // Also check that we actually own this slot
-            let ttb = owner.ttb() | TTBR_VALID | u64::from(slot) << TTBR_ASID_SHIFT;
+            let ttb = owner.ttb() | TTBR_VALID | (slot as u64) << TTBR_ASID_SHIFT;
 
             let uat_inner = self.0.uat_inner.lock();
             uat_inner.handoff_lock();
@@ -1719,7 +1691,7 @@ impl UatShared {
     /// Writes back context-table slot `idx` after it changed, where this SoC needs it.
     fn publish_slot(&self, idx: usize) {
         if self.quirks.clean_tables {
-            let slot = core::ptr::from_ref(&self.ttbs()[idx]).cast::<u8>();
+            let slot = &self.ttbs()[idx] as *const SlotTTBS as *const u8;
             pgtable::clean_poc(slot, size_of::<SlotTTBS>());
             pgtable::poc_barrier();
         }
@@ -1728,20 +1700,13 @@ impl UatShared {
     /// Returns the handoff region area
     fn handoff(&self) -> &Handoff {
         // SAFETY: pointer is non-null per the type invariant
-        unsafe { self.handoff_rgn.map.ptr().cast::<Handoff>().as_ref() }.unwrap()
+        unsafe { (self.handoff_rgn.map.ptr() as *mut Handoff).as_ref() }.unwrap()
     }
 
     /// Returns the TTBAT area
     fn ttbs(&self) -> &[SlotTTBS; UAT_NUM_CTX] {
         // SAFETY: pointer is non-null per the type invariant
-        unsafe {
-            self.ttbs_rgn
-                .map
-                .ptr()
-                .cast::<[SlotTTBS; UAT_NUM_CTX]>()
-                .as_ref()
-        }
-        .unwrap()
+        unsafe { (self.ttbs_rgn.map.ptr() as *mut [SlotTTBS; UAT_NUM_CTX]).as_ref() }.unwrap()
     }
 
     /// Returns the mask of TTBAT contexts whose lower half is the root `ttb`.
@@ -1929,9 +1894,7 @@ impl Handoff {
         while self.lock_fw.load(Ordering::Relaxed) != 0 {
             if self.turn.load(Ordering::Relaxed) != 0 {
                 self.lock_ap.store(0, Ordering::Relaxed);
-                while self.turn.load(Ordering::Relaxed) != 0 {
-                    core::hint::spin_loop()
-                }
+                while self.turn.load(Ordering::Relaxed) != 0 {}
                 self.lock_ap.store(1, Ordering::Relaxed);
                 fence(Ordering::SeqCst);
             }
@@ -2038,7 +2001,10 @@ impl HandoffFlush {
     }
 }
 
-fn prefetch_sgt_segments(dev: &device::Device<Bound>, gem: &gem::Object) -> Result<SgSegments> {
+fn prefetch_sgt_segments(
+    dev: &device::Device<Bound>,
+    gem: &gem::Object,
+) -> Result<SgSegments> {
     let sgt = crate::gem::held_sg_table(gem, dev)?;
 
     let mut segments = KVVec::with_capacity(sgt.iter().size_hint().0, GFP_KERNEL)?;
@@ -2046,10 +2012,7 @@ fn prefetch_sgt_segments(dev: &device::Device<Bound>, gem: &gem::Object) -> Resu
         segments.push((sgt_entry.dma_address(), sgt_entry.dma_len()), GFP_KERNEL)?;
     }
 
-    Ok(SgSegments {
-        segments,
-        _lease: sgt.into_lease(),
-    })
+    Ok(SgSegments { segments, _lease: sgt.into_lease() })
 }
 
 /// Reuse cached segments without allocating another copy for each bind. The bind lease was
@@ -2138,7 +2101,6 @@ impl Vm {
         } else {
             None
         };
-        let bind_sequence = Arc::new(AtomicU64::new(0), GFP_KERNEL)?;
         let unique_gpuvm = gpuvm::GpuVm::new::<Error, _>(
             c"Asahi::GpuVm",
             &dev,
@@ -2151,7 +2113,6 @@ impl Vm {
                 va_range: va_range.clone(),
                 page_table,
                 mapping_epoch: mapping_epoch.clone(),
-                bind_sequence: bind_sequence.clone(),
                 epoch: Some(0),
                 mm,
                 uat_inner,
@@ -2161,14 +2122,11 @@ impl Vm {
         )?;
         let gpuvm = ARef::from(&*unique_gpuvm);
 
-        let device_binding = crate::binding::lookup(&dev)?;
         Ok(Vm {
-            device_binding,
             dev: dev.as_ref().as_ref().into(),
             id,
             gpuvm,
             mapping_epoch,
-            bind_sequence,
             lifetime: None,
             residency: None,
             context_bindings: None,
@@ -2333,10 +2291,6 @@ impl Vm {
         self.mapping_epoch.as_ref()?.snapshot()
     }
 
-    fn current_bind_sequence(&self) -> u64 {
-        self.bind_sequence.load(Ordering::Acquire)
-    }
-
     /// Get the translation table base for this Vm
     fn ttb(&self) -> u64 {
         self.binding.lock().ttb
@@ -2374,13 +2328,7 @@ impl Vm {
         guard_size: usize,
     ) -> Result<KernelMapping> {
         self.map_in_range_with_mode(
-            gem,
-            object_range,
-            alignment,
-            range,
-            prot,
-            guard_size,
-            mm::InsertMode::Best,
+            gem, object_range, alignment, range, prot, guard_size, mm::InsertMode::Best,
         )
     }
 
@@ -2395,13 +2343,7 @@ impl Vm {
         guard_size: usize,
     ) -> Result<KernelMapping> {
         self.map_in_range_with_mode(
-            gem,
-            object_range,
-            alignment,
-            range,
-            prot,
-            guard_size,
-            mm::InsertMode::Low,
+            gem, object_range, alignment, range, prot, guard_size, mm::InsertMode::Low,
         )
     }
 
@@ -2429,27 +2371,17 @@ impl Vm {
         }
         let reserved_size = size.checked_add(guard_size).ok_or(EOVERFLOW)?;
         let _residency = self.enter_residency()?;
-        // End the bound-device lease before entering firmware/GPUVM waits.
-        let (_bind_lease, vm_bo) = {
-            let binding = self.device_binding.enter()?;
-            let dev = binding.device();
-            let lease = crate::gem::held_sg_table(gem, dev)?.into_lease();
-            let bo = self.gpuvm.obtain(
-                gem,
-                pin_init!(VmBoData {
-                    newest_bind: AtomicU64::new(0),
-                    segments <- new_mutex!(None),
-                }),
-            )?;
-            prepare_sgt_segments(dev, gem, &bo, &lease)?;
-            (lease, bo)
-        };
+        // Pin and copy backing before taking BO or DMA reservation locks.
+        let dev = unsafe { self.dev.as_bound() };
+        let _bind_lease = crate::gem::held_sg_table(gem, dev)?.into_lease();
+        let vm_bo = self
+            .gpuvm
+            .obtain(gem, pin_init!(VmBoData { segments <- new_mutex!(None) }))?;
+        prepare_sgt_segments(dev, gem, &vm_bo, &_bind_lease)?;
 
         let size = object_range.range();
-        // SAFETY: Vm construction does not retain its initial UniqueRefGpuVm;
-        // every subsequent access to VM data is serialized by the exec lock.
         let mut vm_exec = unsafe {
-            self.gpuvm.exec_lock(/*Some(gem)*/ None, false)?
+            self.gpuvm.exec_lock_vm(/*Some(gem)*/ None, false)?
         };
         let inner = vm_exec.unique_gpuvm.data();
 
@@ -2518,26 +2450,18 @@ impl Vm {
             .checked_add(if guard { UAT_PGSZ } else { 0 })
             .ok_or(EOVERFLOW)?;
         let _residency = self.enter_residency()?;
-        // End the bound-device lease before entering firmware/GPUVM waits.
-        let (_bind_lease, vm_bo) = {
-            let binding = self.device_binding.enter()?;
-            let dev = binding.device();
-            let lease = crate::gem::held_sg_table(gem, dev)?.into_lease();
-            let bo = self.gpuvm.obtain(
-                gem,
-                pin_init!(VmBoData {
-                    newest_bind: AtomicU64::new(0),
-                    segments <- new_mutex!(None),
-                }),
-            )?;
-            prepare_sgt_segments(dev, gem, &bo, &lease)?;
-            (lease, bo)
-        };
+        // Pin and copy backing before taking BO or DMA reservation locks.
+        let dev = unsafe { self.dev.as_bound() };
+        let _bind_lease = crate::gem::held_sg_table(gem, dev)?.into_lease();
+        let vm_bo = self
+            .gpuvm
+            .obtain(&gem, pin_init!(VmBoData { segments <-new_mutex!(None) }))?;
+        prepare_sgt_segments(dev, gem, &vm_bo, &_bind_lease)?;
 
         // SAFETY: no other UniqRefGpuVm exists so `GpuVm::exec_lock()` is safe
         let mut vm_exec = unsafe {
             self.gpuvm
-                .exec_lock(/*Some(&gem)*/ None, false)
+                .exec_lock_vm(/*Some(&gem)*/ None, false)
                 .inspect_err(|_| {
                     dev_err!(self.dev, "map_at(): Failed to exec_lock gpuvm\n");
                 })?
@@ -2606,14 +2530,11 @@ impl Vm {
         gem::validate_vm_binding(gem, self)?;
         self.wait_for_user_map_admission()?;
         // Pin and copy backing before taking BO or DMA reservation locks.
-        let dev: &device::Device<device::Bound> = device.as_ref().as_ref();
+        let dev = unsafe { self.dev.as_bound() };
         let _bind_lease = crate::gem::held_sg_table(gem, dev)?.into_lease();
         let vm_bo = self
             .gpuvm
-            .obtain(gem, pin_init!(VmBoData {
-                newest_bind: AtomicU64::new(0),
-                segments <- new_mutex!(None),
-            }))?;
+            .obtain(gem, pin_init!(VmBoData { segments <- new_mutex!(None) }))?;
         prepare_sgt_segments(dev, gem, &vm_bo, &_bind_lease)?;
 
         let mut resources = VmOpResources {
@@ -2627,10 +2548,8 @@ impl Vm {
         // Mapping needs a complete context
         let mut ctx = StepContext::new(Some(device.as_ref().as_ref()), prot, &mut resources)?;
 
-        // SAFETY: Vm construction does not retain its initial UniqueRefGpuVm;
-        // every subsequent access to VM data is serialized by the exec lock.
         let mut vm_exec = unsafe {
-            self.gpuvm.exec_lock(/*Some(&gem)*/ None, false)?
+            self.gpuvm.exec_lock_vm(/*Some(&gem)*/ None, false)?
         };
         let inner = vm_exec.unique_gpuvm.data();
 
@@ -2701,9 +2620,7 @@ impl Vm {
         size: usize,
         prot: Prot,
     ) -> Result<KernelMapping> {
-        // SAFETY: Vm construction does not retain its initial UniqueRefGpuVm;
-        // every subsequent access to VM data is serialized by the exec lock.
-        let mut vm_exec = unsafe { self.gpuvm.exec_lock(None, false)? };
+        let mut vm_exec = unsafe { self.gpuvm.exec_lock_vm(None, false)? };
 
         if (iova as usize | phys | size) & UAT_PGMSK != 0 {
             dev_err!(
@@ -2807,9 +2724,7 @@ impl Vm {
         let mut resources = VmOpResources::for_unmap()?;
         let mut ctx = StepContext::new(dev, Prot::default(), &mut resources)?;
 
-        // SAFETY: Vm construction does not retain its initial UniqueRefGpuVm;
-        // every subsequent access to VM data is serialized by the exec lock.
-        let mut vm_exec = unsafe { self.gpuvm.exec_lock(None, false)? };
+        let mut vm_exec = unsafe { self.gpuvm.exec_lock_vm(None, false)? };
 
         mod_dev_dbg!(self.dev, "MMU: sm_unmap: {:#x}:{:#x}\n", iova, size);
         let _commit = if user {
@@ -2840,7 +2755,7 @@ impl Vm {
         let mut ctx = StepContext::new(None, Prot::default(), &mut resources)?;
 
         // SAFETY: See `lock_vm()`.
-        let mut vm_exec = match unsafe { self.gpuvm.exec_lock(None, false) } {
+        let mut vm_exec = match unsafe { self.gpuvm.exec_lock_vm(None, false) } {
             Err(error) if error == ENOMEM => return self.drop_mappings_low_memory(gem),
             result => result?,
         };
@@ -2865,66 +2780,6 @@ impl Vm {
             result?;
         }
         Ok(())
-    }
-
-    fn drop_mappings_before(&self, gem: &gem::Object, sequence: u64) -> Result {
-        let _residency = self.enter_retirement_residency();
-        // Removing whole mappings only does unmaps, so no preallocated VAs
-        // are needed for the indexed path.
-        let mut resources = VmOpResources {
-            preallocated_gpuvas: [None, None, None],
-        };
-        let mut ctx = StepContext::new(None, Prot::default(), &mut resources)?;
-
-        // The BO's newest sequence is checked under the same lock as binds. If
-        // it is not newer than the close, every mapping belongs to that close
-        // and the per-object list is safe and substantially cheaper to walk.
-        // SAFETY: See `lock_vm()`.
-        let mut vm_exec = match unsafe { self.gpuvm.exec_lock(None, false) } {
-            Err(error) if error == ENOMEM => {
-                return self.drop_mappings_filtered(gem, sequence);
-            }
-            result => result?,
-        };
-        let Some(bo) = vm_exec.unique_gpuvm.find_bo(gem) else {
-            return Ok(());
-        };
-        if bo.data().newest_bind.load(Ordering::Relaxed) > sequence {
-            drop(vm_exec);
-            drop(bo);
-            return self.drop_mappings_filtered(gem, sequence);
-        }
-
-        mod_dev_dbg!(self.dev, "MMU: deferred bo_unmap\n");
-        let result = vm_exec.unique_gpuvm.bo_unmap(&mut ctx, &bo);
-        if result.is_ok() {
-            self.untrack_context_object_before(gem, sequence);
-            self.untrack_shared_object_before(gem, sequence);
-        }
-        drop(vm_exec);
-        drop(bo);
-        if result == Err(ENOMEM) {
-            return self.drop_mappings_filtered(gem, sequence);
-        }
-        result
-    }
-
-    /// A newer binding shares the BO list, so select the closed generation by
-    /// walking the VM without allocating. This is also the ENOMEM fallback.
-    fn drop_mappings_filtered(&self, gem: &gem::Object, sequence: u64) -> Result {
-        let mut inner = self.gpuvm.lock_inner();
-        let result = inner.unmap_object_where(
-            gem,
-            |va| va.data().bind_sequence <= sequence,
-            VmInner::unmap_gpuva,
-        );
-        if result.is_ok() {
-            self.untrack_context_object_before(gem, sequence);
-            self.untrack_shared_object_before(gem, sequence);
-        }
-        drop(inner);
-        self.bo_deferred_cleanup();
-        result
     }
 
     /// Preserve the indexed fast path normally; memory pressure must not lose
@@ -3045,11 +2900,7 @@ impl Uat {
 
     #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
     /// Map a region given by its physical range, write-combined.
-    fn map_physical(
-        range: &Range<PhysicalAddr>,
-        min_size: usize,
-        reserved_ram: bool,
-    ) -> Result<UatRegion> {
+    fn map_physical(range: &Range<PhysicalAddr>, min_size: usize, reserved_ram: bool) -> Result<UatRegion> {
         let size: usize = (range.end.checked_sub(range.start).ok_or(EINVAL)?).try_into()?;
         if size < min_size || range.start & (UAT_PGMSK as PhysicalAddr) != 0 {
             return Err(EINVAL);
@@ -3058,11 +2909,13 @@ impl Uat {
         let mut raw: kernel::bindings::resource = unsafe { core::mem::zeroed() };
         raw.start = range.start;
         raw.end = range.end - 1;
-        raw.flags = kernel::bindings::IORESOURCE_MEM as usize;
+        raw.flags = kernel::bindings::IORESOURCE_MEM as _;
         // SAFETY: `Resource` is a transparent wrapper around `Opaque<bindings::resource>`, and
         // `raw` describes a valid memory range.
         let res: io::resource::Resource =
             unsafe { core::mem::transmute(kernel::types::Opaque::new(raw)) };
+        // SAFETY: The UAT regions are only accessed through this mapping by the CPU; the GPU
+        // reaches them through its own translation.
         let flags = io::mem::MemFlag::WC;
         #[cfg(CONFIG_DRM_ASAHI_G15)]
         let flags = if reserved_ram {
@@ -3079,8 +2932,6 @@ impl Uat {
         };
         #[cfg(not(CONFIG_DRM_ASAHI_G15))]
         let _ = reserved_ram;
-        // SAFETY: The UAT regions are only accessed through this mapping by the CPU;
-        // the GPU reaches them through its own translation.
         let map = unsafe { io::mem::Mem::try_new(res, flags.into()) }?;
         Ok(UatRegion {
             base: range.start,
@@ -3137,7 +2988,7 @@ impl Uat {
 
         // SAFETY: The Handoff struct layout matches the firmware's view of memory at this
         // address, and the region is at least large enough per the check above.
-        let handoff = unsafe { &handoff_rgn.map.ptr().cast::<Handoff>().as_ref().unwrap() };
+        let handoff = unsafe { &(handoff_rgn.map.ptr() as *mut Handoff).as_ref().unwrap() };
 
         let inner = Arc::pin_init(
             try_pin_init!(UatInner {
@@ -3407,9 +3258,9 @@ impl Uat {
         {
             return Err(EIO);
         }
-        for (index, table) in ttbs.iter().enumerate().skip(UAT_USER_CTX_START) {
-            if table.ttb0.load(Ordering::Acquire) != inner.owned_user_roots[index]
-                || table.ttb1.load(Ordering::Acquire) != 0
+        for index in UAT_USER_CTX_START..UAT_NUM_CTX {
+            if ttbs[index].ttb0.load(Ordering::Acquire) != inner.owned_user_roots[index]
+                || ttbs[index].ttb1.load(Ordering::Acquire) != 0
             {
                 return Err(EIO);
             }
@@ -3510,19 +3361,14 @@ impl Uat {
         // SAFETY: The kernel root is the bootloader-reserved `pagetables` region, which outlives
         // this `Uat`.
         unsafe {
-            pgtable::with_root_entries(
-                self.inner.reserved.as_deref(),
-                self.kernel_vm.ttb(),
-                UAT_PGSZ / size_of::<u64>(),
-                |ptes| {
-                    for (value, pte) in snapshot.iter_mut().zip(ptes) {
-                        *value = pte.load(Ordering::Relaxed);
-                    }
-                    for pte in &ptes[owned..] {
-                        pte.store(0, Ordering::Relaxed);
-                    }
-                },
-            )
+            pgtable::with_root_entries(self.inner.reserved.as_deref(), self.kernel_vm.ttb(), UAT_PGSZ / size_of::<u64>(), |ptes| {
+                for (value, pte) in snapshot.iter_mut().zip(ptes) {
+                    *value = pte.load(Ordering::Relaxed);
+                }
+                for pte in &ptes[owned..] {
+                    pte.store(0, Ordering::Relaxed);
+                }
+            })
         }?;
 
         mem::sync();
@@ -3535,16 +3381,11 @@ impl Uat {
     pub(crate) fn confirm_firmware_root_entries(&self, snapshot: [u64; 3]) -> Result {
         // SAFETY: The root is a bootloader-reserved page retained for this UAT's lifetime.
         let matches = unsafe {
-            pgtable::with_root_entries(
-                self.inner.reserved.as_deref(),
-                self.kernel_vm.ttb(),
-                snapshot.len(),
-                |ptes| {
-                    ptes.iter()
-                        .zip(snapshot)
-                        .all(|(pte, expected)| pte.load(Ordering::Relaxed) == expected)
-                },
-            )
+            pgtable::with_root_entries(self.inner.reserved.as_deref(), self.kernel_vm.ttb(), snapshot.len(), |ptes| {
+                ptes.iter()
+                    .zip(snapshot)
+                    .all(|(pte, expected)| pte.load(Ordering::Relaxed) == expected)
+            })
         }?;
         if !matches {
             return Err(EIO);
@@ -3632,7 +3473,7 @@ impl Uat {
 
         // SAFETY: The Handoff struct layout matches the firmware's view of memory at this address,
         // and the region is at least large enough per the size specified above.
-        let handoff = unsafe { &handoff_rgn.map.ptr().cast::<Handoff>().as_ref().unwrap() };
+        let handoff = unsafe { &(handoff_rgn.map.ptr() as *mut Handoff).as_ref().unwrap() };
 
         dev_info!(dev.as_ref(), "MMU: Initializing kernel page table\n");
         let shared_quirks = quirks;
@@ -3761,10 +3602,7 @@ impl Uat {
 
         inner.handoff().init(firmware, quirks.handoff_slot)?;
         if quirks.clean_tables {
-            pgtable::clean_poc(
-                core::ptr::from_ref(inner.handoff()).cast::<u8>(),
-                HANDOFF_SIZE,
-            );
+            pgtable::clean_poc(inner.handoff() as *const Handoff as *const u8, HANDOFF_SIZE);
             pgtable::poc_barrier();
         }
 
@@ -3792,7 +3630,7 @@ impl Uat {
                 .store(tagged_root(ttb1, KERNEL_ALIAS_CTX), Ordering::SeqCst);
         }
         if quirks.clean_tables {
-            pgtable::clean_poc(ttbs.as_ptr().cast::<u8>(), SLOTS_SIZE);
+            pgtable::clean_poc(ttbs.as_ptr() as *const u8, SLOTS_SIZE);
             pgtable::poc_barrier();
         }
 
