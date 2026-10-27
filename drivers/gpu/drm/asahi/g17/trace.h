@@ -125,6 +125,25 @@ TRACE_EVENT(asahi_g17_message,
 		  __entry->counter)
 );
 
+/* Failed-context teardown and render slot reuse (kind: see g17/trace.rs teardown()). */
+TRACE_EVENT(asahi_g17_teardown,
+	TP_PROTO(u8 kind, u64 a, u64 b, u64 c),
+	TP_ARGS(kind, a, b, c),
+	TP_STRUCT__entry(
+		__field(u8, kind)
+		__field(u64, a)
+		__field(u64, b)
+		__field(u64, c)
+	),
+	TP_fast_assign(
+		__entry->kind = kind;
+		__entry->a = a;
+		__entry->b = b;
+		__entry->c = c;
+	),
+	TP_printk("kind=%u a=%#llx b=%#llx c=%#llx", __entry->kind, __entry->a, __entry->b, __entry->c)
+);
+
 TRACE_EVENT(asahi_g17_event,
 	TP_PROTO(u8 phase, u64 counter),
 	TP_ARGS(phase, counter),

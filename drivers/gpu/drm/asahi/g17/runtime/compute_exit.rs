@@ -12,8 +12,56 @@ use crate::g17::{
     timeout::LIVENESS_NS,
     Firmware, MSG_CONTROL_NOTIFY,
 };
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use kernel::{prelude::*, sync::Arc};
+
+/// Waits of failed contexts' kills for a moment without other contexts' compute in flight,
+/// by bucket (under 10 ms, 100 ms, 1 s, 5 s, and longer) and the longest.
+static KILL_WAITS: [AtomicU32; 5] = [const { AtomicU32::new(0) }; 5];
+static KILL_WAIT_MAX_NS: AtomicU64 = AtomicU64::new(0);
+const KILL_WAIT_BOUNDS_NS: [u64; 4] = [10_000_000, 100_000_000, 1_000_000_000, 5_000_000_000];
+/// A failed context's kill waiting this long is reported, once per kill and at most once per
+/// this interval across kills.
+const SLOW_KILL_WAIT_NS: u64 = 5_000_000_000;
+static SLOW_KILL_WARNED_NS: AtomicU64 = AtomicU64::new(0);
+/// Failed contexts' kills published beside other contexts' compute under GPU memory pressure,
+/// and when the last one was: at most one per [`PRESSED_KILL_INTERVAL_NS`], so the memory of
+/// one is freed before another is considered.
+static PRESSED_KILLS: AtomicU32 = AtomicU32::new(0);
+static PRESSED_KILL_NS: AtomicU64 = AtomicU64::new(0);
+const PRESSED_KILL_INTERVAL_NS: u64 = 250_000_000;
+
+/// GPU memory is within an eighth of the device limit. A failed context holds its memory
+/// until its kill is acknowledged, so kills waiting for other contexts' compute to pause can
+/// push the device to its limit, and then every client's allocations fail: on Neo,
+/// gnome-shell crashed on such an ENOMEM. A kill beside foreign compute risks one GPU
+/// recovery instead.
+fn memory_pressed() -> bool {
+    let ledger = &crate::memacct::LEDGER;
+    let limit = ledger.limit.load(Ordering::Relaxed);
+    limit != 0
+        && ledger
+            .user_committed
+            .load(Ordering::Relaxed)
+            .saturating_add(ledger.kernel_resident.load(Ordering::Relaxed))
+            > limit - limit / 8
+}
+
+fn record_kill_wait(waited: u64) {
+    let bucket = KILL_WAIT_BOUNDS_NS.iter().position(|bound| waited < *bound).unwrap_or(4);
+    KILL_WAITS[bucket].fetch_add(1, Ordering::Relaxed);
+    KILL_WAIT_MAX_NS.fetch_max(waited, Ordering::Relaxed);
+}
+
+pub(in crate::g17) fn write_kill_waits(f: &mut kernel::fmt::Formatter<'_>, waiting: usize, longest: u64)
+    -> kernel::fmt::Result
+{
+    let count = |bucket: usize| KILL_WAITS[bucket].load(Ordering::Relaxed);
+    writeln!(f, "failed_kill_waits under_10ms={} under_100ms={} under_1s={} under_5s={} longer={} max_ms={} memory_pressed={}",
+             count(0), count(1), count(2), count(3), count(4),
+             KILL_WAIT_MAX_NS.load(Ordering::Relaxed) / 1_000_000, PRESSED_KILLS.load(Ordering::Relaxed))?;
+    writeln!(f, "failed_kills waiting={} longest_wait_ms={}", waiting, longest / 1_000_000)
+}
 
 impl super::Registry {
     /// ACK storage belongs to the already-retained transaction, so a full event
@@ -53,16 +101,22 @@ impl Firmware {
                 let _ = queue.announce_exit(now, || self.primary.notify(MSG_CONTROL_NOTIFY));
             }
         }
+        // Under memory pressure one kill skips the wait, at most one per interval.
+        let last = PRESSED_KILL_NS.load(Ordering::Relaxed);
+        let mut pressed =
+            (last == 0 || now.saturating_sub(last) >= PRESSED_KILL_INTERVAL_NS) && memory_pressed();
         for index in 0..self.queues.teardown.len() {
             let Some((context, age)) = self.queues.teardown.closed(index, now) else {
                 continue;
             };
+            // A failed context's executed pairs keep their pool leases until the kill is
+            // acknowledged (`Pair::firmware_drained`), so its kill cannot wait for them.
             if !self.queues.render.teardown_idle(&context)?
-                || !self.queues.render.teardown_pools_released(&context)
+                || (!self.compute_failed(&context) && !self.queues.render.teardown_pools_released(&context))
             {
                 continue;
             }
-            if let Err(error) = self.publish_compute_exit(&context, age, now) {
+            if let Err(error) = self.publish_compute_exit(&context, age, now, &mut pressed) {
                 dev_err!(
                     self.primary.state.shared.dev.as_ref(),
                     "Scheduler {} exit request failed: {:?}\n",
@@ -74,7 +128,7 @@ impl Firmware {
         Ok(())
     }
 
-    fn publish_compute_exit(&mut self, context: &Arc<Context>, age: u64, now: u64) -> Result {
+    fn publish_compute_exit(&mut self, context: &Arc<Context>, age: u64, now: u64, pressed: &mut bool) -> Result {
         let Some(index) = self.queues.compute.iter().position(|entry| {
             entry
                 .as_ref()
@@ -83,7 +137,36 @@ impl Firmware {
         }) else {
             return Ok(());
         };
-        if self.render_control_backpressured() || self.kill_unsafe(context, now) {
+        let failed = self.compute_failed(context);
+        if self.render_control_backpressured() {
+            return Ok(());
+        }
+        let beside = failed && self.foreign_compute_running(context, now);
+        if failed {
+            if beside && !*pressed {
+                let queue = self.queues.compute[index]
+                    .as_mut()
+                    .and_then(|entry| entry.queue.as_deref_mut());
+                if let Some(mut queue) = queue {
+                    let (waited, crossed) = queue.note_kill_wait(now, SLOW_KILL_WAIT_NS);
+                    let last = SLOW_KILL_WARNED_NS.load(Ordering::Relaxed);
+                    if crossed
+                        && (last == 0 || now.saturating_sub(last) >= SLOW_KILL_WAIT_NS)
+                        && SLOW_KILL_WARNED_NS
+                            .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        dev_warn!(
+                            self.primary.state.shared.dev.as_ref(),
+                            "Scheduler {} kill has waited {} ms for other contexts' compute to pause\n",
+                            context.id(),
+                            waited / 1_000_000
+                        );
+                    }
+                }
+                return Ok(());
+            }
+        } else if self.kill_unsafe(context, now) {
             return Ok(());
         }
         let (owner, target) = {
@@ -122,7 +205,7 @@ impl Firmware {
             && !self
                 .queues
                 .admission
-                .hold_render_slots_for_exit_kill(owner, hold)
+                .hold_render_slots_for_exit_kill(owner, hold, self.queues.render.executed_slots(context) & hold)
         {
             return Ok(());
         }
@@ -131,13 +214,23 @@ impl Firmware {
             self.queues.admission.release_exit_kill_hold(hold);
             return if error == EAGAIN { Ok(()) } else { Err(error) };
         }
-        // Publication is irrevocable even if its doorbell fails. Keep both
-        // the killed graph and the held render identities until processor stop.
+        // Publication is irrevocable even if its doorbell fails. Keep the killed
+        // graph until processor stop, and the held render identities until this
+        // context's scheduler release is consumed or processors stop.
         let mut queue = self.queues.compute[index]
             .as_mut()
             .and_then(|entry| entry.queue.as_deref_mut())
             .ok_or(EIO)?;
+        if failed {
+            record_kill_wait(queue.take_kill_wait(now));
+        }
+        if beside {
+            *pressed = false;
+            PRESSED_KILLS.fetch_add(1, Ordering::Relaxed);
+            PRESSED_KILL_NS.store(now.max(1), Ordering::Relaxed);
+        }
         queue.record_exit(cookie, now);
+        crate::g17::trace::teardown(3, cookie, u64::from(context.id()), hold | u64::from(beside));
         fence(Ordering::SeqCst);
         if let Err(error) = queue.announce_exit(now, || self.primary.notify(MSG_CONTROL_NOTIFY)) {
             dev_warn!(
@@ -150,12 +243,39 @@ impl Firmware {
         Ok(())
     }
 
+    /// Another context's compute command is in flight. On Neo, kills of failed contexts beside
+    /// other clients' compute occasionally made the firmware recover the GPU (twice in ten
+    /// minutes of a five-lane load with 67 faults), even with nothing freed before the kill's
+    /// acknowledgement; such a kill takes the next moment without foreign compute instead.
+    /// Render work is not waited for. A GPU that retired nothing for [`LIVENESS_NS`] has
+    /// stopped.
+    fn foreign_compute_running(&self, context: &Arc<Context>, now: u64) -> bool {
+        let stalled = crate::g17::recovery::since_retired(now).is_none_or(|since| since >= LIVENESS_NS);
+        !stalled
+            && self.queues.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()).any(|queue| {
+                queue.in_flight() && !queue.context().is_some_and(|bound| Arc::ptr_eq(bound, context))
+            })
+    }
+
+    /// A compute command of `context` failed and the firmware holds commands behind it that it
+    /// never runs. `publish_compute_exit` is only reached once `teardown_idle` found all of
+    /// the context's render pairs idle; the pairs behind such a failure become idle when
+    /// their commands have executed (`Pair::firmware_drained`), so by then nothing of the
+    /// context runs any more.
+    fn compute_failed(&self, context: &Arc<Context>) -> bool {
+        self.queues.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()).any(|queue| {
+            queue.context().is_some_and(|bound| Arc::ptr_eq(bound, context)) && queue.fault_pending()
+        })
+    }
+
     /// A kill while other contexts' commands run makes the firmware restart the
     /// GPU, and repeated ones crash it; on an otherwise idle GPU it is safe. A
     /// closed context's commands left alone retire like any others once the GPU
     /// reaches them, so its queues stay quarantined and retained until then. Only
     /// a GPU that retired nothing for [`LIVENESS_NS`] has stopped, and then the
-    /// kill proceeds.
+    /// kill proceeds. A context whose compute failed ([`Self::compute_failed`])
+    /// is not left alone, since its held commands never retire: its kill waits
+    /// only for other contexts' compute ([`Self::foreign_compute_running`]).
     fn kill_unsafe(&self, context: &Arc<Context>, now: u64) -> bool {
         let stalled = crate::g17::recovery::since_retired(now).is_none_or(|since| since >= LIVENESS_NS);
         if stalled {

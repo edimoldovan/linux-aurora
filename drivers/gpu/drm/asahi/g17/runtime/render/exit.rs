@@ -26,6 +26,19 @@ impl RenderState {
         (own, foreign, slots)
     }
 
+    /// Slots of `context`'s pairs whose commands all ran but stay unretired until its kill.
+    pub(in crate::g17::runtime) fn executed_slots(&self, context: &Arc<Context>) -> u64 {
+        let mut slots = 0;
+        for (slot, entry) in self.entries.iter().enumerate() {
+            if entry.as_ref().and_then(|entry| entry.pair.as_ref())
+                .is_some_and(|pair| pair.executed_for_kill(context))
+            {
+                slots |= 1u64 << slot;
+            }
+        }
+        slots
+    }
+
     pub(in crate::g17::runtime) fn qids_for_slot(&self, slot: u8) -> u128 {
         self.entries
             .get(usize::from(slot))

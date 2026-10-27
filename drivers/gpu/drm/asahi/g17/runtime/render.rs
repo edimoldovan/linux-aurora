@@ -76,6 +76,9 @@ pub(super) struct RenderState {
     pools: pools::Pools,
     grow: grow::Grow,
     retired: KVec<crate::g17::queue::render::RetiredBinding>,
+    /// Graphs of released contexts the firmware may still walk (see `detach_context`): kept
+    /// until the firmware stops, when this state is dropped.
+    kept_graphs: KVec<crate::g17::queue::render::RetiredBinding>,
     next_pm_generation: u64,
 }
 
@@ -102,6 +105,7 @@ impl RenderState {
             pools: pools::Pools::new()?,
             grow: grow::Grow::new()?,
             retired: KVec::with_capacity(128, GFP_KERNEL)?,
+            kept_graphs: KVec::new(),
             next_pm_generation: 1,
         })
     }
@@ -300,6 +304,7 @@ impl Registry {
                         if let Some(pair) = entry.pair.as_ref() {
                             self.buffers.unreserve_owner(pair.buffer_id())?;
                         }
+                        self.note_build_room();
                     }
                     return Ok(Some(UnusedRenderSpare {
                         _entry: entry,
@@ -357,11 +362,25 @@ impl Registry {
             .any(|(slot, entry)| entry.is_some() && self.admission.owns_slot(owner, slot))
     }
 
+    /// Tell admission whether another render pair can still be built.
+    pub(super) fn note_build_room(&self) {
+        self.admission.note_build_room(self.qids.render_pair_fits());
+    }
+
     pub(super) fn ensure_render_ids(&mut self, slot: u8, owner: u64) -> Result {
         if owner == 0 || slot == 0 || usize::from(slot) >= RENDER_SLOTS {
             return Err(EINVAL);
         }
-        if self.render.entries[usize::from(slot)].is_none() {
+        if self.render.entries[usize::from(slot)].is_some() {
+            return Ok(());
+        }
+        let built = self.build_render_ids(slot, owner);
+        self.note_build_room();
+        built
+    }
+
+    fn build_render_ids(&mut self, slot: u8, owner: u64) -> Result {
+        {
             let identity = self.identities.reserve(2)?.start;
             let tiling = self.qids.reserve(identity, DataMaster::Tiling, None)?;
             let fragment = match self.qids.reserve(identity + 1, DataMaster::Fragment, None) {
@@ -405,6 +424,13 @@ impl Registry {
     /// ensure_render_ids cancels a first ID if the second cannot be reserved;
     /// validation, identity overflow, and cancellation errors still propagate.
     fn prepare_render_ids(&mut self, slot: u8, owner: u64, optional: bool) -> Result<bool> {
+        // A full queue table refuses a sibling without scanning it on every preparation.
+        if optional
+            && self.render.entries.get(usize::from(slot)).is_some_and(Option::is_none)
+            && !self.qids.render_pair_fits()
+        {
+            return Ok(false);
+        }
         match self.ensure_render_ids(slot, owner) {
             Ok(()) => Ok(true),
             Err(error) if optional && error == ENOSPC => Ok(false),

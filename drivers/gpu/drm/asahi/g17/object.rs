@@ -466,7 +466,16 @@ struct PoolInner {
     reserved: [usize; POOL_FAMILIES],
     bytes: usize,
     stopped: bool,
+    /// Objects the firmware may still reference after their owner dropped them, kept mapped
+    /// and out of reuse until firmware stop (see [`PooledObject::retain_until_stop`]).
+    kept: KVec<KernelObject>,
+    kept_bytes: usize,
+    /// Kept objects still owned by their users, whose list entries are reserved.
+    kept_reserved: usize,
 }
+
+/// Retained objects past this many are still retained, with one warning.
+const KEPT_WARN: usize = 256;
 
 /// Per-device cache-safe object recycling. Every converted mapping reserves
 /// one return slot before its page-table attributes change. Active leases and
@@ -490,6 +499,7 @@ struct CacheLease {
 pub(crate) struct PooledObject {
     object: core::mem::ManuallyDrop<KernelObject>,
     lease: Option<CacheLease>,
+    keep: Option<kernel::sync::Arc<Pool>>,
 }
 
 impl core::ops::Deref for PooledObject {
@@ -503,11 +513,28 @@ impl core::ops::DerefMut for PooledObject {
         &mut self.object
     }
 }
+impl PooledObject {
+    /// The firmware may still reference this object after its owner drops it: keep it mapped
+    /// and never hand it out again before firmware stop. It leaves the reuse cache, so it
+    /// does not take cache capacity. Call from sleepable context: this reserves the list
+    /// entry, so the drop, wherever it happens, does not allocate.
+    pub(crate) fn retain_until_stop(&mut self, pool: &kernel::sync::Arc<Pool>) {
+        if self.keep.is_none() {
+            pool.reserve_kept();
+            self.keep = Some(pool.clone());
+        }
+    }
+}
+
 impl Drop for PooledObject {
     fn drop(&mut self) {
         // SAFETY: This destructor is the only operation that moves `object`
         // out; ManuallyDrop prevents a second implicit drop of the field.
         let object = unsafe { core::mem::ManuallyDrop::take(&mut self.object) };
+        if let Some(pool) = self.keep.take() {
+            pool.keep_object(object, self.lease.take());
+            return;
+        }
         match self.lease.take() {
             Some(lease) => lease.pool.return_object(object, &lease),
             None => drop(object),
@@ -523,7 +550,10 @@ impl Pool {
         }
         kernel::sync::Arc::pin_init(
             pin_init!(Self {
-                inner <- kernel::new_mutex!(PoolInner { returned, reserved: [0; POOL_FAMILIES], bytes: 0, stopped: false }, "g17::object::Pool"),
+                inner <- kernel::new_mutex!(PoolInner {
+                    returned, reserved: [0; POOL_FAMILIES], bytes: 0, stopped: false, kept: KVec::new(),
+                    kept_bytes: 0, kept_reserved: 0,
+                }, "g17::object::Pool"),
             }),
             GFP_KERNEL,
         )
@@ -572,6 +602,7 @@ impl Pool {
             return Ok(PooledObject {
                 object: core::mem::ManuallyDrop::new(entry.object),
                 lease: Some(lease()),
+                keep: None,
             });
         }
         let object = alloc.kernel(size, mmu::UAT_PGSZ as u64, prot, cpu)?;
@@ -596,6 +627,7 @@ impl Pool {
         let mut result = PooledObject {
             object: core::mem::ManuallyDrop::new(object),
             lease: reserved.then(lease),
+            keep: None,
         };
         if !reserved {
             return Ok(result);
@@ -655,10 +687,58 @@ impl Pool {
         core::mem::forget(object);
     }
 
+    /// Room for one more kept object, taken by the matching `keep_object`. A failed
+    /// allocation is reported by that drop, which then leaks the object instead.
+    fn reserve_kept(&self) {
+        let mut inner = self.inner.lock();
+        let pending = inner.kept_reserved + 1;
+        if inner.kept.capacity() - inner.kept.len() < pending
+            && inner.kept.reserve(pending, GFP_KERNEL).is_err()
+        {
+            return;
+        }
+        inner.kept_reserved = pending;
+    }
+
+    fn keep_object(&self, object: KernelObject, lease: Option<CacheLease>) {
+        let mut inner = self.inner.lock();
+        inner.kept_reserved = inner.kept_reserved.saturating_sub(1);
+        if let Some(lease) = &lease {
+            // The object leaves the reuse cache and its capacity.
+            inner.reserved[lease.family as usize] -= 1;
+            inner.bytes -= object.size();
+        }
+        if inner.stopped {
+            drop(inner);
+            drop(object);
+            return;
+        }
+        let size = object.size();
+        if inner.kept.len() == KEPT_WARN {
+            pr_warn!("G17 keeps {} firmware-linked objects until the GPU firmware restarts\n", KEPT_WARN);
+        }
+        // retain_until_stop reserved the entry; this never allocates.
+        match inner.kept.push_within_capacity(object) {
+            Ok(()) => inner.kept_bytes += size,
+            Err(error) => {
+                // Never unmap an object the firmware may still reference.
+                pr_err!("G17 could not record a firmware-linked object; leaking it\n");
+                core::mem::forget(error.0);
+            }
+        }
+    }
+
     /// Releases retained mappings after both firmware processors have stopped.
     /// Active objects returned later observe the same stop witness.
     pub(crate) fn stop_after_firmware(&self) {
-        self.inner.lock().stopped = true;
+        let kept = {
+            let mut inner = self.inner.lock();
+            inner.stopped = true;
+            inner.kept_bytes = 0;
+            core::mem::take(&mut inner.kept)
+        };
+        // Mapping teardown must not run while the pool mutex is held.
+        drop(kept);
         for index in 0..POOL_FAMILIES * POOL_SLOTS {
             let entry = {
                 let mut inner = self.inner.lock();
@@ -684,6 +764,7 @@ impl Pool {
                      inner.reserved[family], POOL_SLOTS, entries.iter().flatten().count(),
                      entries.iter().flatten().filter(|entry| entry.poisoned).count())?;
         }
-        writeln!(f, "cached_object_bytes used={} total={}", inner.bytes, POOL_BYTES)
+        writeln!(f, "cached_object_bytes used={} total={}", inner.bytes, POOL_BYTES)?;
+        writeln!(f, "firmware_linked_objects kept={} bytes={}", inner.kept.len(), inner.kept_bytes)
     }
 }

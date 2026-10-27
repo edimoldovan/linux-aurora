@@ -131,7 +131,8 @@ impl Backend {
                         .reclaim_unused_render_spare(Some(self.owner), true)?;
                     let ready = firmware.queues.has_render_ids(self.owner);
                     drop(state);
-                    if reclaimed.is_none() && !ready {
+                    // A full queue table makes admission reuse a free killed pair instead.
+                    if reclaimed.is_none() && !ready && !pool.killed_pair_free() {
                         self.wait_render_capacity(&mut observed, started, sleep)?;
                     }
                     drop(reclaimed);

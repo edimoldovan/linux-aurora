@@ -71,11 +71,19 @@ struct State {
     /// their own fence with EBUSY instead of a device-loss error, so the VM stays usable.
     spared: u64,
     kill_hold: u64,
+    /// Slots whose kill hold ended at their killed context's consumed scheduler release,
+    /// and when. A new owner takes such a pair last, the one released longest ago first.
+    killed: u64,
+    killed_at: [u64; cfg::RENDER_SLOTS],
+    /// The physical queue table still has room for a pair built in an unowned slot. The
+    /// runtime updates this whenever the table changes.
+    build_room: bool,
     released: u64,
     epoch: u64,
     footprints: KVec<InFlight>,
     next_ticket: u64,
 }
+
 impl State {
     const MASK: u64 = (u64::MAX >> (64 - cfg::RENDER_SLOTS)) & !1;
     const fn new() -> Self {
@@ -87,6 +95,9 @@ impl State {
             quarantined: 0,
             spared: 0,
             kill_hold: 0,
+            killed: 0,
+            killed_at: [0; cfg::RENDER_SLOTS],
+            build_room: true,
             released: 0,
             epoch: 0,
             footprints: KVec::new(),
@@ -120,6 +131,15 @@ impl State {
         self.epochs[slot] = self.epoch;
     }
     fn take_idle(&mut self, slot: usize, owner: u64) -> u8 {
+        if self.owners[slot] != owner {
+            crate::g17::trace::teardown(
+                6,
+                slot as u64,
+                self.owners[slot],
+                owner | u64::from(self.killed & (1u64 << slot) != 0) << 63,
+            );
+            self.killed &= !(1u64 << slot);
+        }
         self.refs[slot] += 1;
         self.active |= 1u64 << slot;
         self.released &= !(1u64 << slot);
@@ -165,13 +185,23 @@ impl State {
         }
         let free = !self.active & Self::MASK & !self.quarantined & !self.kill_hold;
         let eligible = |slot: usize| free & (1u64 << slot) != 0;
-        // Reuse a closed, exactly retired owner before consuming a new graph.
+        let released = |slot: usize| self.released & (1u64 << slot) != 0;
+        let unowned = || (0..cfg::RENDER_SLOTS).find(|slot| eligible(*slot) && self.owners[*slot] == 0);
+        // Reuse a closed, exactly retired owner before consuming a new graph. A killed
+        // context's pair comes after a new graph while one can still be built: on Neo, new
+        // owners of such pairs had renders that executed but never stored their stamps.
+        // Once the queue table is full it is reused, the one released longest ago first,
+        // so killed pairs never strand physical queues.
         let slot = (0..cfg::RENDER_SLOTS)
-            .filter(|slot| eligible(*slot) && self.released & (1u64 << slot) != 0)
+            .filter(|slot| eligible(*slot) && released(*slot) && self.killed & (1u64 << slot) == 0)
             .min_by_key(|slot| self.epochs[*slot])
+            .or_else(|| if self.build_room { unowned() } else { None })
             .or_else(|| {
-                (0..cfg::RENDER_SLOTS).find(|slot| eligible(*slot) && self.owners[*slot] == 0)
-            })?;
+                (0..cfg::RENDER_SLOTS)
+                    .filter(|slot| eligible(*slot) && released(*slot))
+                    .min_by_key(|slot| self.killed_at[*slot])
+            })
+            .or_else(unowned)?;
         let first = self.take_idle(slot, owner);
         self.claim_sibling(owner);
         Some(first)
@@ -180,7 +210,8 @@ impl State {
         if self.owners.iter().filter(|id| **id == owner).count() >= cfg::RENDER_PAIRS_PER_OWNER {
             return;
         }
-        let free = !self.active & Self::MASK & !self.quarantined & !self.kill_hold;
+        // A speculative sibling never takes a killed context's pair.
+        let free = !self.active & Self::MASK & !self.quarantined & !self.kill_hold & !self.killed;
         let eligible = |slot: usize| free & (1u64 << slot) != 0;
         let sibling = (0..cfg::RENDER_SLOTS)
             .filter(|slot| {
@@ -190,6 +221,10 @@ impl State {
             })
             .min_by_key(|slot| self.epochs[*slot])
             .or_else(|| {
+                // Nor an unowned slot once no pair can be built there.
+                if !self.build_room {
+                    return None;
+                }
                 (0..cfg::RENDER_SLOTS).find(|slot| eligible(*slot) && self.owners[*slot] == 0)
             });
         if let Some(slot) = sibling {
@@ -223,6 +258,7 @@ impl State {
         let bit = 1u64 << slot;
         let old = self.owners[slot];
         if old == 0
+            || self.killed & bit != 0
             || owner == Some(old)
             || expected.is_some_and(|expected| expected != old)
             || self.refs[slot] != 0
@@ -648,9 +684,27 @@ impl Pool {
         state.quarantined &= !released;
         state.spared &= !released;
         state.kill_hold = 0;
+        state.killed = 0;
         drop(state);
         self.returned();
     }
+
+    /// Whether the physical queue table can hold another pair (see `State::build_room`).
+    pub(crate) fn note_build_room(&self, room: bool) {
+        let mut state = self.state.lock();
+        if state.build_room != room {
+            state.build_room = room;
+            drop(state);
+            self.returned();
+        }
+    }
+
+    /// A killed context's pair is free for a new owner.
+    pub(crate) fn killed_pair_free(&self) -> bool {
+        let state = self.state.lock();
+        state.killed & state.released & !state.active & !state.quarantined & !state.kill_hold & State::MASK != 0
+    }
+
 }
 
 #[kunit_tests(asahi_g17_admission_accounting)]
@@ -863,7 +917,7 @@ impl Drop for RenderLease {
 }
 
 impl State {
-    fn hold_for_exit_kill(&mut self, owner: u64, slots: u64) -> bool {
+    fn hold_for_exit_kill(&mut self, owner: u64, slots: u64, executed: u64) -> bool {
         if owner == 0 || slots & !Self::MASK != 0 {
             return false;
         }
@@ -872,10 +926,10 @@ impl State {
             if slots & bit == 0 {
                 continue;
             }
+            // A pair whose commands all ran is held with them (see `Pair::executed_for_kill`).
             if self.owners[slot] != owner
-                || self.refs[slot] != 0
-                || self.active & bit != 0
-                || self.released & bit == 0
+                || (executed & bit == 0
+                    && (self.refs[slot] != 0 || self.active & bit != 0 || self.released & bit == 0))
             {
                 return false;
             }
@@ -887,16 +941,36 @@ impl State {
 impl Pool {
     /// Hold the departed owner's idle pairs before publishing its exit record.
     /// Successful publication retains these bits until both processors stop.
-    pub(crate) fn hold_render_slots_for_exit_kill(&self, owner: u64, slots: u64) -> bool {
-        self.state.lock().hold_for_exit_kill(owner, slots)
+    pub(crate) fn hold_render_slots_for_exit_kill(&self, owner: u64, slots: u64, executed: u64) -> bool {
+        self.state.lock().hold_for_exit_kill(owner, slots, executed)
     }
 
-    /// Undo only a hold whose control record was not published.
+    /// Undo a hold whose control record was not published.
     pub(crate) fn release_exit_kill_hold(&self, slots: u64) {
         if slots == 0 {
             return;
         }
         self.state.lock().kill_hold &= !slots;
+        self.returned();
+    }
+
+    /// End the kill hold of `slots` once their killed context's scheduler release was
+    /// consumed (the firmware no longer names these pairs). A new owner takes them last.
+    pub(crate) fn release_killed_slots(&self, slots: u64) {
+        let mut state = self.state.lock();
+        let held = state.kill_hold & slots & State::MASK;
+        if held == 0 {
+            return;
+        }
+        let now = crate::g17::now_ns();
+        state.kill_hold &= !held;
+        state.killed |= held;
+        for slot in 0..cfg::RENDER_SLOTS {
+            if held & (1u64 << slot) != 0 {
+                state.killed_at[slot] = now;
+            }
+        }
+        drop(state);
         self.returned();
     }
 }
@@ -972,12 +1046,85 @@ mod fault_capacity_tests {
         let bit = 1u64 << lease.slot();
         pool.release_owner(1);
         drop(lease);
-        assert!(pool.hold_render_slots_for_exit_kill(1, bit));
+        assert!(pool.hold_render_slots_for_exit_kill(1, bit, 0));
         assert!(!pool.reassign_unused_spare(bit.trailing_zeros() as u8, Some(1), Some(2)));
         // A failed (unpublished) control may roll back its hold. Published kills
         // keep the existing processor-stop rule; this test must not weaken it.
         pool.release_retained_owners_after_processor_stop();
         assert_eq!(pool.state.lock().kill_hold, 0);
+    }
+
+    #[test]
+    fn consumed_scheduler_release_ends_the_kill_hold() {
+        let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
+        let lease = pool.acquire_render(1, None, u64::MAX, || Ok(())).unwrap();
+        let slot = lease.slot();
+        let bit = 1u64 << slot;
+        pool.release_owner(1);
+        drop(lease);
+        assert!(pool.hold_render_slots_for_exit_kill(1, bit, 0));
+        assert!(!pool.reassign_unused_spare(slot, Some(1), Some(2)));
+        pool.release_killed_slots(bit);
+        assert_eq!(pool.state.lock().kill_hold, 0);
+        assert_eq!(pool.state.lock().killed, bit);
+        assert!(pool.killed_pair_free());
+        // The killed context's pair is never reassigned as a spare, and a new owner takes
+        // a new graph before it.
+        assert!(!pool.reassign_unused_spare(slot, Some(1), Some(2)));
+        let next = pool.acquire_render(2, None, u64::MAX, || Ok(())).unwrap();
+        assert_ne!(next.slot(), slot);
+        drop(next);
+        pool.release_retained_owners_after_processor_stop();
+        assert_eq!(pool.state.lock().killed, 0);
+    }
+
+    #[test]
+    fn killed_pairs_are_taken_last_oldest_first() {
+        let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
+        {
+            let mut state = pool.state.lock();
+            for slot in 1..cfg::RENDER_SLOTS {
+                state.owners[slot] = 100 + slot as u64;
+                state.released |= 1u64 << slot;
+                state.killed |= 1u64 << slot;
+                state.killed_at[slot] = 1000 - slot as u64;
+            }
+            // One pair released without a kill.
+            state.killed &= !(1u64 << 7);
+        }
+        let first = pool.acquire_render(1, None, u64::MAX, || Ok(())).unwrap();
+        assert_eq!(first.slot(), 7);
+        let second = pool.acquire_render(2, None, u64::MAX, || Ok(())).unwrap();
+        assert_eq!(usize::from(second.slot()), cfg::RENDER_SLOTS - 1);
+        assert_eq!(pool.state.lock().killed & (1u64 << second.slot()), 0);
+    }
+
+    #[test]
+    fn a_full_queue_table_reuses_killed_pairs_before_unowned_slots() {
+        let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
+        {
+            let mut state = pool.state.lock();
+            for slot in 1..8 {
+                state.owners[slot] = 100 + slot as u64;
+                state.released |= 1u64 << slot;
+                state.killed |= 1u64 << slot;
+                state.killed_at[slot] = 1000 - slot as u64;
+            }
+        }
+        // With room in the queue table a new owner builds a pair in an unowned slot.
+        let built = pool.acquire_render(1, None, u64::MAX, || Ok(())).unwrap();
+        assert!(usize::from(built.slot()) >= 8);
+        // Without room it takes the killed pair released longest ago.
+        pool.note_build_room(false);
+        let reused = pool.acquire_render(2, None, u64::MAX, || Ok(())).unwrap();
+        assert_eq!(reused.slot(), 7);
+        assert_eq!(pool.state.lock().killed & (1u64 << 7), 0);
+        // It claims no sibling: neither another killed pair nor an unowned slot.
+        let state = pool.state.lock();
+        for slot in 1..7 {
+            assert_eq!(state.owners[slot], 100 + slot as u64);
+        }
+        assert_eq!(state.owners.iter().filter(|owner| **owner == 2).count(), 1);
     }
 }
 

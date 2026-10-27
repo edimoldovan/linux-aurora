@@ -16,6 +16,7 @@ unsafe extern "C" {
     fn asahi_g17_trace_doorbell_enabled() -> bool;
     fn asahi_g17_trace_doorbell(engine: u8, power: u32);
     fn asahi_g17_trace_event(phase: u8);
+    fn asahi_g17_trace_teardown(kind: u8, a: u64, b: u64, c: u64);
 }
 
 pub(super) const RENDER: u8 = 0;
@@ -72,6 +73,15 @@ pub(super) const EFFORT: u8 = 2;
 pub(super) fn message(kind: u8, value: u64) {
     // SAFETY: Plain values only.
     unsafe { asahi_g17_trace_message(kind, value) };
+}
+
+/// Failed-context teardown: 1 compute fault (qid, stamp), 2 unstamped render retire (slot,
+/// ordinal), 3 kill published (cookie, context, held slots | 1 if it skipped the wait for other
+/// contexts' compute under memory pressure; slot 0 is never held), 4 kill acknowledged (cookie, qid),
+/// 5 detach (context, slots, linked), 6 render slot to a new owner (slot, old, new | killed << 63).
+pub(crate) fn teardown(kind: u8, a: u64, b: u64, c: u64) {
+    // SAFETY: Plain values only.
+    unsafe { asahi_g17_trace_teardown(kind, a, b, c) };
 }
 
 /// Event worker pass boundaries: 0 begin, 1 fences signalled, 2 end.

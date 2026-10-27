@@ -54,3 +54,9 @@ void asahi_g17_trace_event(u8 phase)
 	if (trace_asahi_g17_event_enabled())
 		trace_asahi_g17_event(phase, __arch_counter_get_cntvct());
 }
+
+void asahi_g17_trace_teardown(u8 kind, u64 a, u64 b, u64 c)
+{
+	if (trace_asahi_g17_teardown_enabled())
+		trace_asahi_g17_teardown(kind, a, b, c);
+}

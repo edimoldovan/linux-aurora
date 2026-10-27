@@ -1614,7 +1614,43 @@ impl Pair {
         let counters = self.free_list.counters()?;
         let stamps = host.stamps(self.qids())?;
         let (_, state) = host.epoch()?;
-        Ok(retirement::drained(self.ordinal, stamps, counters, state))
+        Ok(retirement::drained(self.ordinal, stamps, counters, state)
+            || (state == 0 && self.executed_unstamped() && self.context_killed()))
+    }
+
+    /// The firmware acknowledged a kill of this pair's context (scheduler page): it no longer
+    /// walks that context's work list, so the commands it never unlinked can be released.
+    fn context_killed(&self) -> bool {
+        crate::g17::queue::compute::exit::State::read(&self.memory.context).is_ok_and(|state| state.killed != 0)
+    }
+
+    /// The pair's context may be killed although its commands were not retired: they all ran
+    /// (`executed_unstamped`), so the kill leaves nothing queued for the firmware to run.
+    /// Its memory stays until the kill is acknowledged.
+    pub(crate) fn executed_for_kill(&self, context: &Arc<Context>) -> bool {
+        Arc::ptr_eq(context, &self.memory.context) && self.executed_unstamped()
+    }
+
+    /// Every command of this quarantined pair ran, its ring entries were consumed and its
+    /// free-list blocks returned, yet the firmware never stores the stamp of the last one.
+    /// On Neo this is the render work of a context whose compute command failed: it runs
+    /// about a second after the failure, but its stamp never arrives and it stays linked in
+    /// the firmware's job list, so neither the stamp proof nor the abandoned-group proof
+    /// ever holds and the pair would stay quarantined, keeping its context, until the
+    /// processors stop.
+    fn executed_unstamped(&self) -> bool {
+        self.quarantined
+            // Only for a closed owner: a live owner would go on publishing into a context
+            // whose work list still links the unstamped node.
+            && self.owner.is_none()
+            && self.prepared.is_none()
+            && self.active.len() != 0
+            && self.free_list.counters().is_ok_and(|counters| counters[0] == counters[1])
+            && self.active.iter().all(|active| {
+                active.outer_published
+                    && observation::snapshot(&self.memory, active.ticket.ordinal)
+                        .is_ok_and(retirement::Snapshot::executed_and_consumed)
+            })
     }
 
     /// Account one witnessed tracker, preserving all completion ownership.
@@ -1628,6 +1664,10 @@ impl Pair {
         let qids = self.qids();
         let qos = self.qos_owners();
         let buffer = self.buffer_id();
+        // Commands the firmware never unlinked are released only after it acknowledged the
+        // kill of their context, on every path (see `firmware_drained`).
+        let unstamped = self.executed_unstamped();
+        let killed = unstamped && self.context_killed();
         let Some(active) = self.active.iter_mut().find(|a| !a.flist_completed) else {
             return Ok(false);
         };
@@ -1638,6 +1678,12 @@ impl Pair {
         };
         let result = match retirement::poll(&mut active.ticket, &mut observer)? {
             retirement::Poll::Complete(ticks) => Ok(ticks),
+            // Its commands ran without a stamp (see `executed_unstamped`): they already failed
+            // with the quarantine, and the client sees them cancelled.
+            retirement::Poll::Pending | retirement::Poll::Retry if killed => {
+                crate::g17::trace::teardown(2, u64::from(self.slot), active.ticket.ordinal, 0);
+                Err(ECANCELED)
+            }
             retirement::Poll::Pending | retirement::Poll::Retry => {
                 core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
                 let snapshot = observer.snapshot(active.ticket.ordinal)?;

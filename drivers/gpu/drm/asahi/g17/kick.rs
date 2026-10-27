@@ -145,6 +145,11 @@ impl QueueIds {
         self.render_ids() + (QID_COUNT - self.floor - self.leased) >= 2 * queues + 2
     }
 
+    /// Whether a render pair not yet built can still reserve both of its identities.
+    pub(crate) fn render_pair_fits(&self) -> bool {
+        QID_COUNT - self.floor - self.leased >= 2
+    }
+
     /// Whether a fresh compute identity fits beside the render reserve of
     /// `queues` open logical queues, without reserving it.
     pub(crate) fn compute_fits(&self, queues: usize) -> bool {
