@@ -52,6 +52,16 @@ fn render_kill_target(listed: u128, own: u128) -> Option<u8> {
     (candidates != 0).then(|| candidates.trailing_zeros() as u8)
 }
 
+/// A closed context may be killed on its render pairs' behalf once it has been closed for
+/// [`RENDER_KILL_DELAY_NS`], it was never killed, a pair of it holds executed but unstamped
+/// commands and no compute queue still runs it, switches away from it or killed it. A second kill
+/// of a killed context made the firmware fault on the killed pair's own tiling queue within a
+/// millisecond of acknowledging it: with the pair's release held back, a context killed through
+/// its compute queue still looked like a render-only candidate.
+fn render_kill_eligible(age: u64, killed: bool, executed: bool, compute_clear: bool) -> bool {
+    age >= RENDER_KILL_DELAY_NS && !killed && executed && compute_clear
+}
+
 /// The one admission owner of every pair a kill holds, if there is one.
 fn hold_owner(owners: impl Iterator<Item = Option<u64>>) -> Option<u64> {
     let mut owner = None;
@@ -296,6 +306,7 @@ impl Firmware {
             PRESSED_KILL_NS.store(now.max(1), Ordering::Relaxed);
         }
         queue.record_exit(cookie, now);
+        context.note_kill_published();
         crate::g17::trace::teardown(3, cookie, u64::from(context.id()), hold | u64::from(beside));
         fence(Ordering::SeqCst);
         if let Err(error) = queue.announce_exit(now, || self.primary.notify(MSG_CONTROL_NOTIFY)) {
@@ -315,12 +326,14 @@ impl Firmware {
     /// yet those pairs are released only after one: without this the context, its pairs and
     /// its memory stay until the processors stop.
     fn render_kill_candidate(&self, index: usize, context: &Arc<Context>, age: u64) -> bool {
-        age >= RENDER_KILL_DELAY_NS
-            && !self.queues.teardown.render_kill_published(index)
-            && self.queues.render.executed_slots(context) != 0
-            && self.queues.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()).all(|queue| {
+        render_kill_eligible(
+            age,
+            self.queues.teardown.render_kill_published(index) || context.kill_published(),
+            self.queues.render.executed_slots(context) != 0,
+            self.queues.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()).all(|queue| {
                 queue.idle_for_context(context) && !queue.switching_from(context) && !queue.exit_published(context)
-            })
+            }),
+        )
     }
 
     /// Kill a render-only candidate (`render_kill_candidate`). The rules of a failed
@@ -393,6 +406,7 @@ impl Firmware {
         // Publication is irrevocable. The held pairs stay held until this context's
         // scheduler release is consumed (`release_killed_slots` at detach).
         self.queues.teardown.record_render_kill(index, cookie, now)?;
+        context.note_kill_published();
         record_kill_wait(self.queues.teardown.take_kill_wait(index, now));
         if beside {
             *pressed = false;
@@ -491,7 +505,16 @@ impl Firmware {
 
 #[kernel::macros::kunit_tests(asahi_g17_render_kill_target)]
 mod render_kill_target_tests {
-    use super::{hold_owner, render_kill_target};
+    use super::{hold_owner, render_kill_eligible, render_kill_target, RENDER_KILL_DELAY_NS};
+
+    #[test]
+    fn a_killed_context_is_never_killed_again() {
+        assert!(render_kill_eligible(RENDER_KILL_DELAY_NS, false, true, true));
+        assert!(!render_kill_eligible(RENDER_KILL_DELAY_NS, true, true, true));
+        assert!(!render_kill_eligible(RENDER_KILL_DELAY_NS - 1, false, true, true));
+        assert!(!render_kill_eligible(RENDER_KILL_DELAY_NS, false, false, true));
+        assert!(!render_kill_eligible(RENDER_KILL_DELAY_NS, false, true, false));
+    }
 
     #[test]
     fn a_render_kill_holds_pairs_of_one_owner_only() {
