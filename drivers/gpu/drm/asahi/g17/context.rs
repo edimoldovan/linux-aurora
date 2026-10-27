@@ -114,6 +114,9 @@ pub(crate) struct Context {
     scheduler: Arc<KernelObject>,
     scheduler_generation: u32,
     published: AtomicBool,
+    /// A kill of this context was published, through a compute queue or on its render pairs'
+    /// behalf. A context is killed at most once.
+    kill_published: AtomicBool,
     /// Advisory only: publication still checks the physical binding under the
     /// device mutex. False skips an inline attempt known to need admission.
     compute_binding_hint: AtomicBool,
@@ -197,6 +200,7 @@ impl Context {
             scheduler,
             scheduler_generation,
             published: AtomicBool::new(false),
+            kill_published: AtomicBool::new(false),
             compute_binding_hint: AtomicBool::new(false),
             render_seen: AtomicBool::new(false),
             qos,
@@ -314,6 +318,16 @@ impl Context {
         ];
         fence(Ordering::Acquire);
         Ok(head)
+    }
+
+    /// Record that a kill of this context was published (see `kill_published`).
+    pub(crate) fn note_kill_published(&self) {
+        self.kill_published.store(true, Ordering::Release);
+    }
+
+    /// A kill of this context was published.
+    pub(crate) fn kill_published(&self) -> bool {
+        self.kill_published.load(Ordering::Acquire)
     }
 
     pub(crate) fn is_published(&self) -> bool {
