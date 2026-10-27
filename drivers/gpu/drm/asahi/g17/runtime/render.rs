@@ -1145,6 +1145,8 @@ impl Registry {
 impl RenderState {
     pub(super) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
         writeln!(f, "retired_render_bindings used={} total={}", self.retired.len(), self.retired.capacity())?;
+        writeln!(f, "firmware_linked_render_graphs kept={} leaked={}", self.kept_graphs.len(),
+                 teardown::LEAKED_GRAPHS.load(core::sync::atomic::Ordering::Relaxed))?;
         self.pools.write_capacity(f)?;
         for (slot, entry) in self.entries.iter().enumerate() {
             if let Some(context) = entry.as_ref().and_then(|entry| entry.context.as_ref()) {

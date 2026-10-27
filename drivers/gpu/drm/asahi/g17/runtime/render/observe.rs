@@ -8,8 +8,8 @@ use core::sync::atomic::Ordering;
 use kernel::{prelude::*, sync::Arc};
 
 impl crate::g17::Firmware {
-    /// The first slot from `start` whose pair has news to observe: published work in flight, both
-    /// queues' notifications seen, and an observation the pair accepts.
+    /// The first slot from `start` whose pair has news to observe: published work in flight, the
+    /// fragment queue's notification seen (`completion_noted`), and an observation the pair accepts.
     fn next_render_observation(&self, start: usize) -> Result<Option<usize>> {
         if self.recovery.pending() {
             return Ok(None);

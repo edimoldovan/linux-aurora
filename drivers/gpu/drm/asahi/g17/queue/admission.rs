@@ -940,7 +940,8 @@ impl State {
 }
 impl Pool {
     /// Hold the departed owner's idle pairs before publishing its exit record.
-    /// Successful publication retains these bits until both processors stop.
+    /// Successful publication retains these bits until the owner's scheduler release is
+    /// consumed (`release_killed_slots` at detach), or until both processors stop.
     pub(crate) fn hold_render_slots_for_exit_kill(&self, owner: u64, slots: u64, executed: u64) -> bool {
         self.state.lock().hold_for_exit_kill(owner, slots, executed)
     }

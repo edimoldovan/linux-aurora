@@ -196,15 +196,20 @@ impl Registry {
 
 /// Keeps `graph` until the firmware stops; if even that cannot be recorded, it is leaked
 /// rather than freed.
+/// Graphs that could not be recorded in `kept_graphs` and were leaked instead, for debugfs.
+pub(super) static LEAKED_GRAPHS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 fn keep_graph(
     kept: &mut KVec<crate::g17::queue::render::RetiredBinding>,
     graph: crate::g17::queue::render::RetiredBinding,
 ) {
     if kept.reserve(1, GFP_KERNEL).is_ok() {
         if let Err(error) = kept.push_within_capacity(graph) {
+            LEAKED_GRAPHS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             core::mem::forget(error.0);
         }
     } else {
+        LEAKED_GRAPHS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         core::mem::forget(graph);
     }
 }
