@@ -575,6 +575,9 @@ pub(crate) struct Queue {
     config_cache: Option<(QueueConfig, u64)>,
     ordinal: u32,
     submitted: u32,
+    /// The stamp of the newest command the firmware reported failed ([`Self::note_fault`]),
+    /// while it is newer than the stored stamp.
+    fault_stamp: Option<u32>,
     /// Prepared packets of the bound owner about to publish (see [`Self::claim`]).
     claims: u32,
     last_published: u64,
@@ -694,6 +697,7 @@ impl Queue {
             config_cache: None,
             ordinal: 0,
             submitted: 0,
+            fault_stamp: None,
             claims: 0,
             last_published: 0,
             last_end: 0,
@@ -714,6 +718,29 @@ impl Queue {
             withheld_doorbell: None,
         })
     }
+    /// The firmware failed the command whose completion stamp is `stamp`. It writes a
+    /// zero-duration completion record for it, which quarantines the queue, but stores no
+    /// stamp: without this the quarantine would wait for its retirement witness forever and
+    /// keep the queue's backing. Commands published after the failed one still need their own
+    /// stamp or record.
+    pub(crate) fn note_fault(&mut self, stamp: u32) {
+        if self
+            .fault_stamp
+            .is_none_or(|old| retirement::stamp_newer(stamp, old))
+        {
+            self.fault_stamp = Some(stamp);
+        }
+    }
+
+    /// The stamp that proves retirement: the stored one, or a newer reported fault's.
+    fn witness_stamp(&self) -> Result<u32> {
+        let stored = self.graph.stamp()?;
+        Ok(match self.fault_stamp {
+            Some(fault) if retirement::stamp_newer(fault, stored) => fault,
+            _ => stored,
+        })
+    }
+
     pub(crate) fn qid(&self) -> u8 {
         self.kick.id().qid()
     }
@@ -1096,7 +1123,7 @@ impl Queue {
             if !retirement::quarantined_retired(
                 &newest,
                 self.graph.cursors()?,
-                self.graph.stamp()?,
+                self.witness_stamp()?,
                 self.active.len as u32,
                 self.submitted,
             )? {
@@ -1140,6 +1167,7 @@ impl Queue {
             drop(self.active.pop());
         }
         self.awaiting_witness = false;
+        self.fault_stamp = None;
         self.retirement_proved = false;
         self.replay_retirement = false;
         self.spared_deferred = false;
@@ -1584,6 +1612,7 @@ impl Queue {
         self.spared_deferred = false;
         self.retire_pending = false;
         self.awaiting_witness = false;
+        self.fault_stamp = None;
         self.retirement_proved = false;
         self.replay_retirement = false;
         self.replay_error = None;

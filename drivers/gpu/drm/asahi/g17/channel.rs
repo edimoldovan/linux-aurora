@@ -147,6 +147,7 @@ impl Rings {
 /// the caller can service the copied event using the complete device owner.
 pub(crate) struct Events {
     role: Role,
+    graph: super::fw::variant::InitGraph,
     remaining: u32,
     unknown_reported: bool,
 }
@@ -167,9 +168,10 @@ impl Events {
         Ok(consumer != producer)
     }
 
-    pub(crate) fn new(role: Role) -> Self {
+    pub(crate) fn new(role: Role, graph: super::fw::variant::InitGraph) -> Self {
         Self {
             role,
+            graph,
             remaining: EVENT_SLOTS,
             unknown_reported: false,
         }
@@ -196,7 +198,7 @@ impl Events {
             fence(Ordering::Acquire);
             let offset = status::EVENT_RING as usize + consumer as usize * EVENT_RECORD_SIZE;
             let record = EventRecord::from_words(init.status_read_words(role, offset)?);
-            let event = record.decode();
+            let event = record.decode_for(self.graph);
             fence(Ordering::SeqCst);
             consumer_word.store((consumer + 1) & (EVENT_SLOTS - 1), Ordering::Relaxed);
             fence(Ordering::SeqCst);

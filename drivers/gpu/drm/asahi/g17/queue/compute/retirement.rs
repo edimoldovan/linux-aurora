@@ -52,6 +52,12 @@ impl Cursors {
     }
 }
 
+/// Whether stamp `a` was stored after stamp `b` (both kick stamps, modulo wrap).
+pub(crate) const fn stamp_newer(a: u32, b: u32) -> bool {
+    let delta = a.wrapping_sub(b);
+    delta != 0 && delta < 0x8000_0000
+}
+
 /// Outstanding kicks span fewer than half the 24-bit stamp sequence. Zero is a valid wrap.
 pub(crate) const fn stamp_covers(word: u32, kick: u64) -> bool {
     let delta = word.wrapping_sub((kick as u32).wrapping_shl(8));
@@ -453,6 +459,15 @@ mod tests {
         assert!(!stamp_covers(own(KICK - 1), KICK));
         assert!(!stamp_covers(own(KICK) | 1, KICK));
         assert!(stamp_covers(0, 0xff_ffff));
+    }
+
+    #[test]
+    fn a_reported_fault_stamp_is_newer_only_until_stored() {
+        assert!(stamp_newer(own(KICK), own(KICK - 1)));
+        assert!(!stamp_newer(own(KICK), own(KICK)));
+        assert!(!stamp_newer(own(KICK - 1), own(KICK)));
+        // Across the wrap of the 24-bit kick in the stamp word.
+        assert!(stamp_newer(own(0), own(0xff_ffff)));
     }
 
     #[test]
