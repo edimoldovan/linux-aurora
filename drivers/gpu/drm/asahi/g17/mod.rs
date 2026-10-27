@@ -48,6 +48,7 @@ mod kick;
 mod object;
 mod port;
 pub(crate) mod power;
+mod reports;
 mod preparation;
 mod qos;
 mod queue;
@@ -1097,6 +1098,7 @@ pub(crate) struct Gpu {
     ids: gpu::SequenceIDs,
     shared: Arc<Shared>,
     _capacity: Pin<KBox<kernel::debugfs::File<capacity::View>>>,
+    _reports: Pin<KBox<kernel::debugfs::File<reports::View>>>,
 }
 
 impl Gpu {
@@ -1204,6 +1206,10 @@ impl Gpu {
             directory.read_only_file(c"capacity", capacity::View(shared.clone())),
             GFP_KERNEL,
         )?;
+        let reports = KBox::pin_init(
+            directory.read_only_file(c"firmware_reports", reports::View(shared.clone())),
+            GFP_KERNEL,
+        )?;
         let gpu = Arc::new(
             Gpu {
                 cfg,
@@ -1213,6 +1219,7 @@ impl Gpu {
                 ids: Default::default(),
                 shared,
                 _capacity: capacity,
+                _reports: reports,
             },
             GFP_KERNEL,
         )?;
@@ -1354,7 +1361,7 @@ impl Gpu {
                 bridge,
                 port: port::Port::new()?,
                 seen_submissions: 0,
-                rings: channel::Rings::new(),
+                rings: channel::Rings::new()?,
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
                 hold: power::Hold::new(),
