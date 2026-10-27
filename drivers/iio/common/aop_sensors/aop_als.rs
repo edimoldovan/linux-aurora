@@ -69,6 +69,10 @@ const CT720_CCT_FLAG: usize = 0x2a;
 const CT720_CCT_OFF: usize = 0x2b;
 const CT720_INTEG_OFF: usize = 0x2f;
 const CT720_INTEG_MAX: u32 = 10_000_000;
+/// Clear counts at or below 11 on a covered J313 still had the firmware CCT
+/// byte set, and the published temperatures were 788 K, 1288 K, 2904 K and
+/// 6781 K. Publish CCT only when clear is at least this. Not hardware-tested.
+const CT720_CCT_MIN_CLEAR: u32 = 12;
 
 const _: () = assert!(CT720_CHANS <= MAX_CHANS);
 
@@ -198,9 +202,13 @@ fn ct720_color(message: &[u8], out: &mut [u64]) -> u32 {
         return 0;
     }
     let mut mask = 0u32;
+    let mut clear = 0u32;
     let mut slot = CH_RED;
     for off in CT720_COUNT_OFF {
         if let Some(count) = u32_at(message, off) {
+            if slot == CH_CLEAR {
+                clear = count;
+            }
             if let Some(dest) = out.get_mut(slot) {
                 *dest = u64::from(count).saturating_mul(MICRO);
                 mask |= 1u32 << slot;
@@ -208,7 +216,7 @@ fn ct720_color(message: &[u8], out: &mut [u64]) -> u32 {
         }
         slot += 1;
     }
-    if message.get(CT720_CCT_FLAG).copied() == Some(0) {
+    if message.get(CT720_CCT_FLAG).copied() == Some(0) || clear < CT720_CCT_MIN_CLEAR {
         return mask;
     }
     if let Some(bits) = u32_at(message, CT720_CCT_OFF) {

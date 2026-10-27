@@ -143,6 +143,10 @@ impl<T: MessageProcessor> FakehidListener for AopSensorData<T> {
                 self.values[i].store(raw[i].min(MAX_MICRO), Relaxed);
             }
         }
+        // Replace, do not OR. A CT720 report that fails the layout check
+        // contributes only the lux bit, and the previous color sample must
+        // read back as ENODATA rather than stay published. A zero mask never
+        // reaches here, so a report with no reading keeps the last sample.
         self.valid.store(u64::from(mask), Relaxed);
         smp_wmb();
         self.seq.store(seq.wrapping_add(2), Relaxed);
