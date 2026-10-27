@@ -77,9 +77,8 @@ pub(super) fn message(kind: u8, value: u64) {
 
 /// Failed-context teardown: 1 compute fault (qid, stamp), 2 unstamped render retire (slot,
 /// ordinal), 3 kill published (cookie, context, held slots | 1 if it skipped the wait for other
-/// contexts' compute under memory pressure; slot 0 is never held), 4 kill acknowledged (cookie,
-/// qid, or 0x100 for a render-only kill), 5 detach (context, slots, linked), 6 render slot to a
-/// new owner (slot, old, new | killed << 63), 7 render-only kill published (as 3).
+/// contexts' compute under memory pressure; slot 0 is never held), 4 kill acknowledged (cookie, qid),
+/// 5 detach (context, slots, linked), 6 render slot to a new owner (slot, old, new | killed << 63).
 pub(crate) fn teardown(kind: u8, a: u64, b: u64, c: u64) {
     // SAFETY: Plain values only.
     unsafe { asahi_g17_trace_teardown(kind, a, b, c) };
@@ -89,50 +88,4 @@ pub(crate) fn teardown(kind: u8, a: u64, b: u64, c: u64) {
 pub(super) fn event(phase: u8) {
     // SAFETY: Plain values only.
     unsafe { asahi_g17_trace_event(phase) };
-}
-
-unsafe extern "C" {
-    fn asahi_g17_trace_report_enabled() -> bool;
-    fn asahi_g17_trace_report(role: u8, ring: u8, words: *const u32);
-}
-
-/// Copies a complete firmware record while the host still owns its slot.
-/// Static-key gated; no MMIO reads or firmware requests are issued.
-pub(super) fn report(role: u8, ring: u8, words: &[u32; super::fw::channels::EVENT_WORDS]) {
-    // SAFETY: Pure static-key query.
-    if !unsafe { asahi_g17_trace_report_enabled() } {
-        return;
-    }
-    // SAFETY: C synchronously copies the complete initialized 18-word array.
-    unsafe { asahi_g17_trace_report(role, ring, words.as_ptr()) };
-}
-
-
-unsafe extern "C" {
-    fn asahi_g17_trace_inputs(ctx: u32, seq: u64, phase: u8, inputs: u32,
-        sources: u32, waits: u32, converted: bool);
-    fn asahi_g17_trace_schedule(engine: u8, ctx: u32, seq: u64, phase: u8, detail: i32);
-}
-
-/// Input conversion boundaries. No fence status is polled for tracing.
-pub(super) fn inputs(ctx: u32, seq: u64, phase: u8, inputs: usize,
-    sources: Option<&super::sync_input::Sources>)
-{
-    let (count, waits) = sources.map_or((0, 0),
-        |s| (s.sources.len(), s.publication_waits().len()));
-    // SAFETY: Bounded UAPI counts and plain values only. C reads the timer only
-    // behind this event's static key; no GPU registers or pointers are exposed.
-    unsafe { asahi_g17_trace_inputs(ctx, seq, phase, inputs as u32,
-        count as u32, waits as u32, sources.is_some()) };
-}
-
-/// Host scheduling boundaries, joined to publish/complete by engine/context/sequence.
-pub(super) fn schedule(packet: &super::job::Packet, phase: u8, detail: i32) {
-    let engine = match packet.command {
-        super::command::Validated::Render { .. } => RENDER,
-        super::command::Validated::Compute { .. } => COMPUTE,
-    };
-    // SAFETY: Plain values only; counter sampling is static-key gated in C.
-    unsafe { asahi_g17_trace_schedule(engine, packet.context.id(),
-        packet.order.sequence, phase, detail) };
 }

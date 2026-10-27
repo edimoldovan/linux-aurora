@@ -186,7 +186,7 @@ pub(super) struct Registry {
 impl Registry {
     /// Initialize inside the firmware allocation instead of staging the whole
     /// registry on the probe stack. No additional allocation is required.
-    #[cfg(CONFIG_KUNIT = "y")]
+    #[cfg(CONFIG_KUNIT)]
     pub(super) fn new(
         clusters: u32,
         deflake: crate::g17::fw::render::Deflake,
@@ -1399,9 +1399,6 @@ impl compute::Host for ComputeHost<'_> {
     fn compute_written(&self, priority: u8) -> u64 {
         self.port.compute_written(priority)
     }
-    fn compute_announced(&self, priority: u8) -> u64 {
-        self.port.compute_announced(priority)
-    }
     fn note_submission(&mut self) -> Result {
         self.effort.submit();
         super::Firmware::apply_shared_effort(self.init, self.effort, self.port, super::power::FULL_EFFORT)
@@ -1448,9 +1445,6 @@ impl compute::Host for DirectHost<'_> {
     }
     fn compute_written(&self, priority: u8) -> u64 {
         self.port.compute_written(priority)
-    }
-    fn compute_announced(&self, priority: u8) -> u64 {
-        self.port.compute_announced(priority)
     }
     fn note_submission(&mut self) -> Result {
         Ok(())
@@ -2386,8 +2380,6 @@ impl Registry {
         let waits = || self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref())
             .filter_map(|queue| queue.kill_waiting(now));
         compute_exit::write_kill_waits(f, waits().count(), waits().max().unwrap_or(0))?;
-        compute_exit::write_render_kills(f, self.teardown.kill_waits(now).count(),
-                                         self.teardown.kill_waits(now).max().unwrap_or(0))?;
         writeln!(f, "compute_slots used={} total={} reusable={} building={}",
                  self.compute.iter().flatten().count(), self.compute.len(),
                  self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()).filter(|queue| queue.reusable()).count(),

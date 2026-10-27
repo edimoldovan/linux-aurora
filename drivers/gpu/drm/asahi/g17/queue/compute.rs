@@ -566,6 +566,9 @@ pub(crate) struct Queue {
     replay_error: Option<Error>,
     replay_prepared: bool,
     exit: Option<exit::Transaction>,
+    /// Since when the kill of this failed queue's context waits for other contexts' compute,
+    /// and whether that wait was reported.
+    kill_wait: Option<(u64, bool)>,
     installed: bool,
     /// Bit `p` set once a work slot of priority class `p` named this queue.
     outer_started: u8,
@@ -691,6 +694,7 @@ impl Queue {
             replay_error: None,
             replay_prepared: false,
             exit: None,
+            kill_wait: None,
             installed: false,
             outer_started: 0,
             published_config: None,
@@ -730,6 +734,14 @@ impl Queue {
         {
             self.fault_stamp = Some(stamp);
         }
+    }
+
+    /// The firmware failed a command of this quarantined queue, and the queue still waits for
+    /// its retirement witness: commands published after the failed one, which the firmware
+    /// never runs, or the failed command itself, whose ring entry it does not consume (a ray
+    /// traversal's, on Neo). Only a kill of the queue's context gives them back.
+    pub(crate) fn fault_pending(&self) -> bool {
+        self.fault_stamp.is_some() && self.quarantined && self.awaiting_witness && self.exit.is_none()
     }
 
     /// The stamp that proves retirement: the stored one, or a newer reported fault's.
