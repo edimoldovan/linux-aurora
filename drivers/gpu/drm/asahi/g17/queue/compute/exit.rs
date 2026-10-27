@@ -111,6 +111,10 @@ impl Queue {
                     CANCELLED_DELAY_NS
                 }
     }
+    /// A kill of `context` was published through this queue.
+    pub(crate) fn exit_published(&self, context: &Arc<Context>) -> bool {
+        self.exit.is_some() && self.context().is_some_and(|bound| Arc::ptr_eq(bound, context))
+    }
     pub(crate) fn exit_owner(&self, context: &Arc<Context>) -> Option<u64> {
         if !self
             .active

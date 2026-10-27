@@ -2380,6 +2380,8 @@ impl Registry {
         let waits = || self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref())
             .filter_map(|queue| queue.kill_waiting(now));
         compute_exit::write_kill_waits(f, waits().count(), waits().max().unwrap_or(0))?;
+        compute_exit::write_render_kills(f, self.teardown.kill_waits(now).count(),
+                                         self.teardown.kill_waits(now).max().unwrap_or(0))?;
         writeln!(f, "compute_slots used={} total={} reusable={} building={}",
                  self.compute.iter().flatten().count(), self.compute.len(),
                  self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()).filter(|queue| queue.reusable()).count(),

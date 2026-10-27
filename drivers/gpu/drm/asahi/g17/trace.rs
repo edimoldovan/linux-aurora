@@ -77,8 +77,9 @@ pub(super) fn message(kind: u8, value: u64) {
 
 /// Failed-context teardown: 1 compute fault (qid, stamp), 2 unstamped render retire (slot,
 /// ordinal), 3 kill published (cookie, context, held slots | 1 if it skipped the wait for other
-/// contexts' compute under memory pressure; slot 0 is never held), 4 kill acknowledged (cookie, qid),
-/// 5 detach (context, slots, linked), 6 render slot to a new owner (slot, old, new | killed << 63).
+/// contexts' compute under memory pressure; slot 0 is never held), 4 kill acknowledged (cookie,
+/// qid, or 0x100 for a render-only kill), 5 detach (context, slots, linked), 6 render slot to a
+/// new owner (slot, old, new | killed << 63), 7 render-only kill published (as 3).
 pub(crate) fn teardown(kind: u8, a: u64, b: u64, c: u64) {
     // SAFETY: Plain values only.
     unsafe { asahi_g17_trace_teardown(kind, a, b, c) };

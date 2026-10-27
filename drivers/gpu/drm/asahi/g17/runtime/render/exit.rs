@@ -39,6 +39,14 @@ impl RenderState {
         slots
     }
 
+    /// The admission owner whose identities the pair in `slot` was built with.
+    pub(in crate::g17::runtime) fn slot_owner(&self, slot: u8) -> Option<u64> {
+        self.entries
+            .get(usize::from(slot))
+            .and_then(Option::as_ref)
+            .map(|entry| entry.reservation.owner)
+    }
+
     pub(in crate::g17::runtime) fn qids_for_slot(&self, slot: u8) -> u128 {
         self.entries
             .get(usize::from(slot))
