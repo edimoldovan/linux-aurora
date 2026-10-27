@@ -374,6 +374,9 @@ impl Firmware {
             refuse_render_kill(&mut self.queues.teardown, index, RENDER_KILL_OWNER);
             return Ok(());
         };
+        // As for a failed context's kill: the cookie first, so that running out of cookies
+        // leaves no admission hold behind.
+        let cookie = exit::next_cookie()?;
         if !self
             .queues
             .admission
@@ -382,7 +385,6 @@ impl Firmware {
             refuse_render_kill(&mut self.queues.teardown, index, RENDER_KILL_HOLD);
             return Ok(());
         }
-        let cookie = exit::next_cookie()?;
         let record = ControlRecord::ContextKill(ContextKill::new(context.scheduler_va(), cookie));
         if let Err(error) = Rings::publish_control(&self.init, &record) {
             self.queues.admission.release_exit_kill_hold(hold);
