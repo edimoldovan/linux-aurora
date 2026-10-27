@@ -499,7 +499,9 @@ struct CacheLease {
 pub(crate) struct PooledObject {
     object: core::mem::ManuallyDrop<KernelObject>,
     lease: Option<CacheLease>,
-    keep: Option<kernel::sync::Arc<Pool>>,
+    /// The pool keeping this object until firmware stop, and whether `reserve_kept` took its
+    /// list entry.
+    keep: Option<(kernel::sync::Arc<Pool>, bool)>,
 }
 
 impl core::ops::Deref for PooledObject {
@@ -520,8 +522,8 @@ impl PooledObject {
     /// entry, so the drop, wherever it happens, does not allocate.
     pub(crate) fn retain_until_stop(&mut self, pool: &kernel::sync::Arc<Pool>) {
         if self.keep.is_none() {
-            pool.reserve_kept();
-            self.keep = Some(pool.clone());
+            let reserved = pool.reserve_kept();
+            self.keep = Some((pool.clone(), reserved));
         }
     }
 }
@@ -531,8 +533,8 @@ impl Drop for PooledObject {
         // SAFETY: This destructor is the only operation that moves `object`
         // out; ManuallyDrop prevents a second implicit drop of the field.
         let object = unsafe { core::mem::ManuallyDrop::take(&mut self.object) };
-        if let Some(pool) = self.keep.take() {
-            pool.keep_object(object, self.lease.take());
+        if let Some((pool, reserved)) = self.keep.take() {
+            pool.keep_object(object, self.lease.take(), reserved);
             return;
         }
         match self.lease.take() {
@@ -687,22 +689,25 @@ impl Pool {
         core::mem::forget(object);
     }
 
-    /// Room for one more kept object, taken by the matching `keep_object`. A failed
-    /// allocation is reported by that drop, which then leaks the object instead.
-    fn reserve_kept(&self) {
+    /// Room for one more kept object, taken by the matching `keep_object`. Returns whether
+    /// it was reserved; after a failed allocation that drop leaks the object instead.
+    fn reserve_kept(&self) -> bool {
         let mut inner = self.inner.lock();
         let pending = inner.kept_reserved + 1;
         if inner.kept.capacity() - inner.kept.len() < pending
             && inner.kept.reserve(pending, GFP_KERNEL).is_err()
         {
-            return;
+            return false;
         }
         inner.kept_reserved = pending;
+        true
     }
 
-    fn keep_object(&self, object: KernelObject, lease: Option<CacheLease>) {
+    fn keep_object(&self, object: KernelObject, lease: Option<CacheLease>, reserved: bool) {
         let mut inner = self.inner.lock();
-        inner.kept_reserved = inner.kept_reserved.saturating_sub(1);
+        if reserved {
+            inner.kept_reserved = inner.kept_reserved.saturating_sub(1);
+        }
         if let Some(lease) = &lease {
             // The object leaves the reuse cache and its capacity.
             inner.reserved[lease.family as usize] -= 1;
@@ -716,6 +721,12 @@ impl Pool {
         let size = object.size();
         if inner.kept.len() == KEPT_WARN {
             pr_warn!("G17 keeps {} firmware-linked objects until the GPU firmware restarts\n", KEPT_WARN);
+        }
+        if !reserved {
+            // Another kept object's reservation must not be used: leak this one instead.
+            pr_err!("G17 could not record a firmware-linked object; leaking it\n");
+            core::mem::forget(object);
+            return;
         }
         // retain_until_stop reserved the entry; this never allocates.
         match inner.kept.push_within_capacity(object) {
