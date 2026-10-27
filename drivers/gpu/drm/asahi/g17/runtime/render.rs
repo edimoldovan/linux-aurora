@@ -1057,10 +1057,10 @@ impl Registry {
                     |pair| pair.published_in_flight(),
                 );
             active
-                && entry.reservation.ids.into_iter().all(|id| {
-                    let qid = usize::from(id.qid());
-                    entry.event_masks[qid / 64] & (1u64 << (qid % 64)) != 0
-                })
+                && crate::g17::queue::render::completion_noted(
+                    entry.reservation.ids.map(kick::Id::qid),
+                    entry.event_masks,
+                )
         })
     }
     pub(in crate::g17) fn defer_render_timeout(

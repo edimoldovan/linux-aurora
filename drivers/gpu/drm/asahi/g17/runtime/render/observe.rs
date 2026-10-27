@@ -26,9 +26,7 @@ impl crate::g17::Firmware {
             };
             let qids = pair.qids();
             if !pair.published_in_flight()
-                || !qids
-                    .into_iter()
-                    .all(|qid| entry.event_masks[usize::from(qid) / 64] & (1u64 << (qid % 64)) != 0)
+                || !crate::g17::queue::render::completion_noted(qids, entry.event_masks)
             {
                 continue;
             }
