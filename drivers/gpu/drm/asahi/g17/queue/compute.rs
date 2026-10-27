@@ -786,6 +786,16 @@ impl Queue {
     pub(crate) fn in_flight(&self) -> bool {
         self.active.len != 0 && !self.quarantined
     }
+    /// The oldest command is a published long job (ray traversal or AS build) whose
+    /// completion record the driver has not seen yet.
+    pub(crate) fn long_job_running(&self) -> bool {
+        !self.quarantined
+            && self.active.front().is_some_and(|active| {
+                active.observed.is_none()
+                    && active.packet.is_published()
+                    && active.packet.command.long_job()
+            })
+    }
     /// Quarantines without a pending witness no longer describe live pipe order.
     pub(crate) fn timeout_head(&self) -> Option<crate::g17::timeout::Head> {
         if self.quarantined && !self.awaiting_witness {

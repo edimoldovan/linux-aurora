@@ -66,13 +66,18 @@ const SHARED_RENEWALS: u8 = 14;
 /// nothing for this long has stopped.
 pub(crate) const LIVENESS_NS: u64 = 5_000_000_000;
 
-/// Renews a published job's deadline while some command retired within
-/// [`LIVENESS_NS`] (`since_retired`), at most [`SHARED_RENEWALS`] times.
-pub(crate) fn renew_shared(published: bool, since_retired: Option<u64>, renewals: &mut u8) -> bool {
-    if !published
-        || !since_retired.is_some_and(|since| since < LIVENESS_NS)
-        || *renewals >= SHARED_RENEWALS
-    {
+/// Whether some command retired within [`LIVENESS_NS`] (`since_retired`).
+pub(crate) fn retiring(since_retired: Option<u64>) -> bool {
+    since_retired.is_some_and(|since| since < LIVENESS_NS)
+}
+
+/// Renews a published job's deadline while the GPU is `shared`, at most
+/// [`SHARED_RENEWALS`] times. It is shared while some command retires
+/// ([`retiring`]), or while a long job of another queue runs beside a long job:
+/// two ray traversal dispatches of about 6 s each took 10 to 17 s side by side, and
+/// neither retires anything until it ends.
+pub(crate) fn renew_shared(published: bool, shared: bool, renewals: &mut u8) -> bool {
+    if !published || !shared || *renewals >= SHARED_RENEWALS {
         return false;
     }
     *renewals += 1;
@@ -244,19 +249,32 @@ mod tests {
     fn a_live_gpu_renews_a_published_job_for_thirty_seconds() {
         let mut renewals = 0;
         for poll in 1..=14u8 {
-            assert!(renew_shared(true, Some(4_900_000_000), &mut renewals));
+            assert!(renew_shared(true, retiring(Some(4_900_000_000)), &mut renewals));
             assert_eq!(renewals, poll);
         }
-        assert!(!renew_shared(true, Some(0), &mut renewals));
+        assert!(!renew_shared(true, true, &mut renewals));
         assert_eq!(POLL_MS * (u32::from(renewals) + 1), 30_000);
     }
     #[test]
     fn a_stopped_gpu_or_unpublished_job_keeps_the_deadline() {
         let mut renewals = 0;
-        assert!(!renew_shared(true, Some(LIVENESS_NS), &mut renewals));
-        assert!(!renew_shared(true, None, &mut renewals));
-        assert!(!renew_shared(false, Some(0), &mut renewals));
+        assert!(!renew_shared(true, retiring(Some(LIVENESS_NS)), &mut renewals));
+        assert!(!renew_shared(true, retiring(None), &mut renewals));
+        assert!(!renew_shared(false, true, &mut renewals));
         assert_eq!(renewals, 0);
+    }
+    #[test]
+    fn a_long_job_beside_another_shares_the_gpu_without_retirements() {
+        // Two traversal dispatches side by side: nothing retires, yet both progress.
+        let mut renewals = 0;
+        let long_job_beside = true;
+        let shared = retiring(Some(LIVENESS_NS + 1)) || long_job_beside;
+        for poll in 1..=14u8 {
+            assert!(renew_shared(true, shared, &mut renewals));
+            assert_eq!(renewals, poll);
+        }
+        // The thirty-second bound still ends a pair that never finishes.
+        assert!(!renew_shared(true, true, &mut renewals));
     }
     #[test]
     fn exhausted_or_invalid_credit_never_wraps() {

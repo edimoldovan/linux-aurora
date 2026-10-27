@@ -293,6 +293,8 @@ pub(crate) trait Backend: Send + Sync {
     fn cancel(&self, packet: Arc<Packet>);
     /// Transfer a timeout to an outstanding off-lock graph transaction, if any.
     fn defer_timeout(&self, packet: &Arc<Packet>, renewals: u8) -> bool;
+    /// A long job of another queue is running beside `packet`.
+    fn long_job_beside(&self, _packet: &Arc<Packet>) -> bool { false }
     /// Return true only after taking publication ownership and recording its result.
     fn try_early(&self, packet: &Arc<Packet>) -> bool;
     fn count_backlog(&self, packet: &Packet);
@@ -346,11 +348,11 @@ impl<B: Backend> sched::JobImpl for Job<B> {
         ) {
             return true;
         }
-        // Other work retiring means the GPU is shared, not hung.
-        if super::timeout::renew_shared(
-            job.packet.is_published(), super::recovery::since_retired(super::now_ns()),
-            &mut job.shared_renewals,
-        ) {
+        // Other work retiring means the GPU is shared, not hung. So does another long job
+        // running beside a long job, though neither retires until it ends.
+        let shared = super::timeout::retiring(super::recovery::since_retired(super::now_ns()))
+            || (job.packet.command.long_job() && job.backend.long_job_beside(&job.packet));
+        if super::timeout::renew_shared(job.packet.is_published(), shared, &mut job.shared_renewals) {
             return true;
         }
         let deferred = job.backend.defer_timeout(&job.packet, job.victim_renewals);

@@ -297,6 +297,16 @@ impl job::Backend for Backend {
         }
     }
 
+    fn long_job_beside(&self, _packet: &Arc<Packet>) -> bool {
+        let state = self.shared.state.lock();
+        let Some(firmware) = (*state).as_deref() else {
+            return false;
+        };
+        firmware.queues.compute.iter().flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .any(|other| other.owner() != Some(self.owner) && other.long_job_running())
+    }
+
     fn defer_timeout(&self, packet: &Arc<Packet>, renewals: u8) -> bool {
         if packet.engine() == Engine::Compute {
             return self.defer_compute_timeout(packet, renewals);
