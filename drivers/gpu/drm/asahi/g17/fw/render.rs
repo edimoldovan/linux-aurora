@@ -1023,7 +1023,11 @@ pub(crate) struct TaDescriptor {
     /// QID of the tiling queue.
     pub(crate) qid: u32,
     pub(crate) unk_8be: u32,
-    pub(crate) unk_8c2: u32,
+    /// Non-zero on the first kick of a queue pair, like the fragment descriptor's word at the
+    /// same position. Set on every kick, the firmware also notifies the host of each pass's
+    /// tiling completion, which no retirement needs. The 25G83 firmware keeps it set on every
+    /// kick until this is measured there.
+    pub(crate) first_kick: u32,
     /// Completion value of the tiling kick (see
     /// [`KickTimestamp::completion_value`]).
     pub(crate) completion: u64,
@@ -1073,7 +1077,6 @@ impl TaDescriptor {
     const ARRAY_OFFSET: u64 = core::mem::offset_of!(Self, registers) as u64;
     const UNK_876: u32 = u32::MAX;
     const UNK_892: u32 = 1;
-    const UNK_8C2: u32 = 1;
     const UNK_932: u8 = 0x44;
     const UNK_93C: u8 = 1;
     const UNK_93E_FIRST_KICK: [u8; 2] = [0xd0, 0x91];
@@ -1127,7 +1130,10 @@ impl TaDescriptor {
         self.aux_stamp_va = args.ta.aux_stamp_va;
         self.stamp_value_2 = stamp_value;
         self.qid = args.ta.qid.into();
-        self.unk_8c2 = Self::UNK_8C2;
+        self.first_kick = match args.programs == RegisterPrograms::V25G83 {
+            true => 1,
+            false => u32::from(args.ordinal == 0),
+        };
         self.current_id = resources.ta_ids.current.into();
         self.ordinal = args.ordinal as u32;
         self.timestamp_start_va = resources.timestamp_va;
