@@ -231,7 +231,11 @@ config APPLE_T6030_DISPLAY_GATE
 	  in the same way and only with the PMP values the boot loader passes.
 	  There the native display is on by default on the J516C, unless
 	  apple_t6031_display.enable=0; the other T6031 boards need
-	  apple_t6031_display.enable=1 on the kernel command line.
+	  apple_t6031_display.enable=1 on the kernel command line. The T6031
+	  GPU driver starts its firmware only after this native display is
+	  up, so apple_t6031_display.enable=0, or a native display that does
+	  not come up, also keeps the GPU off for that boot. It is not a
+	  display-only switch.
 
 	  Say 'y' if you want the native display on M3 Pro MacBook Pros.
 
