@@ -147,6 +147,10 @@ kernel::of_device_table!(
             ProbeConfig::G17(&hw::t8140::CONFIG)
         ),
         (
+            of::DeviceId::new(c"apple,agx-t6050"),
+            ProbeConfig::G17(&hw::t6050::CONFIG)
+        ),
+        (
             of::DeviceId::new(c"apple,agx-t8103"),
             ProbeConfig::Legacy(&hw::t8103::HWCONFIG)
         ),
