@@ -76,6 +76,9 @@
 
 &mtp_hid {
 	mtp_mt: multi-touch {
+		firmware-name = "apple/tpmtfw-j714c.bin";
+		apple,power-method = <2>;
+		apple,firmware-managed-reset;
 	};
 
 	keyboard: keyboard {
