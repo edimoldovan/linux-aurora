@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! The 20-word block at HwDataA +0x418c..+0x41db that the runtime backend writes on a T8122
-//! with the G15 14.8.3 firmware, unless `asahi.t8122_hwdata_418c=0`. Plain data only, so that
-//! the host tests run it (tools/asahi).
+//! with the G15 14.8.3 firmware. The chip and firmware identity select it, as they select the
+//! rest of HwDataA; there is no switch to leave it out. Plain data only, so that the host tests
+//! run it (tools/asahi).
 //!
 //! The words are not in the device tree, and what they mean is not known. They have been
 //! tested on 10-core and 8-core J613s only; J615 on this firmware is untested.
@@ -31,27 +32,7 @@ pub(crate) const WORDS: [u32; 20] = [
 /// Size of the block in bytes.
 pub(crate) const SIZE: usize = WORDS.len() * 4;
 
-/// `asahi.t8122_hwdata_418c` values: 0 leaves the range as the builder made it (zero), 1 writes
-/// the block. The default is 1.
-pub(crate) const OFF: u64 = 0;
-pub(crate) const ON: u64 = 1;
-pub(crate) const DEFAULT: u64 = ON;
-
 const _: () = assert!(SIZE == 0x50 && OFFSET % 4 == 0);
-
-/// Parse `asahi.t8122_hwdata_418c`: `0` or `1`. Anything else is refused.
-pub(crate) fn parse(text: &str) -> Option<u64> {
-    match text.trim() {
-        "0" => Some(OFF),
-        "1" => Some(ON),
-        _ => None,
-    }
-}
-
-/// Whether a parameter value asks for the block.
-pub(crate) fn enabled(value: u64) -> bool {
-    value == ON
-}
 
 /// Write the block into `hwdata_a`, the bytes of HwDataA. Nothing outside
 /// `OFFSET..OFFSET + SIZE` changes. Err, with nothing written, when `hwdata_a` is too short.
@@ -111,17 +92,5 @@ mod tests {
         assert!(a.iter().all(|b| *b == 0));
         let mut exact = vec![0u8; OFFSET + SIZE];
         assert_eq!(write(&mut exact), Ok(()));
-    }
-
-    #[test]
-    fn the_parameter_accepts_0_and_1_only_and_defaults_to_1() {
-        assert_eq!(parse("0"), Some(OFF));
-        assert_eq!(parse("1"), Some(ON));
-        assert_eq!(parse(" 1\n"), Some(ON));
-        for text in ["", "2", "-1", "+1", "0x1", "on", "yes", "01"] {
-            assert_eq!(parse(text), None, "{text:?}");
-        }
-        assert!(enabled(DEFAULT));
-        assert!(!enabled(OFF));
     }
 }
