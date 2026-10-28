@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <kunit/visibility.h>
+#include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/iopoll.h>
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
 #include <linux/regmap.h>
 #include <linux/spmi.h>
+#include <linux/usb/tipd.h>
 
 #include "tps6598x.h"
 
@@ -277,6 +279,89 @@ static int sn201202x_probe(struct spmi_device *device)
 		spmi_command_sleep(device);
 	return ret;
 }
+
+/* MODE, STATUS, POWER_STATUS and DATA_STATUS (0x03, 0x1a, 0x3f, 0x5f), for the log. */
+static u32 sn201202x_state(struct tps6598x *tps, const char *when)
+{
+	u32 mode = 0, status = 0, data = 0;
+	u16 power = 0;
+
+	tps6598x_block_read(tps, 0x03, &mode, sizeof(mode));
+	tps6598x_block_read(tps, 0x1a, &status, sizeof(status));
+	tps6598x_block_read(tps, 0x3f, &power, sizeof(power));
+	tps6598x_block_read(tps, 0x5f, &data, sizeof(data));
+	dev_info(tps->dev, "%s: mode %.4s, status %#x, power %#x, data %#x\n", when,
+		 (char *)&mode, status, power, data);
+	return status;
+}
+
+/*
+ * "DISC" in the debug mode: unlocked with @key ("apple,unlock-key", the ADT
+ * target-type's first four characters reversed, as m1n1 does), "DBMa" entered
+ * for the command and left at once, while the port is still disconnected.
+ * Called with tps->lock held.
+ */
+static int sn201202x_disc(struct tps6598x *tps, const char *key, u8 seconds)
+{
+	static const u8 lock_key[4];
+	int lock, dbma = -ENODATA, disc = -ENODATA, leave = -ENODATA, relock;
+	u32 status, last;
+	unsigned int i;
+	u8 en = 1;
+
+	sn201202x_state(tps, "before DISC");
+	lock = tps6598x_exec_cmd_tmo(tps, "LOCK", 4, (const u8 *)key, 0, NULL, 1000, 0);
+	if (!lock)
+		dbma = tps6598x_exec_cmd_tmo(tps, "DBMa", sizeof(en), &en, 0, NULL, 1000, 0);
+	if (!lock && !dbma) {
+		disc = tps6598x_exec_cmd_tmo(tps, "DISC", sizeof(seconds), &seconds, 0, NULL,
+					     1000 * (seconds + 1), 0);
+		sn201202x_state(tps, "DISC done");
+		en = 0;
+		leave = tps6598x_exec_cmd_tmo(tps, "DBMa", sizeof(en), &en, 0, NULL, 1000, 0);
+	}
+	relock = tps6598x_exec_cmd_tmo(tps, "LOCK", sizeof(lock_key), lock_key, 0, NULL, 1000, 0);
+	dev_info(tps->dev, "simulated disconnect: LOCK %d, DBMa %d, DISC %d, DBMa 0 %d, LOCK 0 %d\n",
+		 lock, dbma, disc, leave, relock);
+
+	/* Diagnostic: every STATUS change for 25 s. */
+	last = sn201202x_state(tps, "locked again");
+	for (i = 0; i < 50; i++) {
+		msleep(500);
+		if (!tps6598x_block_read(tps, 0x1a, &status, sizeof(status)) && status != last)
+			last = sn201202x_state(tps, "after");
+	}
+	return lock ?: dbma ?: disc;
+}
+
+/*
+ * Simulated disconnect ("DISC"): the port drops its partner, VBUS included, for
+ * @seconds and then sees it again as freshly plugged in. -EPROBE_DEFER until
+ * the controller at @np is bound.
+ */
+int sn201202x_simulate_disconnect(struct device_node *np, u8 seconds)
+{
+	struct spmi_device *sdev = spmi_find_device_by_of_node(np);
+	struct tps6598x *tps;
+	const char *key;
+	int ret = -EPROBE_DEFER;
+
+	if (!sdev)
+		return ret;
+	if (device_is_bound(&sdev->dev)) {
+		tps = spmi_device_get_drvdata(sdev);
+		guard(mutex)(&tps->lock);
+		if (!tps->dbma_at_probe && !of_property_read_string(np, "apple,unlock-key", &key) &&
+		    strlen(key) == 4)
+			ret = sn201202x_disc(tps, key, seconds);
+		else
+			ret = tps6598x_exec_cmd_tmo(tps, "DISC", sizeof(seconds), &seconds, 0,
+						    NULL, 1000, 0);
+	}
+	put_device(&sdev->dev);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(sn201202x_simulate_disconnect);
 
 static void sn201202x_remove(struct spmi_device *device)
 {
