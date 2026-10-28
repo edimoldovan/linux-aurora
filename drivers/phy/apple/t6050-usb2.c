@@ -31,6 +31,7 @@
 #include <linux/platform_device.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/string.h>
+#include <linux/usb/tipd.h>
 #include <linux/workqueue.h>
 
 #define USB2PHY_USBCTL			0x00
@@ -75,6 +76,7 @@
 #define XHCI_PORTSC1			0x420
 #define XHCI_PORTSC2			0x430
 #define XHCI_PORTSC_CCS			BIT(0)
+#define XHCI_PORTSC_PR			BIT(4)
 
 /* SuperSpeed: pipe handler, AUSBC power control, Type-C PHY ("atc") windows. */
 #define PIPEHANDLER_LOCK_REQ		0x10
@@ -202,6 +204,13 @@ struct t6050_usb2 {
 	/* SuperSpeed only */
 	bool ss;
 	struct work_struct ltssm_work;
+	struct device_node *hpm;
+	struct delayed_work replug_work;
+	unsigned int replug_tries;
+	struct delayed_work u2reset_work;
+	unsigned int u2resets;
+	bool u2reset_queued;
+	struct delayed_work standalone_work;
 	void __iomem *pctl;
 	void __iomem *atc;
 	void __iomem *mxw;
@@ -292,6 +301,43 @@ MODULE_PARM_DESC(ss_settle_ms, "SuperSpeed sequence: pause after step 16, ms");
 static bool ss_susphy = true;
 module_param(ss_susphy, bool, 0444);
 MODULE_PARM_DESC(ss_susphy, "SuperSpeed sequence: set GUSB3PIPECTL SUSPHY again before step 1");
+
+static bool ss_susphy_clear;
+module_param(ss_susphy_clear, bool, 0444);
+MODULE_PARM_DESC(ss_susphy_clear, "SuperSpeed sequence: clear GUSB3PIPECTL SUSPHY after the xHCI reset (step 17)");
+
+/* Plug orientation: flipped uses lane 1 and the swapped crossbar (steps 7, 9, 10). */
+static bool ss_flip;
+module_param(ss_flip, bool, 0444);
+MODULE_PARM_DESC(ss_flip, "SuperSpeed sequence: flipped plug orientation");
+
+/*
+ * A device plugged in at power-on no longer goes for SuperSpeed on a USB 2.0 port
+ * reset, but a fresh connection trains at once: after step 16 the port's Type-C
+ * controller simulates an unplug of this many seconds. Off by default: the device
+ * does not come back as a fresh connection (kernel/USB-BRINGUP.md).
+ */
+static unsigned int ss_replug_s;
+module_param(ss_replug_s, uint, 0444);
+MODULE_PARM_DESC(ss_replug_s, "SuperSpeed: simulated disconnect after step 16, s (0: off)");
+
+/*
+ * Step 18 again: a device left at high speed by the hub's USB 2.0 resets often goes
+ * for SuperSpeed on a later one (the proxy: U0 on the 5th). From 3 s after the xHCI
+ * reset, while the SS port has no connection, reset the USB 2.0 port every 2 s. Off by
+ * default: under Linux each reset costs the high-speed device and none has trained yet.
+ */
+static unsigned int ss_u2resets;
+module_param(ss_u2resets, uint, 0444);
+MODULE_PARM_DESC(ss_u2resets, "SuperSpeed: extra USB 2.0 port resets until the SS port connects (0: off)");
+
+/*
+ * Test without the xHCI driver (port 1's xHCI node disabled): the proxy run from
+ * here, steps 1-17, run, port power, then USB 2.0 resets until the SS port is in U0.
+ */
+static bool ss_standalone;
+module_param(ss_standalone, bool, 0444);
+MODULE_PARM_DESC(ss_standalone, "SuperSpeed test: sequence and USB 2.0 resets without the xHCI driver");
 
 static void t6050_ss_mask(void __iomem *reg, u32 clear, u32 set)
 {
@@ -402,16 +448,18 @@ static void t6050_phy_cpu_boot(struct t6050_usb2 *p)
 static void t6050_usb3_up(struct t6050_usb2 *p)
 {
 	void __iomem *atc = p->atc, *pipe = p->pipehandler;
-	bool hcrst, cnr, cio = true, mxw, tnbl, s1, rise, fall, lock, ack, unlock, rel;
+	bool hcrst, cnr, cio = true, mxw, tnbl, s1, rise, fall, lock, ack, unlock, rel, wpr;
+	unsigned long wpr_us;
+	unsigned int l = ss_flip;	/* active lane */
 	unsigned int i, n = 0;
 	char trace[17 * 9 + 1];
 	u32 val, tr[17];
 	int len = 0;
 
-	/* The glue back to the boot values while CIO is still off; tr[] = cd28 after each step. */
+	/* The glue back to the boot values while CIO is still off; tr[] = SS PORTSC after each step. */
 	for (i = 0; i < ARRAY_SIZE(t6050_glue); i++)
 		writel(t6050_glue_boot[i], p->core + t6050_glue[i]);
-	tr[n++] = readl(p->core + t6050_glue[0]);
+	tr[n++] = readl(p->core + XHCI_PORTSC2);
 
 	if (ss_susphy)
 		t6050_usb2_mask(p->core + DWC3_GUSB3PIPECTL0, 0, DWC3_GUSB3PIPECTL_SUSPHY);
@@ -420,56 +468,62 @@ static void t6050_usb3_up(struct t6050_usb2 *p)
 	t6050_ss_mask(p->core + XHCI_USBCMD, 0, XHCI_USBCMD_HCRST);
 	hcrst = t6050_wait(p->core + XHCI_USBCMD, XHCI_USBCMD_HCRST, 0, 1000);
 	cnr = t6050_wait(p->core + XHCI_USBSTS, XHCI_USBSTS_CNR, 0, 1000);
-	tr[n++] = readl(p->core + t6050_glue[0]);
+	tr[n++] = readl(p->core + XHCI_PORTSC2);
 
 	/* 2. Controller tunables. 3. TXDETRX lock request. */
 	t6050_tunables_apply(p->host_tun, ARRAY_SIZE(p->host_tun));
 	t6050_ss_mask(p->pctl + PCTL_TXDETRX_REQ, 0, BIT(0));
-	tr[n++] = readl(p->core + t6050_glue[0]);
+	tr[n++] = readl(p->core + XHCI_PORTSC2);
 
 	/* 4. CIO power domains, then the PHY power control; the PHY reset stays asserted. */
 	for (i = 0; i < ARRAY_SIZE(t6050_cio_domains); i++)
 		cio &= t6050_ps_on(p->pmgr + t6050_cio_domains[i]);
 	mxw = t6050_ps_on(p->pmgr_mxw + PS_PHYMXWRAP);
-	tr[n++] = readl(p->core + t6050_glue[0]);
+	tr[n++] = readl(p->core + XHCI_PORTSC2);
 	t6050_ss_mask(p->atc_pwr + ATC_PWR_CTRL, 0, ATC_PWR_SLEEP_SMALL);
 	t6050_wait(p->atc_pwr + ATC_PWR_STAT, ATC_PWR_SLEEP_SMALL, ATC_PWR_SLEEP_SMALL, 100);
 	t6050_ss_mask(p->atc_pwr + ATC_PWR_CTRL, 0, ATC_PWR_SLEEP_BIG);
 	t6050_wait(p->atc_pwr + ATC_PWR_STAT, ATC_PWR_SLEEP_BIG, ATC_PWR_SLEEP_BIG, 100);
 	t6050_ss_mask(p->atc_pwr + ATC_PWR_CTRL, ATC_PWR_CLAMP, 0);
 	t6050_ss_mask(p->atc_pwr + ATC_PWR_CTRL, 0, ATC_PWR_APB_RESET_N);
-	tr[n++] = readl(p->core + t6050_glue[0]);
+	tr[n++] = readl(p->core + XHCI_PORTSC2);
 
 	/* 5. PHY tunables. */
 	t6050_tunables_apply(p->phy_tun, ARRAY_SIZE(p->phy_tun));
-	tr[n++] = readl(p->core + t6050_glue[0]);
+	tr[n++] = readl(p->core + XHCI_PORTSC2);
 
 	/* 6. Port capability host, no core soft reset. */
 	t6050_ss_mask(p->core + DWC3_GCTL, DWC3_GCTL_PRTCAPDIR_MASK, DWC3_GCTL_PRTCAP_HOST);
 	t6050_ss_mask(atc + ATC_LANE_MODE, 0xfc, (2 << 2) | (2 << 5));
-	tr[n++] = readl(p->core + t6050_glue[0]);
+	tr[n++] = readl(p->core + XHCI_PORTSC2);
 
 	/* 7. Sleep control, USB3 mode: common block and lane 0 overrides to the FSM. */
 	t6050_ss_mask(atc + ATC_CFG0, BIT(1) | BIT(3) | BIT(5), 0);
-	t6050_ss_mask(atc + ATC_RX_PWR, BIT(2), 0);
-	t6050_ss_mask(atc + ATC_RX_PWR, BIT(6), 0);
-	t6050_ss_mask(atc + ATC_CFG0, BIT(16), 0);
-	t6050_ss_mask(atc + ATC_CFG0, BIT(8), 0);
-	t6050_ss_mask(atc + ATC_CFG0, BIT(12), 0);
-	t6050_ss_mask(atc + ATC_TX_PWR, BIT(6), 0);
-	t6050_ss_mask(atc + ATC_TX_PWR, BIT(2), 0);
-	t6050_ss_mask(atc + ATC_TX_PWR, BIT(10), 0);
-	tr[n++] = readl(p->core + t6050_glue[0]);
+	t6050_ss_mask(atc + ATC_RX_PWR, BIT(2 + l), 0);
+	t6050_ss_mask(atc + ATC_RX_PWR, BIT(6 + l), 0);
+	t6050_ss_mask(atc + ATC_CFG0, BIT(16 + l), 0);
+	t6050_ss_mask(atc + ATC_CFG0, BIT(8 + l), 0);
+	t6050_ss_mask(atc + ATC_CFG0, BIT(12 + l), 0);
+	t6050_ss_mask(atc + ATC_TX_PWR, BIT(6 + l), 0);
+	t6050_ss_mask(atc + ATC_TX_PWR, BIT(2 + l), 0);
+	t6050_ss_mask(atc + ATC_TX_PWR, BIT(10 + l), 0);
+	tr[n++] = readl(p->core + XHCI_PORTSC2);
 
 	/* 8. MxWrap idle control. */
 	t6050_ss_mask(p->mxw + MXW_IDLE_CTRL, 0, BIT(0));
-	tr[n++] = readl(p->core + t6050_glue[0]);
+	tr[n++] = readl(p->core + XHCI_PORTSC2);
 
-	/* 9. Crossbar, normal orientation: lane 0 mode 1, lane 1 mode 2, USB3 + DP. */
-	t6050_ss_mask(atc + ATC_LANE_MODE, 0xfc | BIT(23) | BIT(25), 0x44);
-	t6050_ss_mask(atc + ATC_XBAR, GENMASK(16, 0), 0x110);
+	/*
+	 * 9. Crossbar, USB3 + DP: normal lane 0 mode 1, lane 1 mode 2; flipped lane 0
+	 * mode 2, lane 1 mode 1.
+	 */
+	if (l)
+		t6050_ss_mask(atc + ATC_LANE_MODE, 0xfc | BIT(22) | BIT(24), 0x28);
+	else
+		t6050_ss_mask(atc + ATC_LANE_MODE, 0xfc | BIT(23) | BIT(25), 0x44);
+	t6050_ss_mask(atc + ATC_XBAR, GENMASK(16, 0), 0x110 | l);
 	t6050_ss_mask(atc + ATC_LANE_MODE, GENMASK(1, 0), 2);
-	tr[n++] = readl(p->core + t6050_glue[0]);
+	tr[n++] = readl(p->core + XHCI_PORTSC2);
 
 	/* 10. BIST first half. */
 	t6050_ss_mask(atc + ATC_BIST_CFG1, 0, ATC_BIST_CFG1_CLOCK_EN);
@@ -480,20 +534,21 @@ static void t6050_usb3_up(struct t6050_usb2 *p)
 	t6050_ss_mask(atc + ATC_BIST_OV2, 0x660, 0x220);
 	t6050_ss_mask(atc + ATC_BIST_CFG1, 0, ATC_BIST_CFG1_USB_EN);
 	t6050_ss_mask(atc + ATC_BIST_CFG1, ATC_BIST_CFG1_USB_EN, 0);
-	t6050_ss_mask(p->atc_pwr + ATC_PWR_MISC, ATC_PWR_MISC_USB_LN_SWAP, 0);
+	t6050_ss_mask(p->atc_pwr + ATC_PWR_MISC, ATC_PWR_MISC_USB_LN_SWAP,
+		      l ? ATC_PWR_MISC_USB_LN_SWAP : 0);
 	msleep(10);
-	tr[n++] = readl(p->core + t6050_glue[0]);
+	tr[n++] = readl(p->core + XHCI_PORTSC2);
 
 	/* 11. PHY CPU firmware, then its tunables-done flag. */
 	t6050_phy_cpu_boot(p);
 	usleep_range(5000, 6000);
 	tnbl = t6050_wait(atc + ATC_UC_CTRL, ATC_UC_TNBL_DONE, ATC_UC_TNBL_DONE, 1000);
-	tr[n++] = readl(p->core + t6050_glue[0]);
+	tr[n++] = readl(p->core + XHCI_PORTSC2);
 
 	/* 12. PHY reset release. */
 	t6050_ss_mask(p->atc_pwr + ATC_PWR_CTRL, 0, ATC_PWR_PHY_RESET_N);
 	msleep(100);
-	tr[n++] = readl(p->core + t6050_glue[0]);
+	tr[n++] = readl(p->core + XHCI_PORTSC2);
 
 	/* 13. BIST second half. */
 	t6050_ss_mask(atc + ATC_BIST_OV1, 0, ATC_BIST_OV1_PIPE_RESET_N);
@@ -506,12 +561,21 @@ static void t6050_usb3_up(struct t6050_usb2 *p)
 	rise = t6050_wait(atc + ATC_BIST_STATUS2, ATC_BIST_STATUS2_PHY_STATUS,
 			  ATC_BIST_STATUS2_PHY_STATUS, 1000);
 	fall = t6050_wait(atc + ATC_BIST_STATUS2, ATC_BIST_STATUS2_PHY_STATUS, 0, 1000);
+	/*
+	 * The SS port has been in a warm reset since host mode (step 6); it completes
+	 * with the PHY held here (power-down override 3). The proxy runs, which missed
+	 * the PhyStatus pulse and waited out its 1 s timeout, always had it completed
+	 * at this point and reached step 17 with a clean port; wait for it here.
+	 */
+	wpr_us = jiffies;
+	wpr = t6050_wait(p->core + XHCI_PORTSC2, XHCI_PORTSC_PR, 0, 1000);
+	wpr_us = jiffies_to_usecs(jiffies - wpr_us);
 	t6050_ss_mask(atc + ATC_BIST_OV2, 0x660, 0);
 	t6050_ss_mask(atc + ATC_BIST_CFG1, 0, ATC_BIST_CFG1_USB_EN);
 	t6050_ss_mask(atc + ATC_BIST_CFG1, ATC_BIST_CFG1_USB_EN, 0);
 	t6050_ss_mask(pipe + PIPEHANDLER_NONSELECTED_OVERRIDE, GENMASK(3, 0), 3);
 	t6050_ss_mask(pipe + PIPEHANDLER_NONSELECTED_OVERRIDE, BIT(12), 0);
-	tr[n++] = readl(p->core + t6050_glue[0]);
+	tr[n++] = readl(p->core + XHCI_PORTSC2);
 
 	/* 14. PIPE overrides and lock; the PHY answers the TXDETRX request. */
 	t6050_ss_mask(pipe + PIPEHANDLER_OVERRIDE_VALUES, BIT(1) | BIT(2), 0);
@@ -520,7 +584,7 @@ static void t6050_usb3_up(struct t6050_usb2 *p)
 	t6050_ss_mask(pipe + PIPEHANDLER_LOCK_REQ, 0, PIPEHANDLER_LOCK);
 	lock = t6050_wait(pipe + PIPEHANDLER_LOCK_ACK, PIPEHANDLER_LOCK, PIPEHANDLER_LOCK, 100);
 	ack = t6050_wait(p->pctl + PCTL_TXDETRX_ACK, BIT(0), BIT(0), 50);
-	tr[n++] = readl(p->core + t6050_glue[0]);
+	tr[n++] = readl(p->core + XHCI_PORTSC2);
 
 	/* 15. PIPE to the USB3 PHY, overrides off, unlock. */
 	t6050_ss_mask(pipe + PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CLK, 0);
@@ -531,12 +595,12 @@ static void t6050_usb3_up(struct t6050_usb2 *p)
 	t6050_ss_mask(pipe + PIPEHANDLER_OVERRIDE, BIT(2), 0);
 	t6050_ss_mask(pipe + PIPEHANDLER_LOCK_REQ, PIPEHANDLER_LOCK, 0);
 	unlock = t6050_wait(pipe + PIPEHANDLER_LOCK_ACK, PIPEHANDLER_LOCK, 0, 10);
-	tr[n++] = readl(p->core + t6050_glue[0]);
+	tr[n++] = readl(p->core + XHCI_PORTSC2);
 
 	/* 16. TXDETRX lock release. */
 	t6050_ss_mask(p->pctl + PCTL_TXDETRX_REQ, BIT(0), 0);
 	rel = t6050_wait(p->pctl + PCTL_TXDETRX_ACK, BIT(0), 0, 50);
-	tr[n++] = readl(p->core + t6050_glue[0]);
+	tr[n++] = readl(p->core + XHCI_PORTSC2);
 
 	val = readl(atc + ATC_BIST_STATUS2);
 	for (i = 0; i < n; i++)
@@ -544,15 +608,49 @@ static void t6050_usb3_up(struct t6050_usb2 *p)
 
 	dev_info(p->dev, "SS: HCRST %d CNR %d, CIO %d, mxwrap %d, UC_TNBL_DONE %d\n",
 		 hcrst, cnr, cio, mxw, tnbl);
-	dev_info(p->dev, "SS: cd28 from the write through step 16:%s\n", trace);
+	dev_info(p->dev, "SS: SS PORTSC from the write through step 16:%s\n", trace);
 	dev_info(p->dev, "SS: PhyStatus s1 %d rise %d fall %d (STATUS2 %#x), lock %d ack %d unlock %d release %d\n",
 		 s1, rise, fall, val, lock, ack, unlock, rel);
-	dev_info(p->dev, "SS: pace %u us, settle %u ms, susphy %d\n", ss_pace_us, ss_settle_ms, ss_susphy);
+	dev_info(p->dev, "SS: warm reset in step 13 done %d after %lu us\n", wpr, wpr_us);
+	dev_info(p->dev, "SS: pace %u us, settle %u ms, susphy %d, flip %d\n", ss_pace_us, ss_settle_ms,
+		 ss_susphy, ss_flip);
 	msleep(ss_settle_ms);
 	dev_info(p->dev, "SS: glue %#x %#x %#x %#x, PORTSC %#x / %#x\n", readl(p->core + t6050_glue[0]),
 		 readl(p->core + t6050_glue[1]), readl(p->core + t6050_glue[2]),
 		 readl(p->core + t6050_glue[3]), readl(p->core + XHCI_PORTSC1),
 		 readl(p->core + XHCI_PORTSC2));
+	if (p->hpm && ss_replug_s)
+		schedule_delayed_work(&p->replug_work, 0);
+}
+
+/* Diagnostic around the simulated unplug: the port 1 registers of both sides. */
+static void t6050_port_state(struct t6050_usb2 *p, const char *when)
+{
+	dev_info(p->dev, "SS: %s: PORTSC %#x / %#x, usb2phy %#x %#x %#x, pipe mux %#x, GUSB2PHYCFG %#x, GUSB3PIPECTL %#x, power %#x / %#x, UC_CTRL %#x, STATUS2 %#x\n",
+		 when, readl(p->core + XHCI_PORTSC1), readl(p->core + XHCI_PORTSC2),
+		 readl(p->usb2phy + USB2PHY_USBCTL), readl(p->usb2phy + USB2PHY_CTL),
+		 readl(p->usb2phy + USB2PHY_SIG), readl(p->pipehandler + PIPEHANDLER_MUX_CTRL),
+		 readl(p->core + DWC3_GUSB2PHYCFG0), readl(p->core + DWC3_GUSB3PIPECTL0),
+		 readl(p->atc_pwr + ATC_PWR_CTRL), readl(p->atc_pwr + ATC_PWR_STAT),
+		 readl(p->atc + ATC_UC_CTRL), readl(p->atc + ATC_BIST_STATUS2));
+}
+
+/* Waits up to 10 s for the Type-C controller's driver, then simulates the unplug. */
+static void t6050_replug(struct work_struct *work)
+{
+	struct t6050_usb2 *p = container_of(to_delayed_work(work), struct t6050_usb2, replug_work);
+	int ret;
+
+	if (!p->replug_tries)
+		t6050_port_state(p, "before the disconnect");
+	ret = sn201202x_simulate_disconnect(p->hpm, min(ss_replug_s, 255U));
+	if (ret == -EPROBE_DEFER && ++p->replug_tries < 100) {
+		schedule_delayed_work(&p->replug_work, msecs_to_jiffies(100));
+		return;
+	}
+	dev_info(p->dev, "SS: simulated disconnect %u s: %d after %u tries\n", ss_replug_s, ret,
+		 p->replug_tries + 1);
+	t6050_port_state(p, "after the disconnect");
 }
 
 /*
@@ -596,6 +694,8 @@ static int t6050_usb2_calibrate(struct phy *phy)
 		changed |= BIT(i);
 	}
 	t6050_usb2_mask(p->core + DWC3_GCTL, DWC3_GCTL_PRTCAPDIR_MASK, DWC3_GCTL_PRTCAP_HOST);
+	if (ss_susphy_clear)
+		t6050_usb2_mask(p->core + DWC3_GUSB3PIPECTL0, DWC3_GUSB3PIPECTL_SUSPHY, 0);
 	dev_info(p->dev, "SS: after xHCI reset: glue read %#x %#x %#x %#x, rewritten %#x, now %#x %#x %#x %#x\n",
 		 rd[0], rd[1], rd[2], rd[3], changed, readl(p->core + t6050_glue[0]),
 		 readl(p->core + t6050_glue[1]), readl(p->core + t6050_glue[2]),
@@ -605,7 +705,115 @@ static int t6050_usb2_calibrate(struct phy *phy)
 		 readl(p->core + XHCI_PORTSC2), readl(p->core + DWC3_GUSB2PHYCFG0),
 		 readl(p->core + DWC3_GUSB3PIPECTL0));
 	queue_work(system_long_wq, &p->ltssm_work);
+	/* phy_calibrate() runs again on a root hub resume */
+	if (ss_u2resets && !p->u2reset_queued) {
+		p->u2reset_queued = true;
+		schedule_delayed_work(&p->u2reset_work, msecs_to_jiffies(3000));
+	}
 	return 0;
+}
+
+static void t6050_usb3_inherited(struct t6050_usb2 *p);
+
+static void t6050_standalone(struct work_struct *work)
+{
+	struct t6050_usb2 *p = container_of(to_delayed_work(work), struct t6050_usb2,
+					    standalone_work);
+	u32 last[2] = { ~0U, ~0U }, now[2];
+	unsigned int i, k, changes = 0;
+	bool hcrst, cnr;
+
+	t6050_usb3_inherited(p);
+	t6050_usb3_up(p);
+
+	/* 17. xHCI reset, glue, host mode; then run and port power, as the proxy runs. */
+	t6050_usb2_mask(p->core + XHCI_USBCMD, 0, XHCI_USBCMD_HCRST);
+	hcrst = t6050_wait(p->core + XHCI_USBCMD, XHCI_USBCMD_HCRST, 0, 2000);
+	cnr = t6050_wait(p->core + XHCI_USBSTS, XHCI_USBSTS_CNR, 0, 2000);
+	for (i = 0; i < ARRAY_SIZE(t6050_glue); i++)
+		writel(t6050_glue_boot[i], p->core + t6050_glue[i]);
+	t6050_usb2_mask(p->core + DWC3_GCTL, DWC3_GCTL_PRTCAPDIR_MASK, DWC3_GCTL_PRTCAP_HOST);
+	t6050_usb2_mask(p->core + XHCI_USBCMD, 0, BIT(0));
+	for (i = 0; i < 2; i++) {
+		void __iomem *reg = p->core + (i ? XHCI_PORTSC2 : XHCI_PORTSC1);
+
+		writel((readl(reg) & 0x4e00ffe9) | BIT(9), reg);
+	}
+	dev_info(p->dev, "SS standalone: HCRST %d CNR %d, PORTSC %#x / %#x\n", hcrst, cnr,
+		 readl(p->core + XHCI_PORTSC1), readl(p->core + XHCI_PORTSC2));
+	msleep(100);
+
+	/* 18. USB 2.0 port resets, 2 s apart, until the SS port is in U0 */
+	for (k = 1; k <= 10; k++) {
+		u32 hs = readl(p->core + XHCI_PORTSC1);
+
+		writel((hs & 0x0e00c200) | XHCI_PORTSC_PR, p->core + XHCI_PORTSC1);
+		dev_info(p->dev, "SS standalone: USB 2.0 reset %u, PORTSC %#x / %#x\n", k, hs,
+			 readl(p->core + XHCI_PORTSC2));
+		for (i = 0; i < 2000; i++) {
+			now[0] = readl(p->core + XHCI_PORTSC1);
+			now[1] = readl(p->core + XHCI_PORTSC2);
+			if (memcmp(now, last, sizeof(now)) && changes++ < 100)
+				dev_info(p->dev, "SS standalone: %u ms PORTSC %#x / %#x\n", i,
+					 now[0], now[1]);
+			memcpy(last, now, sizeof(now));
+			if ((now[1] & 0x1e1) == XHCI_PORTSC_CCS) {
+				dev_info(p->dev, "SS standalone: U0 after USB 2.0 reset %u\n", k);
+				return;
+			}
+			usleep_range(1000, 1100);
+		}
+	}
+	dev_info(p->dev, "SS standalone: no U0 after 10 USB 2.0 resets\n");
+}
+
+static void t6050_u2reset(struct work_struct *work)
+{
+	struct t6050_usb2 *p = container_of(to_delayed_work(work), struct t6050_usb2, u2reset_work);
+	u32 hs = readl(p->core + XHCI_PORTSC1), ss = readl(p->core + XHCI_PORTSC2);
+
+	if (ss & XHCI_PORTSC_CCS) {
+		dev_info(p->dev, "SS: connected after %u extra USB 2.0 reset(s), PORTSC %#x / %#x\n",
+			 p->u2resets, hs, ss);
+		return;
+	}
+	if (p->u2resets == ss_u2resets) {
+		dev_info(p->dev, "SS: no connection after %u extra USB 2.0 resets, PORTSC %#x / %#x\n",
+			 p->u2resets, hs, ss);
+		return;
+	}
+	if (hs & XHCI_PORTSC_CCS) {
+		/* PP, port indicators and the wake enables kept; the change bits not cleared */
+		writel((hs & 0x0e00c200) | XHCI_PORTSC_PR, p->core + XHCI_PORTSC1);
+		p->u2resets++;
+		dev_info(p->dev, "SS: extra USB 2.0 reset %u, PORTSC %#x / %#x\n", p->u2resets, hs, ss);
+	}
+	schedule_delayed_work(&p->u2reset_work, msecs_to_jiffies(2000));
+}
+
+/*
+ * The port 1 state the kernel inherits, to compare with the state the proven proxy
+ * runs started from. The core is read only with dwc3 out of reset.
+ */
+static void t6050_usb3_inherited(struct t6050_usb2 *p)
+{
+	void __iomem *pipe = p->pipehandler;
+	u32 aon = readl(pipe + PIPEHANDLER_AON_GEN);
+
+	dev_info(p->dev, "SS: inherited pipehandler +0x0 %#x +0x4 %#x +0xc %#x +0x1c %#x +0x20 %#x\n",
+		 readl(pipe + PIPEHANDLER_OVERRIDE), readl(pipe + PIPEHANDLER_OVERRIDE_VALUES),
+		 readl(pipe + PIPEHANDLER_MUX_CTRL), aon,
+		 readl(pipe + PIPEHANDLER_NONSELECTED_OVERRIDE));
+	if (!(aon & PIPEHANDLER_AON_GEN_DWC3_RESET_N)) {
+		dev_info(p->dev, "SS: inherited dwc3 in reset, core not read; reset released\n");
+		writel(PIPEHANDLER_AON_GEN_DWC3_RESET_N, pipe + PIPEHANDLER_AON_GEN);
+		return;
+	}
+	dev_info(p->dev, "SS: inherited GCTL %#x, GUSB2PHYCFG %#x, GUSB3PIPECTL %#x, glue %#x / %#x, PORTSC %#x / %#x\n",
+		 readl(p->core + DWC3_GCTL), readl(p->core + DWC3_GUSB2PHYCFG0),
+		 readl(p->core + DWC3_GUSB3PIPECTL0), readl(p->core + t6050_glue[0]),
+		 readl(p->core + t6050_glue[2]), readl(p->core + XHCI_PORTSC1),
+		 readl(p->core + XHCI_PORTSC2));
 }
 
 static int t6050_usb2_init(struct phy *phy)
@@ -614,6 +822,16 @@ static int t6050_usb2_init(struct phy *phy)
 	static const unsigned int wait_ms[] = { 50, 100, 100 };
 	unsigned int attempt;
 	u32 portsc = 0;
+
+	/*
+	 * Port 1 starts the SuperSpeed sequence from the inherited state, as the
+	 * proven proxy runs did: no USB 2.0 flip, step 6 sets host mode.
+	 */
+	if (p->ss) {
+		t6050_usb3_inherited(p);
+		t6050_usb3_up(p);
+		return 0;
+	}
 
 	/*
 	 * The loader saw on J714c that a device plugged in at power-on shows
@@ -631,8 +849,6 @@ static int t6050_usb2_init(struct phy *phy)
 
 	dev_info(p->dev, "USB 2.0 host mode, PORTSC %#x after %u flip(s)\n", portsc,
 		 min_t(unsigned int, attempt + 1, ARRAY_SIZE(wait_ms)));
-	if (p->ss)
-		t6050_usb3_up(p);
 	return 0;
 }
 
@@ -697,6 +913,12 @@ static int t6050_usb3_probe(struct platform_device *pdev, struct t6050_usb2 *p)
 	if (ret)
 		return ret;
 	INIT_WORK(&p->ltssm_work, t6050_ltssm_watch);
+	INIT_DELAYED_WORK(&p->replug_work, t6050_replug);
+	INIT_DELAYED_WORK(&p->u2reset_work, t6050_u2reset);
+	INIT_DELAYED_WORK(&p->standalone_work, t6050_standalone);
+	if (ss_standalone)
+		schedule_delayed_work(&p->standalone_work, msecs_to_jiffies(1000));
+	p->hpm = of_parse_phandle(pdev->dev.of_node, "apple,typec-controller", 0);
 	p->ss = true;
 	return 0;
 }
