@@ -155,6 +155,16 @@ pub(crate) struct Config {
     pub(crate) crash_buffers: [FixedBuffer; 2],
     /// Parameter buffer page metrics shared with the firmware.
     pub(crate) pm_metrics: FixedBuffer,
+    /// Firmware MMIO register windows, by register-map slot.
+    pub(crate) register_windows: &'static [fw::initdata::RegisterWindow],
+    /// Register-map slots that are reserved but have no window.
+    pub(crate) reserved_slots: &'static [usize],
+    /// Performance-table configuration.
+    pub(crate) perf: &'static fw::initdata::PerfConfig,
+    /// Operating points expected in the device tree (performance-state count).
+    pub(crate) opps: usize,
+    /// Firmware interface version written to the root; the firmware rejects any other.
+    pub(crate) interface_version: [u16; 4],
 }
 
 /// A firmware coprocessor instance.
@@ -1135,7 +1145,7 @@ impl gpu::Gpu for Gpu {
             .uat
             .new_vm(self.ids.vm.next(), kernel_range)?
             .with_status()?;
-        let mappings = firmware.init.user_aliases(&vm, &firmware._pm_metrics)?;
+        let mappings = firmware.init.user_aliases(&vm, &firmware._pm_metrics, self.cfg)?;
         let ranges =
             hw::t8140::resources::client_reserved_ranges(self.cfg.pm_metrics.va).ok_or(EINVAL)?;
         let mut reserved = KVec::with_capacity(ranges.len(), GFP_KERNEL)?;

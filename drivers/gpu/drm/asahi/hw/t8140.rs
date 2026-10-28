@@ -42,9 +42,14 @@ pub(crate) const CONFIG: Config = Config {
         va: 0x10_0008_0000,
         size: 0x8000,
     },
+    register_windows: &REGISTER_WINDOWS,
+    reserved_slots: &RESERVED_REGISTER_SLOTS,
+    perf: &PERF,
+    opps: OPPS,
+    interface_version: INTERFACE_VERSION,
 };
 
-use crate::g17::fw::initdata::{PerfConfig, RegisterWindow, PERF_STATES};
+use crate::g17::fw::initdata::{PerfConfig, RegisterWindow, INTERFACE_VERSION, PERF_STATES};
 
 /// Chip identifier written to the hardware data.
 pub(crate) const CHIP_ID: u32 = 0x8140;

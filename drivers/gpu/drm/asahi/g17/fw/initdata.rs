@@ -109,6 +109,8 @@ impl LevelDescriptor {
 
 /// Addresses and geometry common to both roots.
 pub(crate) struct RootArgs {
+    /// Firmware interface version ([`INTERFACE_VERSION`] for G17P).
+    pub(crate) version: [u16; 4],
     /// Region A.
     pub(crate) region_a_va: u64,
     /// Region C.
@@ -166,7 +168,7 @@ static_assert!(size_of::<Root>() == 0xb8);
 impl Root {
     fn new(role: Role, args: &RootArgs, status_b_va: u64) -> Self {
         Self {
-            version: INTERFACE_VERSION,
+            version: args.version,
             region_a_va: args.region_a_va,
             unk_10: 0,
             main_config_va: args.main_config_va,
