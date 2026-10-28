@@ -14,6 +14,8 @@
  * Port 1 is the proxy cable.
  */
 
+#include <dt-bindings/spmi/spmi.h>
+
 / {
 	aliases {
 		usb0 = &dwc3_0;
@@ -23,6 +25,29 @@
 };
 
 &soc {
+	/* Port 1's Type-C controller only (ADT hpm1, left-front), polled. */
+	nub_spmi_a0: spmi@28a188000 {
+		compatible = "apple,t6050-spmi", "apple,t8142-spmi";
+		reg = <0x2 0x8a188000 0x0 0x4000>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		power-domains = <&ps_nub_spmi_a0>;
+
+		hpm1: usb-pd@a {
+			compatible = "apple,sn201202x";
+			reg = <0xa SPMI_USID>;
+			/* ADT target-type "J714c": first four characters reversed */
+			apple,unlock-key = "417J";
+
+			connector {
+				compatible = "usb-c-connector";
+				label = "USB-C port 1";
+				power-role = "dual";
+				data-role = "host";
+			};
+		};
+	};
+
 	usb2phy_0: phy@2a2a90000 {
 		compatible = "apple,t6050-usb2-phy";
 		reg = <0x2 0xa2a90000 0x0 0x4000>, <0x2 0xa2a84000 0x0 0x4000>,
@@ -82,6 +107,7 @@
 			    "atc-axi2af-lioa", "atc-common-cfg", "pmgr", "pmgr-mxwrap";
 		#phy-cells = <0>;
 		power-domains = <&ps_atc1_usb>;
+		apple,typec-controller = <&hpm1>;
 
 		apple,tunable-gbl =
 			<0xc100 0x8 0x8>,
