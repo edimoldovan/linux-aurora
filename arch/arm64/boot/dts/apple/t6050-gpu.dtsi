@@ -1,0 +1,141 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T6050 "M5 Max" GPU: G17 with two coprocessors, GFX and GFX1.
+ * Registers and interrupts from the J714c ADT (sgx, gfx-asc, gfx1-asc).
+ * Disabled until the loader hands the GPU over.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/ {
+	reserved-memory {
+		uat_handoff: uat-handoff {
+			reg = <0 0 0 0>;
+		};
+
+		/* Only reserved: the GPU node does not reference it */
+		uat_l2_pagetables: uat-l2-pagetables {
+			reg = <0 0 0 0>;
+		};
+
+		uat_pagetables: uat-pagetables {
+			reg = <0 0 0 0>;
+		};
+
+		uat_ttbs: uat-ttbs {
+			reg = <0 0 0 0>;
+		};
+	};
+
+	/*
+	 * ADT sgx perf-states, first set: frequency and core voltage per GPU
+	 * performance state, in performance-state order.
+	 */
+	gpu_opp: opp-table-gpu {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <125000>;
+		};
+		opp01 {
+			opp-hz = /bits/ 64 <338000000>;
+			opp-microvolt = <630000>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <486000000>;
+			opp-microvolt = <670000>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <636000000>;
+			opp-microvolt = <705000>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <796000000>;
+			opp-microvolt = <745000>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <888000000>;
+			opp-microvolt = <755000>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <988000000>;
+			opp-microvolt = <780000>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <1084000000>;
+			opp-microvolt = <815000>;
+		};
+		opp08 {
+			opp-hz = /bits/ 64 <1182000000>;
+			opp-microvolt = <825000>;
+		};
+		opp09 {
+			opp-hz = /bits/ 64 <1278000000>;
+			opp-microvolt = <860000>;
+		};
+		opp10 {
+			opp-hz = /bits/ 64 <1374000000>;
+			opp-microvolt = <900000>;
+		};
+		opp11 {
+			opp-hz = /bits/ 64 <1470000000>;
+			opp-microvolt = <940000>;
+		};
+		opp12 {
+			opp-hz = /bits/ 64 <1578000000>;
+			opp-microvolt = <1020000>;
+		};
+		opp13 {
+			opp-hz = /bits/ 64 <1620000000>;
+			opp-microvolt = <1055000>;
+		};
+	};
+};
+
+&soc {
+	gpu: gpu@2302600000 {
+		compatible = "apple,agx-t6050";
+		reg = <0x23 0x02600000 0x0 0x88000>,
+		      <0x23 0x00000000 0x0 0x3fdc000>;
+		reg-names = "asc", "sgx";
+		mboxes = <&gfx_mbox>, <&gfx1_mbox>;
+		power-domains = <&ps_gfx>;
+		memory-region = <&uat_ttbs>, <&uat_pagetables>,
+				<&uat_handoff>;
+		memory-region-names = "ttbs", "pagetables", "handoff";
+		operating-points-v2 = <&gpu_opp>;
+		status = "disabled";
+	};
+
+	/* The ADT lists each ASC's interrupts in swapped pairs (2798, 2797, 2800, 2799). */
+	gfx_mbox: mailbox@2302600000 {
+		compatible = "apple,t6050-ascwrap-v6", "apple,t8140-ascwrap-v6";
+		reg = <0x23 0x02600000 0x0 0x88000>,
+		      <0x23 0x02050000 0x0 0x8>;
+		reg-names = "wrapper", "iop-vbar";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 2797 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 2800 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		apple,firmware-role = "GFX";
+		power-domains = <&ps_gfx>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	gfx1_mbox: mailbox@2302e00000 {
+		compatible = "apple,t6050-ascwrap-v6", "apple,t8140-ascwrap-v6";
+		reg = <0x23 0x02e00000 0x0 0x88000>,
+		      <0x23 0x02850000 0x0 0x8>;
+		reg-names = "wrapper", "iop-vbar";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 2801 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 2804 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		apple,firmware-role = "GFX1";
+		power-domains = <&ps_gfx>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+};

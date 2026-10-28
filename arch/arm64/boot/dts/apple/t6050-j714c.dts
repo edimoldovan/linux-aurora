@@ -33,6 +33,7 @@
 	interrupt-parent = <&aic>;
 
 	aliases {
+		gpu = &gpu;
 		keyboard = &keyboard;
 		serial0 = &serial0;
 	};
@@ -96,3 +97,17 @@
 	};
 };
 #include "t6050-j714c-usb2.dtsi"
+
+/* Enable the GPU and its mailboxes; the loader disables them again if the ADT
+ * perf/region data does not validate (dt_set_gpu_g17). */
+&gfx_mbox {
+	status = "okay";
+};
+
+&gfx1_mbox {
+	status = "okay";
+};
+
+&gpu {
+	status = "okay";
+};
