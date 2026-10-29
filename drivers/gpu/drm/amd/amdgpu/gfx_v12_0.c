@@ -3130,10 +3130,12 @@ static int gfx_v12_0_kgq_init_queue(struct amdgpu_ring *ring, bool reset)
 		}
 	} else {
 		/* restore mqd with the backup copy */
-		if (adev->gfx.me.mqd_backup[mqd_idx])
+		if (adev->gfx.me.mqd_backup[mqd_idx]) {
 			amdgpu_bo_memcpy_to(ring->mqd_obj, mqd,
 					    adev->gfx.me.mqd_backup[mqd_idx],
 					    sizeof(*mqd));
+			amdgpu_device_flush_hdp(adev, NULL);
+		}
 		/* reset the ring */
 		ring->wptr = 0;
 		atomic64_set((atomic64_t *)ring->wptr_cpu_addr, 0);
@@ -3455,10 +3457,12 @@ static int gfx_v12_0_kiq_init_queue(struct amdgpu_ring *ring)
 
 	if (amdgpu_in_reset(adev)) { /* for GPU_RESET case */
 		/* reset MQD to a clean status */
-		if (adev->gfx.mec.mqd_backup[mqd_idx])
+		if (adev->gfx.mec.mqd_backup[mqd_idx]) {
 			amdgpu_bo_memcpy_to(ring->mqd_obj, mqd,
 					    adev->gfx.mec.mqd_backup[mqd_idx],
 					    sizeof(*mqd));
+			amdgpu_device_flush_hdp(adev, NULL);
+		}
 
 		/* reset ring buffer */
 		ring->wptr = 0;
@@ -3530,10 +3534,12 @@ static int gfx_v12_0_kcq_init_queue(struct amdgpu_ring *ring, bool reset)
 		}
 	} else {
 		/* restore MQD to a clean status */
-		if (adev->gfx.mec.mqd_backup[mqd_idx])
+		if (adev->gfx.mec.mqd_backup[mqd_idx]) {
 			amdgpu_bo_memcpy_to(ring->mqd_obj, mqd,
 					    adev->gfx.mec.mqd_backup[mqd_idx],
 					    sizeof(*mqd));
+			amdgpu_device_flush_hdp(adev, NULL);
+		}
 		/* reset ring buffer */
 		ring->wptr = 0;
 		atomic64_set((atomic64_t *)ring->wptr_cpu_addr, 0);
