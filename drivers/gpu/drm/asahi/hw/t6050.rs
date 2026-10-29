@@ -25,10 +25,10 @@ pub(crate) const CONFIG: Config = Config {
         variant: 0x4,
         num_dies: 1,
         gpu_variant: GpuVariant::C,
-        // Placeholders (t8140); the g17c firmware's expected values are
-        // unconfirmed and consumed after the version gate.
+        // AGX3 shaders and the HAL300 command stream (Mesa's asahi_drm.h:
+        // DRM_ASAHI_GPU_HAL_300 for G17G/G17S/G17C).
         usc_generation: 3,
-        hal_generation: 200,
+        hal_generation: 300,
     },
     uat_ias: 42,
     uat_oas: 42,

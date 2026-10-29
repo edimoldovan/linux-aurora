@@ -1748,6 +1748,12 @@ impl Vm {
         Ok(self)
     }
 
+    /// Drop the G17P job context views; the HAL300 firmware has none.
+    pub(crate) fn without_context_views(mut self) -> Self {
+        self.context_bindings = None;
+        self
+    }
+
     /// Attach a status and job lifetime tracking before sharing a newly created user VM with
     /// queues, without the G17 canonical context views, shared-object footprints and idle
     /// residency reclaim of [`Self::with_status`]. Used by G15, whose user objects stay pinned.

@@ -1201,6 +1201,10 @@ impl gpu::Gpu for Gpu {
             .uat
             .new_vm(self.ids.vm.next(), kernel_range)?
             .with_status()?;
+        let vm = match self.cfg.abi {
+            Abi::G17p => vm,
+            Abi::G17c => vm.without_context_views(),
+        };
         let mappings = firmware.init.user_aliases(&vm, &firmware._pm_metrics, self.cfg)?;
         let ranges =
             hw::t8140::resources::client_reserved_ranges(self.cfg.pm_metrics.va).ok_or(EINVAL)?;

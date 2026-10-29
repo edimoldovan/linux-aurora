@@ -200,7 +200,9 @@ impl Vm {
 
     /// Requires a job mapping guard before validating or installing these views.
     pub(crate) fn install_job_context_aliases(&self) -> Result {
-        let context = self.context_bindings.as_ref().ok_or(EINVAL)?;
+        let Some(context) = self.context_bindings.as_ref() else {
+            return Ok(());
+        };
         let (generation, snapshot) = {
             let bindings = context.bindings.lock();
             let mut snapshot = KVec::with_capacity(CONTEXT_VIEWS.len(), GFP_KERNEL)?;
