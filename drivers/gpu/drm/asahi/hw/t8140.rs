@@ -74,6 +74,7 @@ const fn window(
         va: MMIO_APERTURE + offset,
         size,
         elements: 1,
+        phys_stride: 0,
         unk_18,
         unk_20,
     }

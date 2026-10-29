@@ -715,29 +715,34 @@ impl InitData {
 
     fn map_register_windows(&mut self, env: &BuildEnv<'_>, cfg: &Config) -> Result {
         for window in cfg.register_windows {
-            let (phys, va, size) = window.mapping().ok_or(EINVAL)?;
-            if window.phys == abi::SCRATCH_WINDOW_PHYS {
-                let scratch = KernelObject::new(
-                    env.dev,
-                    env.vm,
-                    Placement::At(va),
-                    size.try_into()?,
-                    mmu::PROT_FW_PRIV_RW,
-                    CpuMap::WriteCombined,
+            // Each element is mapped on its own: elements are contiguous in the GPU address
+            // space but may be apart physically.
+            let element = window.size / window.elements;
+            let stride = match window.phys_stride {
+                0 => element as u64,
+                stride => stride,
+            };
+            for index in 0..window.elements as u64 {
+                let part = abi::RegisterWindow {
+                    phys: window.phys + index * stride,
+                    va: window.va + index * element as u64,
+                    size: element,
+                    elements: 1,
+                    phys_stride: 0,
+                    ..*window
+                };
+                let (phys, va, size) = part.mapping().ok_or(EINVAL)?;
+                self.aliases.push(
+                    env.vm.map_io(
+                        env.dev.as_ref().as_ref(),
+                        va,
+                        phys.try_into()?,
+                        size.try_into()?,
+                        mmu::PROT_FW_MMIO_RW,
+                    )?,
+                    GFP_KERNEL,
                 )?;
-                self.add(scratch)?;
-                continue;
             }
-            self.aliases.push(
-                env.vm.map_io(
-                    env.dev.as_ref().as_ref(),
-                    va,
-                    phys.try_into()?,
-                    size.try_into()?,
-                    mmu::PROT_FW_MMIO_RW,
-                )?,
-                GFP_KERNEL,
-            )?;
         }
         Ok(())
     }

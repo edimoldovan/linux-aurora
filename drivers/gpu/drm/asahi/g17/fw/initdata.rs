@@ -604,8 +604,10 @@ pub(crate) struct RegisterWindow {
     pub(crate) va: u64,
     /// Size in bytes; need not be a multiple of the page size.
     pub(crate) size: u32,
-    /// Equal elements the window holds, at `size / elements` strides.
+    /// Equal elements the window holds, at `size / elements` strides of the GPU address.
     pub(crate) elements: u32,
+    /// Physical distance between elements; 0 when they are contiguous.
+    pub(crate) phys_stride: u64,
     /// Value of [`RegisterMapEntry::unk_18`].
     pub(crate) unk_18: u64,
     /// Value of [`RegisterMapEntry::unk_20`].
@@ -631,11 +633,6 @@ impl RegisterWindow {
         Some((self.phys & !mask, start, span))
     }
 }
-
-/// [`RegisterWindow::phys`] of a window backed by host scratch memory, for a register block
-/// whose address is not known yet: the firmware finds the window mapped and its accesses
-/// land in RAM.
-pub(crate) const SCRATCH_WINDOW_PHYS: u64 = 0xdead_0000_0000;
 
 /// Value of [`RegisterMapEntry::unk_20`] in a reserved register-map slot.
 const RESERVED_SLOT_UNK_20: u32 = 2;
