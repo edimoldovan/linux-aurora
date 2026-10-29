@@ -62,7 +62,8 @@ use kernel::{
     io::{
         IoBase,
         IoSysMap,
-        Region, //
+        Region,
+        SysMem, //
     },
     impl_has_delayed_work, impl_has_work,
     new_condvar, new_delayed_work, new_mutex, new_work, platform,
@@ -139,8 +140,19 @@ pub(crate) struct FixedBuffer {
     pub(crate) size: usize,
 }
 
+/// Firmware interface generation, which selects the layouts of the structures that differ.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Abi {
+    /// G17P firmware (t8140).
+    G17p,
+    /// G17C firmware (t6050).
+    G17c,
+}
+
 /// Static configuration of a SoC with a G17 GPU.
 pub(crate) struct Config {
+    /// Firmware interface generation.
+    pub(crate) abi: Abi,
     /// SoC identifier.
     pub(crate) chip_id: u32,
     /// Expected GPU identification.
@@ -153,6 +165,9 @@ pub(crate) struct Config {
     pub(crate) secondary_root_offset: u64,
     /// Crash log buffer of each [`Role`].
     pub(crate) crash_buffers: [FixedBuffer; 2],
+    /// The firmware keeps each crash log in its own memory and requests it by physical address,
+    /// so the host maps that memory instead of its [`Self::crash_buffers`].
+    pub(crate) crash_log_phys: bool,
     /// Parameter buffer page metrics shared with the firmware.
     pub(crate) pm_metrics: FixedBuffer,
     /// Firmware MMIO register windows, by register-map slot.
@@ -217,7 +232,24 @@ const CRASH_BUFFER_FILL: [u8; 2] = [0xa5, 0x5a];
 /// A crash log buffer handed to RTKit.
 pub(crate) struct CrashLog {
     iova: usize,
-    map: shmem::VMapOwned<AsahiObject>,
+    map: CrashMap,
+}
+
+/// Memory behind a [`CrashLog`].
+enum CrashMap {
+    /// The host's crash log buffer.
+    Object(shmem::VMapOwned<AsahiObject>),
+    /// Firmware memory at the requested physical address, from `memremap`.
+    Firmware { ptr: *mut u8, size: usize },
+}
+
+impl Drop for CrashMap {
+    fn drop(&mut self) {
+        if let Self::Firmware { ptr, .. } = *self {
+            // SAFETY: `ptr` came from `memremap` and is not used after this.
+            unsafe { kernel::bindings::memunmap(ptr.cast()) };
+        }
+    }
 }
 
 impl rtkit::Buffer for CrashLog {
@@ -226,7 +258,13 @@ impl rtkit::Buffer for CrashLog {
     }
 
     fn buf(&mut self) -> Result<IoSysMap<'_, Region>> {
-        Ok(IoSysMap::from((&self.map).as_view()))
+        Ok(match &self.map {
+            CrashMap::Object(map) => IoSysMap::from(map.as_view()),
+            // SAFETY: `ptr` maps `size` bytes, 4-byte aligned, for as long as `self` lives.
+            CrashMap::Firmware { ptr, size } => IoSysMap::Sys(unsafe {
+                SysMem::new(Region::ptr_from_raw_parts_mut(*ptr, *size))
+            }),
+        })
     }
 }
 
@@ -236,6 +274,7 @@ struct RoleState {
     role: Role,
     shared: Arc<Shared>,
     crash_log: FixedBuffer,
+    crash_log_phys: bool,
     crash_map: shmem::VMapOwned<AsahiObject>,
     crashed: AtomicBool,
     #[pin]
@@ -319,9 +358,25 @@ impl rtkit::Operations for RoleOps {
         {
             return Err(EINVAL);
         }
+        if data.crash_log_phys {
+            // SAFETY: Maps firmware memory the firmware points the host at; nothing else uses it.
+            let ptr = unsafe {
+                kernel::bindings::memremap(iova as _, size, kernel::bindings::MEMREMAP_WB as _)
+            };
+            if ptr.is_null() {
+                return Err(ENOMEM);
+            }
+            return Ok(CrashLog {
+                iova,
+                map: CrashMap::Firmware {
+                    ptr: ptr.cast(),
+                    size,
+                },
+            });
+        }
         Ok(CrashLog {
             iova,
-            map: data.crash_map.owner().owned_vmap()?,
+            map: CrashMap::Object(data.crash_map.owner().owned_vmap()?),
         })
     }
 }
@@ -368,6 +423,7 @@ impl Coprocessor {
                     va: buffer.va,
                     size: buffer.size,
                 },
+                crash_log_phys: cfg.crash_log_phys,
                 crash_map,
                 crashed: AtomicBool::new(false),
                 ack <- Opaque::ffi_init(|ptr| {

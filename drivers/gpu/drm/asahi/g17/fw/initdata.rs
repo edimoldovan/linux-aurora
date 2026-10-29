@@ -574,6 +574,15 @@ impl MainConfig {
         self.unk_300 = 4;
         self.power_config_va = args.bundle_va + bundle::POWER_CONFIG as u64;
     }
+
+    /// Initializes the g17c secondary configuration; its firmware finds the
+    /// [`PowerConfig`] 0x10 bytes after the G17P field.
+    pub(crate) fn init_secondary_g17c(&mut self, args: &MainConfigArgs) {
+        self.init_secondary(args);
+        let va = self.power_config_va;
+        self.power_config_va = 0;
+        self.unk_479[8..16].copy_from_slice(&va.to_le_bytes());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -595,6 +604,8 @@ pub(crate) struct RegisterWindow {
     pub(crate) va: u64,
     /// Size in bytes; need not be a multiple of the page size.
     pub(crate) size: u32,
+    /// Equal elements the window holds, at `size / elements` strides.
+    pub(crate) elements: u32,
     /// Value of [`RegisterMapEntry::unk_18`].
     pub(crate) unk_18: u64,
     /// Value of [`RegisterMapEntry::unk_20`].
@@ -620,6 +631,11 @@ impl RegisterWindow {
         Some((self.phys & !mask, start, span))
     }
 }
+
+/// [`RegisterWindow::phys`] of a window backed by host scratch memory, for a register block
+/// whose address is not known yet: the firmware finds the window mapped and its accesses
+/// land in RAM.
+pub(crate) const SCRATCH_WINDOW_PHYS: u64 = 0xdead_0000_0000;
 
 /// Value of [`RegisterMapEntry::unk_20`] in a reserved register-map slot.
 const RESERVED_SLOT_UNK_20: u32 = 2;
@@ -653,7 +669,7 @@ impl RegisterMapEntry {
             phys: window.phys,
             va: window.va,
             total_size: window.size,
-            element_size: window.size,
+            element_size: window.size / window.elements,
             unk_18: window.unk_18,
             unk_20: window.unk_20,
             unk_24: 0,
@@ -834,13 +850,22 @@ pub(crate) struct HwDataArgs<'a> {
     pub(crate) qos_va: u64,
 }
 
+/// Register-map slots of the g17c hardware data; everything after the map moves by
+/// 7 slots (0x118 bytes).
+pub(crate) const G17C_REGISTER_MAP_SLOTS: usize = 60;
+/// Further bytes the g17c hardware data inserts before the fields G17P has at `0x2544` and
+/// on, which sit 0x128 bytes later in all.
+pub(crate) const G17C_HW_DATA_GAP: usize = 0x10;
+/// The g17c hardware data.
+pub(crate) type HwDataG17c = HwData<G17C_REGISTER_MAP_SLOTS, G17C_HW_DATA_GAP>;
+
 /// Size of the QoS object named by the hardware data.
 pub(crate) const QOS_SIZE: usize = 0xe40;
 
 /// The hardware data, at the base of the bundle and shared by both
 /// instances.
 #[repr(C, packed)]
-pub(crate) struct HwData {
+pub(crate) struct HwData<const SLOTS: usize = REGISTER_MAP_SLOTS, const GAP: usize = 0> {
     /// Required: 0x6f_0000_0000.
     pub(crate) unk_0: u64,
     /// Required: 0xffc0_0000.
@@ -868,7 +893,7 @@ pub(crate) struct HwData {
     pub(crate) unk_5d8: [u16; 12],
     pub(crate) unk_5f0: [u8; 0x50],
     /// Register windows the firmware maps.
-    pub(crate) register_map: [RegisterMapEntry; REGISTER_MAP_SLOTS],
+    pub(crate) register_map: [RegisterMapEntry; SLOTS],
     pub(crate) unk_e88: [u8; 8],
     /// Chip identifier.
     pub(crate) chip_id: u32,
@@ -956,6 +981,8 @@ pub(crate) struct HwData {
     /// Performance table B. Each voltage is stored in lane 0 only.
     pub(crate) perf_b: PerfGroup,
     pub(crate) unk_23dc: [u8; 0x168],
+    /// Bytes the g17c firmware adds before the tail ([`G17C_HW_DATA_GAP`]).
+    pub(crate) unk_g17c: [u8; GAP],
     /// Required: 4.
     pub(crate) unk_2544: u32,
     /// Required: 6.
@@ -1023,12 +1050,18 @@ static_assert!(core::mem::offset_of!(HwData, unk_258e) == 0x258e);
 static_assert!(core::mem::offset_of!(HwData, completion_rings) == 0x2614);
 static_assert!(core::mem::offset_of!(HwData, qos_va) == 0x26ac);
 static_assert!(size_of::<HwData>() == 0x3db4);
+static_assert!(core::mem::offset_of!(HwDataG17c, chip_id) == 0xfa8);
+static_assert!(core::mem::offset_of!(HwDataG17c, perf_a) == 0x10dc);
+static_assert!(core::mem::offset_of!(HwDataG17c, unk_2544) == 0x266c);
+static_assert!(core::mem::offset_of!(HwDataG17c, completion_rings) == 0x273c);
+static_assert!(core::mem::offset_of!(HwDataG17c, qos_va) == 0x27d4);
+static_assert!(bundle::HW_DATA + size_of::<HwDataG17c>() <= bundle::VIEWS[2]);
 static_assert!(bundle::HW_DATA + size_of::<HwData>() <= bundle::VIEWS[2]);
 
 // SAFETY: `HwData` consists of integers and arrays of integers only.
-unsafe impl Zeroable for HwData {}
+unsafe impl<const SLOTS: usize, const GAP: usize> Zeroable for HwData<SLOTS, GAP> {}
 
-impl HwData {
+impl<const SLOTS: usize, const GAP: usize> HwData<SLOTS, GAP> {
     const UNK_E0: [u16; 24] = [
         0x2008, 0, 0, 0, 0, 0x2008, 0, 0, 0, 0, 0x2008, 0, 0x24cb, 0, 0x2cfa, 0xc98a, 0x24cb,
         0xf4f6, 0xe917, 0x1877, 0x24cb, 0x38d9, 0, 0xbdab,
@@ -1058,7 +1091,7 @@ impl HwData {
         self.unk_3e0 = Self::UNK_3E0;
         self.unk_5d8 = Self::UNK_5D8;
 
-        let mut used = [false; REGISTER_MAP_SLOTS];
+        let mut used = [false; SLOTS];
         let mut claim = |slot: usize| -> Result {
             match used.get_mut(slot) {
                 Some(used) if !*used => {
@@ -1477,6 +1510,10 @@ impl PrimaryStatusB {
     /// Offset of the [`PowerState`].
     pub(crate) const POWER_STATE: usize = 0xe440;
 
+    /// g17c: pointer to a host word the firmware reads after raising its flag at
+    /// `+0xe71c`; it lies inside G17P's [`PowerState`], which leaves those bytes zero.
+    const G17C_FWCTL_STATE: usize = 0xe720;
+
     /// Initializes the primary status B; `fwctl_va` is the zeroed
     /// firmware-control page ([`FWCTL_SIZE`] bytes).
     pub(crate) fn init(&mut self, fwctl_va: u64) {
@@ -1486,6 +1523,16 @@ impl PrimaryStatusB {
         self.fwctl_ring_va = fwctl_va + FWCTL_RING;
         self.unk_e434 = 1;
         self.power.init();
+    }
+
+    /// Initializes the g17c primary status B. Its recovery area is laid out differently,
+    /// so only the status block, the power state and the firmware-control pointer are set.
+    pub(crate) fn init_g17c(&mut self, fwctl_va: u64) {
+        clear(self);
+        self.status = StatusBlock::new();
+        self.power.init();
+        let at = Self::G17C_FWCTL_STATE - Self::POWER_STATE;
+        self.power.0[at..at + 8].copy_from_slice(&fwctl_va.to_le_bytes());
     }
 }
 
