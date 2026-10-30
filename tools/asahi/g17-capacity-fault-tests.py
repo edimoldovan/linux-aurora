@@ -7,6 +7,7 @@ predicate is compiled too; allocation and asynchronous notification are stubs.
 """
 from pathlib import Path
 import os
+import re
 import subprocess
 import tempfile
 
@@ -28,13 +29,13 @@ def fixture():
     retirement = (ROOT / 'queue/compute/retirement.rs').read_text()
     previous = item(source, 'struct Previous<') + '\n' + item(source, 'impl<B, C> Previous<B, C>')
     methods = '\n'.join(item(source, sig) for sig in [
-        'pub(crate) fn release_owner(', 'pub(crate) fn reusable(',
+        'fn witness_stamp(', 'pub(crate) fn release_owner(', 'pub(crate) fn reusable(',
         'pub(crate) fn recycle_quarantined_idle(', 'pub(crate) fn recycle_killed(',
-        'fn recycle_settled(', 'fn release_witnessed_inner(', 'pub(crate) fn share_idle(', 'pub(crate) fn can_rearm(', 'pub(crate) fn recycled_pending('])
+        'fn recycle_settled(', 'fn release_witnessed_inner(', 'pub(crate) fn share_idle(', 'pub(crate) fn shareable(', 'pub(crate) fn can_rearm(', 'pub(crate) fn recycled_pending('])
     exit_source = (ROOT / 'queue/compute/exit.rs').read_text()
     methods += '\n' + item(exit_source, 'pub(crate) fn settle_exit(').replace('super::Previous', 'Previous').replace('crate::g17::qos::Owner', 'qos::Owner')
     drain = item((ROOT / 'mod.rs').read_text(), 'fn drain_reclaims(')
-    proof = item(retirement, 'pub(crate) const fn stamp_covers(') + '\n' + item(retirement, 'pub(crate) fn quarantined_retired(')
+    proof = item(retirement, 'pub(crate) const fn stamp_newer(') + '\n' + item(retirement, 'pub(crate) const fn stamp_covers(') + '\n' + item(retirement, 'pub(crate) fn quarantined_retired(')
     return r'''
 #![allow(dead_code)]
 use std::sync::{Arc, atomic::{AtomicUsize, AtomicU32, Ordering}};
@@ -48,6 +49,7 @@ const ECANCELED: Error = -125;
 fn now_ns() -> u64 { 123 }
 struct Context { id: u64, live: Arc<AtomicUsize>, killed: AtomicU32 }
 impl Context {
+    fn note_compute_binding(&self, _: bool) {}
     fn new(id: u64, live: &Arc<AtomicUsize>) -> Arc<Self> {
         live.fetch_add(1, Ordering::SeqCst);
         Arc::new(Self { id, live: live.clone(), killed: AtomicU32::new(1) })
@@ -55,14 +57,14 @@ impl Context {
 }
 impl Drop for Context { fn drop(&mut self) { self.live.fetch_sub(1, Ordering::SeqCst); } }
 struct Binding { context: Arc<Context> }
-''' + previous + r'''
+''' + previous + '\n' + item((ROOT / 'sync_input.rs').read_text(), 'pub(super) struct ReaderHint').replace('pub(super) ', '') + '\nimpl ReaderHint {\n' + item((ROOT / 'sync_input.rs').read_text(), 'pub(super) fn has_readers(').replace('pub(super) ', '') + '\n}\n' + r'''
 #[derive(Clone, Copy, PartialEq)] enum PoolPhase { Populated, ReleaseSent(u32), Vacant }
 #[derive(Clone, Copy)] struct Ticket {
     owner: u64, item_count: u32, descriptor: u64, item_producer: u32, kick: u64,
 }
 #[derive(Clone, Copy)] struct Cursors { count: u32, producer: u32, consumer: u32 }
 ''' + proof + r'''
-mod retirement { pub(crate) use super::quarantined_retired; }
+mod retirement { pub(crate) use super::{quarantined_retired, stamp_newer}; }
 struct Graph { cursors: Cursors, stamp: u32, fail: bool, resets: usize, owner: u64 }
 impl Graph {
     fn set_owner(&mut self, context: &Context) -> Result { if self.fail { Err(EIO) } else { self.owner = context.id; Ok(()) } }
@@ -107,6 +109,7 @@ struct Queue {
     retired_by_teardown: bool, spared_quarantine: bool, spared_deferred: bool,
     retire_pending: bool, retirement_proved: bool, replay_retirement: bool,
     replay_error: Option<Error>, replay_prepared: bool, submitted: u32, kick: Kick,
+    config_cache: Option<()>, source_hint: ReaderHint, source_readers: AtomicU32, claims: u32, fault_stamp: Option<u32>,
 }
 impl Queue {
     fn valid_ticket(&self, _: &Active, _: &Ticket) -> Result { Ok(()) }
@@ -126,6 +129,7 @@ fn idle(live: &Arc<AtomicUsize>) -> Queue {
         retired_by_teardown: false, spared_quarantine: false, spared_deferred: false,
         retire_pending: false, retirement_proved: false, replay_retirement: false,
         replay_error: None, replay_prepared: false, submitted: 0, kick: Kick,
+        fault_stamp: None, config_cache: None, source_hint: ReaderHint { possible: false }, source_readers: AtomicU32::new(0), claims: 0,
     }
 }
 fn fault(live: &Arc<AtomicUsize>) -> Queue {
@@ -146,20 +150,34 @@ struct Reclaims(Vec<Reclaim>);
 impl Reclaims { fn take_one(&mut self) -> Option<Reclaim> { self.0.pop() } }
 struct Mutex<T>(std::sync::Mutex<T>);
 impl<T> Mutex<T> { fn lock(&self) -> std::sync::MutexGuard<'_, T> { self.0.lock().unwrap() } }
-struct Shared { reclaim: Mutex<Reclaims>, wakes: AtomicUsize }
+struct Available(AtomicUsize); impl Available {fn notify(&self){self.0.fetch_add(1, Ordering::SeqCst);}}
+struct Shared { reclaim: Mutex<Reclaims>, wakes: AtomicUsize, queues: Available }
 impl Shared {
     fn queue_events(&self) { self.wakes.fetch_add(1, Ordering::SeqCst); }
 ''' + drain + r'''
 }
 fn main() {
     let finished = Arc::new(AtomicUsize::new(0));
-    let shared = Arc::new(Shared { reclaim: Mutex(std::sync::Mutex::new(Reclaims(vec![Reclaim(finished.clone())]))), wakes: AtomicUsize::new(0) });
+    let shared = Arc::new(Shared { reclaim: Mutex(std::sync::Mutex::new(Reclaims(vec![Reclaim(finished.clone())]))), wakes: AtomicUsize::new(0), queues: Available(AtomicUsize::new(0)) });
     shared.drain_reclaims();
     assert_eq!(finished.load(Ordering::SeqCst), 1);
     assert_eq!(shared.wakes.load(Ordering::SeqCst), 1);
     shared.drain_reclaims();
     assert_eq!(shared.wakes.load(Ordering::SeqCst), 1);
+    assert_eq!(shared.queues.0.load(Ordering::SeqCst), 1);
     let live = Arc::new(AtomicUsize::new(0));
+    let mut borrowed = idle(&live);
+    borrowed.retirement_ready = true;
+    borrowed.source_hint.possible = true;
+    borrowed.source_readers.store(1, Ordering::Release);
+    assert!(!borrowed.shareable());
+    borrowed.release_owner().unwrap();
+    assert!(!borrowed.reusable());
+    borrowed.pool_phase = PoolPhase::Vacant;
+    assert!(!borrowed.can_rearm());
+    borrowed.source_readers.store(0, Ordering::Release);
+    assert!(borrowed.reusable() && borrowed.can_rearm());
+    drop(borrowed);
     for _ in 0..512 {
         // Rebound detached queue; lost VM / killed publisher / allocation error
         // before the first new command. No future completion exists to free it.
@@ -261,13 +279,18 @@ def main():
     fault_fix = 'Previous::retire_witnessed(&mut self.previous);'
     assert source.count(idle_fix) == 1
     assert source.count(fault_fix) == 2
+    def mutate(pattern, replacement):
+        changed, count = re.subn(pattern, replacement, source)
+        assert count == 1, (pattern, count)
+        return changed
+
     controls = [('fixed', source, True),
                 ('missing-idle-close', source.replace(idle_fix, ''), False),
                 ('missing-fault-release', source.replace(fault_fix, '', 1), False),
                 ('missing-kill-release', source.replace('Previous::retire_witnessed(&mut self.previous);\n        self.exit', 'self.exit'), False),
                 ('missing-reclaim-wake', source.replace('self.queue_events();', ''), False),
-                ('share-before-retirement', source.replace('|| !self.retirement_ready', ''), False),
-                ('share-during-kill', source.replace('|| self.exit.is_some() || self.active.len', '|| self.active.len'), False)]
+                ('share-before-retirement', mutate(r'(&&\s*self\.owner\.is_some\(\))\s*&&\s*self\.retirement_ready', r'\1'), False),
+                ('share-during-kill', mutate(r'&&\s*self\.exit\.is_none\(\)\s*(?=&&\s*self\.active\.len)', ''), False)]
     with tempfile.TemporaryDirectory(prefix='g17-capacity-') as tmp:
         for name, rust, passes in controls:
             path = Path(tmp) / (name + '.rs')

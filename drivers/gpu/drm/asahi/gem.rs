@@ -41,9 +41,7 @@ use crate::{
         AsahiDrmDevice,
         AsahiDrmDriver, //
     },
-    file,
-    memacct,
-    mmu,
+    file, memacct, mmu,
 };
 
 const DEBUG_CLASS: DebugFlags = DebugFlags::Gem;
@@ -132,9 +130,6 @@ pub(crate) fn validate_vm_binding(gem: &Object, vm: &mmu::Vm) -> Result {
     }
     Ok(())
 }
-
-unsafe impl Send for AsahiObject {}
-unsafe impl Sync for AsahiObject {}
 
 /// A shared reference to a GEM object for this driver.
 pub(crate) struct ObjectRef {
@@ -466,7 +461,7 @@ mod allocation_policy_tests {
 /// The DMA mapping only cleans if the device is not marked DMA-coherent (G15's synthesized node
 /// has no `dma-coherent`). Should it ever be marked so, the pages are cleaned here instead.
 #[cfg(CONFIG_DRM_ASAHI_G15)]
-pub(crate) fn prepare_new_object(gem: &Object) -> Result {
+pub(crate) fn prepare_new_object_g15(gem: &Object) -> Result {
     // SAFETY: G15 objects belong to the retained bound platform device; user object
     // creation occurs only after registration and before a file can outlive its device.
     let dev: &kernel::device::Device = gem.dev().as_ref().as_ref();
@@ -503,9 +498,7 @@ pub(crate) fn prepare_new_object(gem: &Object) -> Result {
     Ok(())
 }
 
-
 #[cfg(CONFIG_DRM_ASAHI_G15)]
-extern "C" { fn asahi_g15_dma_coherent(dev: *mut core::ffi::c_void) -> bool; }
-
-#[cfg(not(CONFIG_DRM_ASAHI_G15))]
-pub(crate) fn prepare_new_object(_gem: &Object) -> Result { Err(EINVAL) }
+extern "C" {
+    fn asahi_g15_dma_coherent(dev: *mut core::ffi::c_void) -> bool;
+}

@@ -310,8 +310,8 @@ pub(crate) trait Gpu: Send + Sync {
         if self.queue_limits().is_some() {
             flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES);
         }
-        if self.soft_faults() && module_parameters::fault_control.value() == 0xb {
-            flags |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
+        if self.soft_faults() && self.supports_soft_faults() {
+            flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS);
         }
         flags
     }
@@ -350,28 +350,6 @@ pub(crate) trait Gpu: Send + Sync {
     fn base_clock_hz(&self) -> u32;
     /// Return the GPU address space geometry.
     fn uat_geometry(&self) -> mmu::UatGeometry;
-    /// Backend-specific user address aperture; other GPUs keep their geometry's range.
-    fn user_range(&self) -> Range<u64> {
-        self.uat_geometry().user_usable_range()
-    }
-    /// Use tracked command publication and sticky VM status on this backend.
-    fn tracked_submission(&self) -> bool {
-        false
-    }
-    /// Whether faults may be reported as recoverable to userspace.
-    fn soft_faults(&self) -> bool {
-        true
-    }
-    /// Populate and clean fresh object backing before any WC CPU mapping.
-    fn prepare_new_objects(&self) -> bool {
-        false
-    }
-    /// Optional backend-specific upper bound for a VM_BIND batch.
-    fn bind_batch_limit(&self) -> Option<u32> {
-        None
-    }
-    /// A userspace VM handle was closed; release backend-only registry references.
-    fn vm_closed(&self) {}
     /// Create a new `Vm` with the given range reserved for kernel-managed objects.
     fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm>;
     /// Create a VM charged to a DRM file when the backend bounds retained bindings.
@@ -1122,7 +1100,7 @@ impl GpuManager::ver {
                     virt_addr: U64(iova + off as u64),
                     total_size: (map.size * map.count * dies) as u32,
                     element_size: map.size as u32,
-                    readwrite: U64(map.writable as u64),
+                    readwrite: U64(u64::from(map.writable)),
                 };
             });
 
@@ -1172,20 +1150,14 @@ impl GpuManager::ver {
     /// Fetch the GPU MMU fault information from the hardware registers.
     fn get_fault_info(&self) -> Option<regs::FaultInfo> {
         // TODO: handle differently
-        let Some(guard) = self.dev.registration_guard() else {
-            return None;
-        };
+        let guard = self.dev.registration_guard()?;
 
         guard.registration_data_with(|reg_data| {
             let res = &reg_data.resources;
 
             let info = res.get_fault_info(self.cfg);
-            if info.is_some() {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "  Fault info: {:#x?}\n",
-                    info.as_ref().unwrap()
-                );
+            if let Some(fault) = &info {
+                dev_err!(self.dev.as_ref(), "  Fault info: {:#x?}\n", fault);
             }
             info
         })
