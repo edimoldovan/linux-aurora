@@ -16,6 +16,7 @@ use crate::{
         AsahiDrmDevice, //
     },
     gem,
+    gpu,
     memacct,
     mmu,
     queue,
@@ -44,6 +45,7 @@ use kernel::sync::{
     Mutex, //
 };
 use kernel::time::NSEC_PER_SEC;
+use kernel::types::ScopeGuard;
 use kernel::uaccess::{
     UserPtr,
     UserSlice, //
@@ -69,6 +71,7 @@ struct Vm {
     user_range: Range<u64>,
     kernel_range: Range<u64>,
     _dummy_mapping: mmu::KernelMapping,
+    gpu: Arc<dyn gpu::Gpu>,
 }
 
 impl Drop for Vm {
@@ -90,6 +93,7 @@ impl Drop for Vm {
                 pr_err!("Vm::Drop: deferred user unmap failed: {:?}\n", error);
             }
             self.vm.bo_deferred_cleanup();
+            self.gpu.vm_closed(&self.vm);
             return;
         }
         // When the user Vm is dropped, verify that no user mappings exists.
@@ -128,11 +132,16 @@ pub(crate) struct SyncItem {
 }
 
 impl SyncItem {
-    fn parse_one(file: &DrmFile, mut data: uapi::drm_asahi_sync, out: bool,
-        bundled: bool) -> Result<SyncItem>
-    {
+    fn parse_one(
+        file: &DrmFile,
+        mut data: uapi::drm_asahi_sync,
+        out: bool,
+        bundled: bool,
+    ) -> Result<SyncItem> {
         if data.sync_type == crate::g17::sync_output::SYNC_CUMULATIVE {
-            if !out || !bundled || data.timeline_value == 0 { return Err(EINVAL); }
+            if !out || !bundled || data.timeline_value == 0 {
+                return Err(EINVAL);
+            }
             data.sync_type = uapi::drm_asahi_sync_type_DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ;
         }
         match data.sync_type {
@@ -226,12 +235,16 @@ impl SyncItem {
                 }
                 anchor = Some(i as usize);
             }
-            vec.push(Self::parse_one(file, sync, i >= in_count,
-                allow_cumulative)?, GFP_KERNEL)?;
+            vec.push(
+                Self::parse_one(file, sync, i >= in_count, allow_cumulative)?,
+                GFP_KERNEL,
+            )?;
         }
         if let Some(anchor) = anchor {
             let bundle = crate::g17::sync_output::SignalBundle::new(
-                &vec[in_count as usize..], anchor - in_count as usize)?;
+                &vec[in_count as usize..],
+                anchor - in_count as usize,
+            )?;
             vec[anchor].cumulative = Some(bundle);
         } else {
             for sync in &mut vec[in_count as usize..] {
@@ -247,7 +260,7 @@ impl SyncItem {
 
 #[derive(Clone)]
 pub(crate) enum Object {
-    TimestampBuffer(Arc<mmu::KernelMapping>),
+    TimestampBuffer(Arc<crate::timestamp::Buffer>),
 }
 
 /// State associated with a client.
@@ -457,9 +470,12 @@ impl File {
             return Err(EINVAL);
         }
         let status = Self::vm_status(file, vm_id)?;
-        UserSlice::new(user, size)
-            .writer()
-            .write(&[vm_id, 0, status.reported_error() as u32, 0])?;
+        UserSlice::new(user, size).writer().write(&[
+            vm_id,
+            0,
+            status.reported_error() as u32,
+            0,
+        ])?;
         Ok(0)
     }
 
@@ -534,7 +550,22 @@ impl File {
 
         let gpu = &reg_data.gpu;
         let file_id = file.inner().id;
-        let vm = gpu.new_vm(kernel_range.clone())?;
+        let vm = gpu.new_vm_for_file(kernel_range.clone(), file_id)?;
+        // G16 registers a retained backend owner before returning this VM. Any later
+        // allocation can fail before file::Vm exists to run its normal close path.
+        let failed_vm = ScopeGuard::new_with_data(
+            (vm.clone(), user_range.clone(), kernel_range.clone()),
+            |(vm, user_range, kernel_range)| {
+                if gpu.tracked_submission() && vm.status().is_some() && !vm.is_closed() {
+                    vm.close_idle_reclaim();
+                    if let Err(error) = vm.unmap_user_ranges(user_range, kernel_range) {
+                        pr_err!("VM create: closing unpublished VM failed: {:?}\n", error);
+                    }
+                    vm.bo_deferred_cleanup();
+                    gpu.vm_closed(&vm);
+                }
+            },
+        );
 
         let vm_xa = file.inner().vms();
         let resv = vm_xa.lock().reserve_limit(1..=u32::MAX, GFP_KERNEL)?;
@@ -610,10 +641,12 @@ impl File {
                 user_range,
                 kernel_range,
                 _dummy_mapping: dummy_mapping,
+                gpu: gpu.clone(),
             },
             GFP_KERNEL,
         )?)?;
 
+        drop(failed_vm.dismiss());
         data.vm_id = id;
 
         Ok(0)
@@ -622,7 +655,7 @@ impl File {
     /// IOCTL: vm_destroy: Destroy a `Vm`.
     pub(crate) fn vm_destroy(
         _device: &AsahiDrmDevice<drm::Registered>,
-        reg_data: &driver::AsahiDrmRegistrationData<'_>,
+        _reg_data: &driver::AsahiDrmRegistrationData<'_>,
         data: &mut uapi::drm_asahi_vm_destroy,
         file: &DrmFile,
     ) -> Result<u32> {
@@ -631,7 +664,6 @@ impl File {
             Err(ENOENT)
         } else {
             drop(vm);
-            reg_data.gpu.vm_closed();
             Ok(0)
         }
     }
@@ -675,27 +707,47 @@ impl File {
         };
 
         let size = gem::checked_object_size(data.size.try_into()?)?;
-        let commit = memacct::LEDGER.admit(&file.inner().mem, size as u64).inspect_err(|_| {
-            cls_pr_debug!(
-                Errors,
-                "gem_create: {:#x} bytes refused by the GPU memory limits\n",
-                size
-            );
-        })?;
+        let commit = memacct::LEDGER
+            .admit(&file.inner().mem, size as u64)
+            .inspect_err(|_| {
+                cls_pr_debug!(
+                    Errors,
+                    "gem_create: {:#x} bytes refused by the GPU memory limits\n",
+                    size
+                );
+            })?;
         // Large G17 user objects are populated in full by the first VM_BIND.
         // Do not multiply direct reclaim/compaction latency by their folio
         // count. Userspace can evict its BO cache and retry after ENOMEM.
-        let pages_no_reclaim = gem::user_pages_no_reclaim(
-            size,
-            reg_data.gpu.as_any().is::<crate::g17::Gpu>(),
-        );
+        let pages_no_reclaim =
+            gem::user_pages_no_reclaim(size, reg_data.gpu.as_any().is::<crate::g17::Gpu>());
         let gem = gem::new_object(
-            device, size, data.flags, resv_obj, reclaim_cpu, pages_no_reclaim, commit,
+            device,
+            size,
+            data.flags,
+            resv_obj,
+            reclaim_cpu,
+            pages_no_reclaim,
+            commit,
         )?;
-
         if reg_data.gpu.prepare_new_objects() {
-            gem::prepare_new_object(&gem)?;
+            #[cfg(CONFIG_DRM_ASAHI_G15)]
+            if reg_data.gpu.as_any().is::<crate::g15::Gpu>() {
+                gem::prepare_new_object_g15(&gem)?;
+            } else {
+                let registered = device.registration_guard().ok_or(ENODEV)?;
+                let parent: &kernel::platform::Device<kernel::device::Bound> = registered.as_ref();
+                gem::prepare_new_object(&gem, parent.as_ref())?;
+            }
+            #[cfg(not(CONFIG_DRM_ASAHI_G15))]
+            let registered = device.registration_guard().ok_or(ENODEV)?;
+            #[cfg(not(CONFIG_DRM_ASAHI_G15))]
+            {
+                let parent: &kernel::platform::Device<kernel::device::Bound> = registered.as_ref();
+                gem::prepare_new_object(&gem, parent.as_ref())?;
+            }
         }
+
         let handle = gem.create_handle(file)?;
         data.handle = handle;
 
@@ -772,11 +824,17 @@ impl File {
         }
 
         if let Some(limit) = reg_data.gpu.bind_batch_limit() {
-            if data.num_binds == 0 || data.num_binds > limit || data.userptr == 0
-                || data.stride % 8 != 0 || data.stride as usize > kernel::page::PAGE_SIZE {
+            if data.num_binds == 0
+                || data.num_binds > limit
+                || data.userptr == 0
+                || data.stride % 8 != 0
+                || data.stride as usize > kernel::page::PAGE_SIZE
+            {
+                cls_pr_debug!(Errors, "vm_bind: Batch outside the GPU's limits\n");
                 return Err(EINVAL);
             }
         }
+
         if reg_data.gpu.as_any().is::<crate::g17::Gpu>() || reg_data.gpu.tracked_submission() {
             return Self::vm_bind_g17(data, file);
         }
@@ -1253,10 +1311,32 @@ impl File {
             return Err(EINVAL);
         }
 
-        // TODO: Allow with CAP_SYS_NICE
-        if data.priority >= uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_HIGH {
+        // REALTIME stays reserved. HIGH needs CAP_SYS_NICE or DRM master, as amdgpu and
+        // panthor require for raised queue priority; EACCES lets userspace fall back to MEDIUM.
+        if data.priority == uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_REALTIME {
             cls_pr_debug!(Errors, "queue_create: Invalid priority\n");
             return Err(EINVAL);
+        }
+        // HIGH has only been run on G17; G13 and G14 keep refusing it.
+        if data.priority == uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_HIGH
+            && !reg_data.gpu.as_any().is::<crate::g17::Gpu>()
+        {
+            cls_pr_debug!(
+                Errors,
+                "queue_create: HIGH priority is not supported on this GPU\n"
+            );
+            return Err(EINVAL);
+        }
+        // SAFETY: capable() only reads the calling task's credentials (ioctl process context).
+        if data.priority == uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_HIGH
+            && !unsafe { bindings::capable(bindings::CAP_SYS_NICE as _) }
+            && !file.is_current_master()
+        {
+            cls_pr_debug!(
+                Errors,
+                "queue_create: HIGH priority needs CAP_SYS_NICE or DRM master\n"
+            );
+            return Err(EACCES);
         }
 
         let queues_xa = file.inner().queues();
@@ -1319,6 +1399,9 @@ impl File {
         }
 
         let gpu = &reg_data.gpu;
+        if data.cmdbuf_size as usize > gpu.max_cmdbuf_size() {
+            return Err(E2BIG);
+        }
         if let Some(manager) = gpu.manager() {
             manager.update_globals();
         }
@@ -1363,9 +1446,13 @@ impl File {
         if guarded {
             copy_commands(&mut vec)?;
         }
-        let syncs =
-            SyncItem::parse_array(file, data.syncs, data.in_sync_count, data.out_sync_count,
-                gpu.as_any().is::<crate::g17::Gpu>())?;
+        let syncs = SyncItem::parse_array(
+            file,
+            data.syncs,
+            data.in_sync_count,
+            data.out_sync_count,
+            gpu.as_any().is::<crate::g17::Gpu>(),
+        )?;
 
         mod_dev_dbg!(
             device,
