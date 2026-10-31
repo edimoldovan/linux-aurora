@@ -8,6 +8,7 @@ The G15 probe, platform callback's dispatch block, Device::set_drvdata and
 try_pin_init macro are extracted from production. GPU startup and the allocator
 are fault-injection models. KBox's actual source is checked to allocate before
 write_pin_init; the host uses the same vendored write_pin_init implementation.
+Runs G15-only and combined G15/G16 module registration configurations.
 This checks allocation/init/binding order, not a GPU or a kernel probe on hardware.
 """
 import argparse
@@ -91,22 +92,29 @@ mod bindings {
         unsafe { (*dev).data.set(data); }
     }
 }
-struct Owned<T>(Pin<Box<T>>);
-impl<T> Owned<T> {
+struct KBox<T>(Box<T>);
+impl<T> core::ops::Deref for KBox<T> {
+    type Target = T;
+    fn deref(&self) -> &T { &self.0 }
+}
+impl<T> core::ops::DerefMut for KBox<T> {
+    fn deref_mut(&mut self) -> &mut T { &mut self.0 }
+}
+trait IntoForeign<T> { fn into_foreign(self) -> *mut T; }
+impl<T> IntoForeign<T> for Pin<KBox<T>> {
     fn into_foreign(self) -> *mut T {
-        // Test ownership transfer mirrors the kernel's retained pinned KBox.
-        unsafe { Box::into_raw(Pin::into_inner_unchecked(self.0)) }
+        // The pointer stays pinned until the fake kernel explicitly tears it down.
+        unsafe { Box::into_raw(Pin::into_inner_unchecked(self).0) }
     }
 }
-struct KBox;
-impl KBox {
-    fn pin_init<T>(init: impl PinInit<T, Error>, _flags: u32) -> Result<Owned<T>> {
+impl<T> KBox<T> {
+    fn pin_init(init: impl PinInit<T, Error>, _flags: u32) -> Result<Pin<Self>> {
         ALLOCS.with(|v| v.set(v.get() + 1));
         if FAIL_ALLOC.with(Cell::get) { return Err(-12); }
-        // Kernel KBox::try_pin_init has this same ordering. Allocation is the only
-        // mocked operation here; write_pin_init is the actual vendored implementation.
         let slot = Box::<T>::new_uninit();
-        Ok(Owned(slot.write_pin_init(init)?))
+        let value = slot.write_pin_init(init)?;
+        // Rewrap the owning pointer, preserving the actual pinned allocation.
+        Ok(unsafe { Pin::new_unchecked(Self(Pin::into_inner_unchecked(value))) })
     }
 }
 mod platform {
@@ -151,7 +159,11 @@ mod driver {
             assert!(BINDING_READY.get(), "adapter registered before binding registry init");
             try_pin_init!(Self {
                 stage: {
-                    let stage = if name.to_bytes() == b"asahi-g15" { 1 } else { 2 };
+                    let stage = match name.to_bytes() {
+                        b"aurora-g15" => 1,
+                        b"aurora-g16" => 3,
+                        _ => 2,
+                    };
                     // Model driver_attach and a late driver_add_groups failure. A deferred
                     // worker can also retry G15 while the other registration is in progress.
                     let _ = callback::<Driver<'static>>(&PDEV, Some(&&CFG));
@@ -202,7 +214,8 @@ static PDEV: platform::Device<Core<'static>> = platform::Device {
     base: Device { data: Cell::new(core::ptr::null_mut()) }, ctx: PhantomData,
 };
 fn activation_reprobe() {
-    assert_eq!(COMPLETED_REGISTRATION.get(), 2, "activation before all registrations completed");
+    let last = if cfg!(CONFIG_DRM_ASAHI_G16) { 3 } else { 2 };
+    assert_eq!(COMPLETED_REGISTRATION.get(), last, "activation before all registrations completed");
     ACTIVATED.set(true);
     let _ = callback::<Driver<'static>>(&PDEV, Some(&&CFG));
     // An attach pass may fail after another device starts. Its error is logged, not returned
@@ -211,7 +224,8 @@ fn activation_reprobe() {
 }
 fn module_cases() {
     static MODULE: ThisModule = ThisModule;
-    for failure in [1, 2, 0] {
+    let failures: &[u8] = if cfg!(CONFIG_DRM_ASAHI_G16) { &[1, 2, 3, 0] } else { &[1, 2, 0] };
+    for &failure in failures {
         reset(false, true, 0);
         PDEV.base.data.set(core::ptr::null_mut());
         MODULE_READY.store(false, Ordering::Release);
@@ -318,9 +332,13 @@ def main():
     assert ready in sources[PROBE_PATH]
     activate = item(sources[PROBE_PATH], "pub(crate) fn activate()")
     core = sources["drivers/gpu/drm/asahi/asahi_core.rs"]
+    # Keep the actual conditional G16 alias and registration helper in both builds.
+    start = core.index("#[cfg(CONFIG_DRM_ASAHI_G16)]\ntype G16Registration")
+    aliases = core[start:core.index("\n\nfn register_g16", start)]
+    g16_registration = aliases + "\n" + item(core, "fn register_g16(")
     module_struct = item(core, "#[pin_data]\nstruct DriverModule")
     module_init = item(core, "    fn init(module:")
-    module_code = module_struct + "\nimpl InPlaceModule for DriverModule {\n" + module_init + "\n}\nimpl ModuleMetadata for DriverModule { const NAME: &'static std::ffi::CStr = c\"asahi\"; }\n"
+    module_code = module_struct + "\nimpl InPlaceModule for DriverModule {\n" + module_init + "\n}\nimpl ModuleMetadata for DriverModule { const NAME: &'static std::ffi::CStr = c\"aurora\"; }\n"
     kbox = item(sources["rust/kernel/alloc/kbox.rs"], "    fn try_pin_init<E>(")
     assert "Box::<_, A>::new_uninit(flags)?.write_pin_init(init)" in kbox
     reprobe = item(sources["drivers/gpu/drm/asahi/g15/glue.c"], "void asahi_g15_reprobe(void)\n{")
@@ -362,7 +380,7 @@ int main(void) {
     subprocess.run([str(c_binary)], check=True)
     library = out / "libpin_init.rlib"
     subprocess.run([a.rustc, "--edition=2021", "--crate-type=rlib", "--crate-name=pin_init", "--cfg", 'feature="std"', str(ROOT / "rust/pin-init/src/lib.rs"), "--extern", f"pin_init_internal={a.kernel_build / 'rust/libpin_init_internal.so'}", "-L", f"dependency={a.kernel_build / 'rust'}", "-o", str(library)], check=True)
-    receipt = {"rustc": subprocess.check_output([a.rustc, "--version"], text=True).strip(), "pin_init_source_sha256": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in (ROOT / "rust/pin-init").rglob("*.rs")}, "proc_macro_sha256": hashlib.sha256((a.kernel_build / "rust/libpin_init_internal.so").read_bytes()).hexdigest(), "source_sha256": {n: hashlib.sha256(s.encode()).hexdigest() for n, s in sources.items()}, "cases": 9, "actual_C_activation_cases": 3, "mutants": {}, "scope": __doc__}
+    receipt = {"rustc": subprocess.check_output([a.rustc, "--version"], text=True).strip(), "pin_init_source_sha256": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in (ROOT / "rust/pin-init").rglob("*.rs")}, "proc_macro_sha256": hashlib.sha256((a.kernel_build / "rust/libpin_init_internal.so").read_bytes()).hexdigest(), "source_sha256": {n: hashlib.sha256(s.encode()).hexdigest() for n, s in sources.items()}, "cases": 19, "actual_C_activation_cases": 3, "mutants": {}, "scope": __doc__}
     variants = {"actual": (probe, module_code)}
     if a.mutations:
         try:
@@ -382,26 +400,33 @@ int main(void) {
         assert module_code.count(late) == 1
         early = module_code.replace(late, "").replace("            _driver <-", late + "            _driver <-", 1)
         variants["activation-before-last-registration"] = (probe, early)
-    for name, (method, module_variant) in variants.items():
-        # Macro definitions precede the fake registration, just as kernel prelude exports them.
-        source = macro + "\n" + PREFIX.replace("#![allow(dead_code, unused_variables)]\n", "").replace("    // SET_DRVDATA", set_data) + "\n" + ready + "\n" + driver + "\nimpl platform::Driver for Driver<'_> {\n    type IdInfo = &'static Config;\n    type Data<'bound> = Driver<'bound>;\n" + method + "\n}\nmod g15 { use super::*; pub type Driver<'a> = super::Driver<'a>; " + activate + "\n}\ntype G15Registration = driver::Registration<platform::Adapter<g15::Driver<'static>>>;\n" + module_variant + "\n" + SUFFIX.replace("    // CALLBACK", callback)
-        source = "#![allow(dead_code, unused_variables, private_bounds, private_interfaces)]\n" + source
-        src = out / (name + ".rs"); src.write_text(source)
-        binary = out / name
-        subprocess.run([a.rustc, "--edition=2021", "--cfg", "CONFIG_DRM_ASAHI_G15", str(src), "--extern", f"pin_init={library}", "-L", f"dependency={a.kernel_build / 'rust'}", "-o", str(binary)], check=True)
-        r = subprocess.run([str(binary)], capture_output=True, text=True)
-        receipt["mutants" if name != "actual" else "control"] = receipt.get("mutants" if name != "actual" else "control", {})
-        result = {"exit": r.returncode, "stdout": r.stdout, "stderr": r.stderr}
-        if name == "actual":
-            receipt["control"] = result
-            if r.returncode: raise SystemExit(r.stderr)
-            if r.stdout.count(": PASS\n") != 9: raise SystemExit("control did not run every case")
-        else:
-            receipt["mutants"][name] = result
-            if r.returncode == 0: raise SystemExit("SURVIVED: " + name)
-            intended = {"eager-probe-before-allocation": "allocation-before-start: firmware probe before drvdata allocation", "retained-error-unbinds": "retained-start-failure-binds: callback result", "no-registration-readiness-gate": "late registration failure started firmware", "activation-before-last-registration": "activation before all registrations completed"}[name]
-            result["intended_failure"] = intended in r.stderr
-            if not result["intended_failure"]: raise SystemExit("INVALID unrelated failure: " + name + "\n" + r.stderr)
+        before_g16 = module_code.replace(late, "").replace(
+            "            _g16: register_g16(module)?,", late + "            _g16: register_g16(module)?,", 1)
+        variants["activation-before-g16-registration"] = (probe, before_g16)
+    for enable_g16 in [False, True]:
+        for name, (method, module_variant) in variants.items():
+            if name == "activation-before-g16-registration" and not enable_g16:
+                continue
+            # Macro definitions precede the fake registration, just as kernel prelude exports them.
+            source = macro + "\n" + PREFIX.replace("#![allow(dead_code, unused_variables)]\n", "").replace("    // SET_DRVDATA", set_data) + "\n" + ready + "\n" + driver + "\nimpl platform::Driver for Driver<'_> {\n    type IdInfo = &'static Config;\n    type Data<'bound> = Driver<'bound>;\n" + method + "\n}\nmod g15 { use super::*; pub type Driver<'a> = super::Driver<'a>; " + activate + "\n}\ntype G15Registration = driver::Registration<platform::Adapter<g15::Driver<'static>>>;\n" + "mod g16 { pub struct Driver; pub const DRIVER_NAME: &std::ffi::CStr = c\"aurora-g16\"; }\n" + g16_registration + "\n" + module_variant + "\n" + SUFFIX.replace("    // CALLBACK", callback)
+            source = "#![allow(dead_code, unused_variables, private_bounds, private_interfaces)]\n" + source
+            label = ("g16-" if enable_g16 else "") + name
+            src = out / (label + ".rs"); src.write_text(source)
+            binary = out / label
+            subprocess.run([a.rustc, "--edition=2021", "--cfg", "CONFIG_DRM_ASAHI_G15", *(["--cfg", "CONFIG_DRM_ASAHI_G16"] if enable_g16 else []), str(src), "--extern", f"pin_init={library}", "-L", f"dependency={a.kernel_build / 'rust'}", "-o", str(binary)], check=True)
+            r = subprocess.run([str(binary)], capture_output=True, text=True)
+            receipt["mutants" if name != "actual" else "control"] = receipt.get("mutants" if name != "actual" else "control", {})
+            result = {"exit": r.returncode, "stdout": r.stdout, "stderr": r.stderr}
+            if name == "actual":
+                receipt["g16_control" if enable_g16 else "control"] = result
+                if r.returncode: raise SystemExit(r.stderr)
+                if r.stdout.count(": PASS\n") != (10 if enable_g16 else 9): raise SystemExit("control did not run every case")
+            else:
+                receipt["mutants"][label] = result
+                if r.returncode == 0: raise SystemExit("SURVIVED: " + name)
+                intended = {"eager-probe-before-allocation": "allocation-before-start: firmware probe before drvdata allocation", "retained-error-unbinds": "retained-start-failure-binds: callback result", "no-registration-readiness-gate": "late registration failure started firmware", "activation-before-last-registration": "activation before all registrations completed", "activation-before-g16-registration": "activation before all registrations completed"}[name]
+                result["intended_failure"] = intended in r.stderr
+                if not result["intended_failure"]: raise SystemExit("INVALID unrelated failure: " + name + "\n" + r.stderr)
     (out / "result.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(json.dumps(receipt, indent=2))
 
