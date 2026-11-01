@@ -58,6 +58,7 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('no-close', 'no-join'), out()),
     'apple-dart-fw-tests.py': [(out(), PASS)],
     'apple-dart-range-tests.py': [([], PASS)],
+    'asahi-stats-raw-tests.py': [([], PASS)],
     'atc-usb3-tests.py': [(out(), PASS), (out() + ['--mutations'], PASS)],
     'avd-av1-tail-tests.py': [(out(), PASS)]
         + [(out() + ['--case', c], PASS) for c in ('copy', 'seed', 'aligned')]
