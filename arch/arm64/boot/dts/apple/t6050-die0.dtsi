@@ -107,9 +107,26 @@
 		status = "disabled";
 	};
 
-	gpio0: gpio@29c000000 {
-		compatible = "apple,t6050-gpio", "apple,t8103-gpio";
+	/*
+	 * AP GPIO block. ADT /arm-io/gpio0: 0x9c000000 + 0x44000, 221 pins,
+	 * seven AIC interrupts, no-restore-gpio-pins 5 6 7 112 141. The t8140
+	 * driver variant: slots in the block fault when read, so the regmap is
+	 * not cache-initialised and stays inside the valid pins minus the
+	 * reserved ranges (the firmware's no-restore pins, as t8140.dtsi).
+	 * Enabled by the board DT together with its first users, the audio
+	 * codec reset, shutdown and interrupt lines.
+	 */
+	pinctrl_ap: pinctrl@29c000000 {
+		compatible = "apple,t6050-pinctrl", "apple,t8140-pinctrl";
 		reg = <0x2 0x9c000000 0x0 0x44000>;
+		power-domains = <&ps_gpio>;
+
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&pinctrl_ap 0 0 221>;
+		apple,npins = <221>;
+		gpio-reserved-ranges = <5 3>, <112 1>, <141 1>;
+
 		interrupt-controller;
 		#interrupt-cells = <2>;
 		interrupt-parent = <&aic>;
@@ -120,7 +137,49 @@
 			     <AIC_IRQ 490 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 491 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 492 IRQ_TYPE_LEVEL_HIGH>;
-		/* No pin map measured for J714c yet; keep the controller inert. */
+		status = "disabled";
+	};
+
+	/*
+	 * I2C controllers. ADT /arm-io/i2c1..3: 0x305014000, 0x305018000,
+	 * 0x30501c000 (+ 0x4000 each), AIC interrupts 1376-1378, pmgr I2C1-3.
+	 * SCL/SDA are AP pins 60/61, 62/63 and 64/65; iBoot leaves them muxed
+	 * (it drives the speaker amps for the boot chime), so no pin groups are
+	 * set here. i2c1 and i2c3 carry the speaker amps, i2c2 the jack codec.
+	 */
+	i2c1: i2c@505014000 {
+		compatible = "apple,t6050-i2c", "apple,t8103-i2c";
+		reg = <0x5 0x05014000 0x0 0x4000>;
+		clocks = <&clkref>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1376 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		power-domains = <&ps_i2c1>;
+		status = "disabled";
+	};
+
+	i2c2: i2c@505018000 {
+		compatible = "apple,t6050-i2c", "apple,t8103-i2c";
+		reg = <0x5 0x05018000 0x0 0x4000>;
+		clocks = <&clkref>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1377 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		power-domains = <&ps_i2c2>;
+		status = "disabled";
+	};
+
+	i2c3: i2c@50501c000 {
+		compatible = "apple,t6050-i2c", "apple,t8103-i2c";
+		reg = <0x5 0x0501c000 0x0 0x4000>;
+		clocks = <&clkref>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1378 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		power-domains = <&ps_i2c3>;
 		status = "disabled";
 	};
 

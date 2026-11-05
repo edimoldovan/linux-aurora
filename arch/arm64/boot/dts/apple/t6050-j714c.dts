@@ -19,6 +19,7 @@
 
 /dts-v1/;
 
+#include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/interrupt-controller/apple-aic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/leds/common.h>
@@ -146,5 +147,126 @@
 
 	fan-F1Ac {
 		apple,fan-mode = "F1md";
+	};
+};
+
+/*
+ * Audio, stage A: the I2C side only.
+ *
+ * ADT /arm-io/i2c1: audio-speaker 0x38 (the primary amp, holds
+ * speaker-config), audio-speaker-left-woofer-2 0x39, audio-speaker-left-
+ * tweeter 0x3a. /arm-io/i2c3: audio-speaker-right-woofer-1 0x3b,
+ * audio-speaker-right-woofer-2 0x3c, audio-speaker-right-tweeter 0x3d. All
+ * six are sn012776. /arm-io/i2c2: audio-codec-output 0x4b, cs42l84, the
+ * headphone jack.
+ *
+ * Lines, all on gpio0 (pinctrl_ap): amps share shutdown GPIO 107
+ * (function-reset GPIO(0x6b)) and interrupt 106; codec reset GPIO 139
+ * (function-reset GPIO(0x8b)), interrupt 134. Speaker-id GPIOs 136/137 are
+ * unused. Polarities follow the in-tree J516 and the J716s reference:
+ * active-high shutdown and reset, level-low interrupts; the ADT flag words
+ * (0x10001 amps, 0x1 codec) are not decoded.
+ *
+ * Sense slots: speaker-config row n is the amp the ADT names speakerN
+ * (audio-speaker, then speaker1..speaker5 = LW1 RW1 LW2 RW2 LT RT); amp n
+ * carries I in slot 4n and V in slot 4n+2, the tas2764/J516 convention
+ * (the ADT labels the two the other way round).
+ *
+ * No sound card: T6050 has no AP-side MCA. The I2S ports and their power
+ * domains belong to the AOP firmware (ADT /arm-io/iop-audio-controller,
+ * AOPAudioService, streams on admac-base-ns), as on T8140 where
+ * t8140_aop_audio provides the CPU DAIs; nothing drives them on T6050 yet.
+ * Without a card the amps stay in hardware shutdown: tas2764 requests the
+ * shutdown line as output-low at probe and raises it only from the ASoC
+ * component probe. The jack codec probes fully and arms plug detection.
+ */
+&pinctrl_ap {
+	status = "okay";
+};
+
+&i2c1 {
+	status = "okay";
+
+	speaker_left_woof1: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		shutdown-gpios = <&pinctrl_ap 107 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 1";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <0>;
+		ti,vmon-slot-no = <2>;
+	};
+
+	speaker_left_woof2: codec@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		shutdown-gpios = <&pinctrl_ap 107 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 2";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <8>;
+		ti,vmon-slot-no = <10>;
+	};
+
+	speaker_left_tweet: codec@3a {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3a>;
+		shutdown-gpios = <&pinctrl_ap 107 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <16>;
+		ti,vmon-slot-no = <18>;
+	};
+};
+
+&i2c2 {
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		reset-gpios = <&pinctrl_ap 139 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		interrupts-extended = <&pinctrl_ap 134 IRQ_TYPE_LEVEL_LOW>;
+		sound-name-prefix = "Jack";
+	};
+};
+
+&i2c3 {
+	status = "okay";
+
+	speaker_right_woof1: codec@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		shutdown-gpios = <&pinctrl_ap 107 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 1";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <4>;
+		ti,vmon-slot-no = <6>;
+	};
+
+	speaker_right_woof2: codec@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		shutdown-gpios = <&pinctrl_ap 107 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 2";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <12>;
+		ti,vmon-slot-no = <14>;
+	};
+
+	speaker_right_tweet: codec@3d {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3d>;
+		shutdown-gpios = <&pinctrl_ap 107 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <20>;
+		ti,vmon-slot-no = <22>;
 	};
 };
