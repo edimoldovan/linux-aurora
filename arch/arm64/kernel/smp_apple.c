@@ -25,8 +25,12 @@
  *                                jumps to the release slot, still holding
  *                                secondary_holding_pen.
  *   apple_cpu_hotplug=powerdown-legacy
- *                                the same, also with an m1n1 stage 2 older
- *                                than v1.9.9 (see apple_m1n1_reentry below).
+ *                                the same, accepting an m1n1 stage 2 older
+ *                                than v1.9.9.
+ *
+ * Powerdown is currently only used with a legacy (< v1.9.9) m1n1 and
+ * powerdown-legacy; every other combination falls back to park (see
+ * apple_m1n1_reentry below for why v1.9.9 and later are refused).
  *
  * Rules that hold in every mode:
  * - The boot CPU never goes offline: its RVBAR is locked by iBoot to m1n1,
@@ -133,7 +137,24 @@
  * slot holds it, which the kernel then makes sure of before each restart;
  * restarts are serialised by CPU hotplug, and a core stuck inside m1n1 with
  * the shared stack blocks all later restarts.
+ *
+ * Powerdown is refused with a v1.9.9+ ("mpidr") stage 2. Its re-entry
+ * (start.S via smp_reset_stacks[], then smp_secondary_entry()) runs on the
+ * core's secondary_stacks[] entry. Since m1n1 e327b97f4ab9 those are a
+ * static array in m1n1's .bss, above the release slots in .data.smp_shared,
+ * so outside the RVBAR..release-slot range that apple_cpu_prepare_powerdown()
+ * checks. m1n1 /memreserve/s its whole [_base, _end), but the EFI stub drops
+ * /memreserve/ entries and the kernel has no way to learn _end, so it cannot
+ * verify that those stack pages are not its own. A restart onto a stack the
+ * kernel has handed out would silently corrupt kernel memory, so these
+ * stage 2s get park. Legacy re-entry runs on dummy_stack, which is in
+ * smp.c's own .bss next to the legacy spin_table (both static, a few KB in
+ * all); the check is widened by APPLE_M1N1_LEGACY_SLACK past the release
+ * slot to cover it whichever order the linker chose. m1n1's own 128 KB
+ * boot stack follows .bss, so the slack stays inside [_base, _end).
  */
+#define APPLE_M1N1_LEGACY_SLACK		SZ_64K
+
 enum apple_m1n1_reentry {
 	APPLE_M1N1_UNKNOWN,	/* no or unparseable version: park only */
 	APPLE_M1N1_LEGACY,	/* < v1.9.9: shared stack, stale slot */
@@ -222,6 +243,8 @@ void apple_cpu_off_mmuoff(unsigned long stop_pa, unsigned long flushed_pa,
 
 static enum apple_hp_mode apple_hp_mode __ro_after_init;
 static bool apple_hp_allow_legacy __ro_after_init;
+/* Why apple_cpu_hotplug=powerdown[-legacy] became park, NULL if it did not. */
+static const char *apple_hp_fallback __ro_after_init;
 static bool apple_hp_active __ro_after_init;
 static enum apple_m1n1_reentry apple_m1n1_reentry __ro_after_init;
 static const char *apple_m1n1_version __ro_after_init;
@@ -229,7 +252,11 @@ static struct apple_cpu apple_cpus[NR_CPUS];
 static void __iomem *apple_cpu_start;
 static void __iomem *apple_ps_uart0;
 static bool apple_pmgr_unmapped;
-/* Legacy m1n1 only: a core is stuck on m1n1's shared stack. */
+/*
+ * A restarted core never reached the kernel and may still be inside m1n1,
+ * on the dummy_stack that every legacy re-entry shares: no core may be
+ * powered down or restarted again.
+ */
 static bool apple_restarts_blocked;
 
 static int __init apple_cpu_hotplug_setup(char *arg)
@@ -483,6 +510,9 @@ static void apple_cpu_prepare_powerdown(unsigned int cpu)
 		apple_cpu_unmap(ac);
 		return;
 	}
+	/* Legacy re-entry stack: see APPLE_M1N1_LEGACY_SLACK. */
+	if (apple_m1n1_reentry == APPLE_M1N1_LEGACY)
+		hi += APPLE_M1N1_LEGACY_SLACK;
 	if (apple_range_has_kernel_ram(lo, hi)) {
 		pr_warn("CPU%u: m1n1 at %pa..%pa is not reserved, powerdown disabled\n",
 			cpu, &lo, &hi);
@@ -528,31 +558,52 @@ static void apple_write_release(struct apple_cpu *ac, unsigned long pen_pa)
 			       (__force unsigned long)ac->release + sizeof(*ac->release));
 }
 
-static int apple_cpu_boot(unsigned int cpu)
+/*
+ * A cpu_boot() that never reached cpu_postboot(): __cpu_up() gave up after
+ * 5 s. CPU hotplug is serialised and arm64 brings CPUs up one at a time, so
+ * once the next hotplug operation runs, any CPU with boot_pending set has
+ * failed, whichever CPU that operation is for. The core may still be on its
+ * way; never send it anything again. If it was restarted through m1n1 it
+ * may still be there, on the shared dummy_stack: block every later restart
+ * and power-down.
+ */
+static void apple_cpu_reap_failed_boots(void)
 {
-	struct apple_cpu *ac = &apple_cpus[cpu];
-	unsigned long pen_pa = __pa_symbol(secondary_holding_pen);
-	int state = READ_ONCE(ac->state);
 	unsigned int i;
 
-	if (cpu == 0)
-		return -EPERM;
+	for_each_possible_cpu(i) {
+		struct apple_cpu *ac = &apple_cpus[i];
+		int state;
 
-	/*
-	 * The last cpu_boot() never reached cpu_postboot(): __cpu_up() gave up
-	 * after 5 s. The core may still be on its way; do not send it anything.
-	 */
-	if (ac->boot_pending) {
+		if (!READ_ONCE(ac->boot_pending))
+			continue;
+
+		state = READ_ONCE(ac->state);
 		apple_write_pen_release(INVALID_HWID);
 		ac->boot_pending = false;
 		ac->stuck = true;
 		ac->stuck_reason = "did not come online";
-		if (state == APPLE_CPU_STARTING &&
-		    apple_m1n1_reentry != APPLE_M1N1_MPIDR) {
-			/* It may sit on m1n1's shared dummy_stack. */
-			apple_restarts_blocked = true;
-		}
+		if (state == APPLE_CPU_STARTING)
+			WRITE_ONCE(apple_restarts_blocked, true);
+		pr_warn("CPU%u: did not come online (state %s), marked stuck%s\n",
+			i, apple_cpu_state_name[state],
+			state == APPLE_CPU_STARTING ?
+			", restarts blocked" : "");
 	}
+}
+
+static int apple_cpu_boot(unsigned int cpu)
+{
+	struct apple_cpu *ac = &apple_cpus[cpu];
+	unsigned long pen_pa = __pa_symbol(secondary_holding_pen);
+	unsigned int i;
+	int state;
+
+	if (cpu == 0)
+		return -EPERM;
+
+	apple_cpu_reap_failed_boots();
+	state = READ_ONCE(ac->state);
 
 	if (ac->stuck) {
 		/* A late stop is fine: it is off now, so it can be started. */
@@ -583,7 +634,7 @@ static int apple_cpu_boot(unsigned int cpu)
 		return 0;
 	}
 
-	if (apple_restarts_blocked) {
+	if (READ_ONCE(apple_restarts_blocked)) {
 		pr_err("CPU%u: a core is stuck in m1n1, not restarting\n", cpu);
 		return -EBUSY;
 	}
@@ -671,6 +722,9 @@ static int apple_cpu_disable(unsigned int cpu)
 	if (cpu == 0)
 		return -EPERM;
 
+	/* Before the restarts_blocked check below. */
+	apple_cpu_reap_failed_boots();
+
 	ac->down_mode = APPLE_CPU_PARKED;
 	if (apple_hp_mode != APPLE_HP_POWERDOWN) {
 		ac->park_reason = "mode";
@@ -685,7 +739,7 @@ static int apple_cpu_disable(unsigned int cpu)
 		ac->park_reason = "legacy m1n1, release slots unmapped";
 		return 0;
 	}
-	if (apple_restarts_blocked) {
+	if (READ_ONCE(apple_restarts_blocked)) {
 		ac->park_reason = "restarts blocked";
 		return 0;
 	}
@@ -876,20 +930,22 @@ apple_cpu_hotplug_ops(const struct cpu_operations *ops)
 		apple_m1n1_version ?: "(not reported)",
 		apple_m1n1_reentry_name[apple_m1n1_reentry]);
 
-	if (apple_hp_mode == APPLE_HP_POWERDOWN &&
-	    !of_machine_is_compatible("apple,t8103")) {
-		pr_warn("powerdown is t8103-only, using park\n");
-		apple_hp_mode = APPLE_HP_PARK;
-	}
 	if (apple_hp_mode == APPLE_HP_POWERDOWN) {
-		if (apple_m1n1_reentry == APPLE_M1N1_UNKNOWN) {
-			pr_warn("m1n1 version unknown, using park\n");
+		if (!of_machine_is_compatible("apple,t8103"))
+			apple_hp_fallback = "not t8103";
+		else if (apple_m1n1_reentry == APPLE_M1N1_UNKNOWN)
+			apple_hp_fallback = "m1n1 version unknown";
+		else if (apple_m1n1_reentry == APPLE_M1N1_MPIDR)
+			apple_hp_fallback =
+				"m1n1 v1.9.9+ restarts a core on a stack in its .bss that the kernel cannot verify is reserved";
+		else if (!apple_hp_allow_legacy)
+			apple_hp_fallback = "m1n1 older than v1.9.9 needs apple_cpu_hotplug=powerdown-legacy";
+
+		if (apple_hp_fallback) {
+			pr_warn("powerdown refused (%s), using park\n",
+				apple_hp_fallback);
 			apple_hp_mode = APPLE_HP_PARK;
-		} else if (apple_m1n1_reentry == APPLE_M1N1_LEGACY &&
-			   !apple_hp_allow_legacy) {
-			pr_warn("m1n1 older than v1.9.9 has no per-core re-entry; using park (apple_cpu_hotplug=powerdown-legacy overrides)\n");
-			apple_hp_mode = APPLE_HP_PARK;
-		} else if (apple_m1n1_reentry == APPLE_M1N1_LEGACY) {
+		} else {
 			pr_warn("legacy m1n1 re-entry: every release slot is rewritten before a restart\n");
 		}
 	}
@@ -927,6 +983,7 @@ static int apple_cpu_hotplug_show(struct seq_file *m, void *v)
 
 	seq_printf(m, "mode: %s\n",
 		   apple_hp_mode == APPLE_HP_POWERDOWN ? "powerdown" : "park");
+	seq_printf(m, "powerdown_fallback: %s\n", apple_hp_fallback ?: "-");
 	seq_printf(m, "m1n1: %s reentry=%s\n",
 		   apple_m1n1_version ?: "(not reported)",
 		   apple_m1n1_reentry_name[apple_m1n1_reentry]);
