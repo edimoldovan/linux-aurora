@@ -1625,9 +1625,18 @@ config ARM64_APPLE_CPU_HOTPLUG
 	    CPU-start block and restart it through m1n1's reset vector
 	    (apple_cpu_hotplug=powerdown).
 
-	  The boot CPU stays online. Without one of these parameters on the
-	  kernel command line nothing changes. While enabled, kexec and
-	  hibernation stay refused as with plain spin-table.
+	  The boot CPU stays online, and the last online core of a cluster
+	  is only ever parked. Powerdown needs m1n1 stage 2 v1.9.9 or later
+	  (apple_cpu_hotplug=powerdown-legacy accepts older ones); otherwise
+	  it falls back to park.
+
+	  A parked CPU waits clock-gated in WFE, which costs more power
+	  than an idle online CPU in cpuidle: this is groundwork for
+	  suspend-to-RAM, not a power saving on its own.
+
+	  Without one of these parameters on the kernel command line
+	  nothing changes. While enabled, kexec and hibernation stay
+	  refused as with plain spin-table.
 
 # Common NUMA Features
 config NUMA

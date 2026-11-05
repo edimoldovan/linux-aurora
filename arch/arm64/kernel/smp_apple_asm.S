@@ -9,6 +9,16 @@
  *
  * Neither exit touches memory between turning the caches off and cleaning
  * them, so no stale dirty line can overwrite a non-cacheable store.
+ *
+ * Both exits clean L1 only. M1 cores run with HID4/EHID4
+ * DISABLE_DC_SW_L2_OPS (bit 44) set by m1n1 init_cpu() (chickens.c), so a
+ * set/way operation never reaches the cluster L2; the kernel therefore never
+ * powers down the last online core of a cluster (see smp_apple.c).
+ *
+ * After the clean, each exit stores 1 to its per-CPU "flushed" word with the
+ * MMU off (a non-cacheable store to its physical address). cpu_kill() on
+ * another CPU waits for it, so the L1 is known to be clean before the dying
+ * CPU is reported dead.
  */
 
 #include <linux/linkage.h>
@@ -50,7 +60,8 @@ SYM_FUNC_END(apple_cpu_mmu_off_jump)
 	.text
 /*
  * Clean and invalidate the data caches by set/way, from L1 up to (not
- * including) level x0 + 1. x0 = 1 is L1 only.
+ * including) level x0 + 1. x0 = 1 is L1 only, the only value used: on M1
+ * the set/way operations do not reach L2 (HID4 bit 44, see above).
  *
  * This is the TF-A do_dcsw_op loop that m1n1 runs on M1 in mmu_disable()
  * (m1n1 src/memory_asm.S), restricted to DC CISW.
@@ -97,43 +108,54 @@ SYM_FUNC_START_LOCAL(apple_dcache_cisw_levels)
 SYM_FUNC_END(apple_dcache_cisw_levels)
 
 /*
- * apple_cpu_park_mmuoff(pen_pa, levels) - MMU off, running at its PA.
+ * apple_cpu_park_mmuoff(pen_pa, flushed_pa) - MMU off, running at its PA.
  *
- * Milestone 1 ("park"): nothing is powered down. Empty the local caches so
- * that the CPU holds no stale line when it turns them on again, then enter
+ * Milestone 1 ("park"): nothing is powered down. Empty L1 so that the CPU
+ * holds no dirty or stale line, report that through *flushed_pa, then enter
  * the kernel's own secondary_holding_pen, exactly where m1n1 sent it at
  * boot. cpu_boot releases it with secondary_holding_pen_release + SEV.
  */
 SYM_FUNC_START(apple_cpu_park_mmuoff)
 	mov	x19, x0
-	mov	x0, x1
+	mov	x20, x1
+	mov	x0, #1
 	bl	apple_dcache_cisw_levels
 	ic	iallu
 	tlbi	vmalle1
 	dsb	sy
 	isb
+
+	mov	x0, #1
+	str	x0, [x20]			// L1 is clean: tell cpu_kill()
+	dsb	sy
 	br	x19
 SYM_FUNC_END(apple_cpu_park_mmuoff)
 
 /*
- * apple_cpu_off_mmuoff(stop_reg_pa, levels, stop_bit) - MMU off, at its PA.
+ * apple_cpu_off_mmuoff(stop_reg_pa, flushed_pa, stop_bit) - MMU off, at its PA.
  *
  * Milestone 2 ("powerdown"): the per-core stop that m1n1 smp_stop_cpu() does
  * (m1n1 src/smp.c:228-233 and cpu_sleep(false), src/utils.c:249-285):
  * request the stop in the PMGR CPU-start block, then CYC_OVRD
  * FIQ_MODE(2) | IRQ_MODE(2) | WFI_MODE(3) | DISABLE_WFI_RET and WFI.
- * ACC_OVRD is deliberately left alone: its deep-sleep bit is per cluster.
+ * ACC_OVRD is deliberately left alone: its deep-sleep bit is per cluster,
+ * and this core is never the last online core of its cluster.
  *
  * The core comes back through PMGR CPU start, at its RVBAR (m1n1).
  */
 SYM_FUNC_START(apple_cpu_off_mmuoff)
 	mov	x19, x0
 	mov	x20, x2
-	mov	x0, x1
+	mov	x21, x1
+	mov	x0, #1
 	bl	apple_dcache_cisw_levels
 	ic	iallu
 	dsb	sy
 	isb
+
+	mov	x0, #1
+	str	x0, [x21]			// L1 is clean: tell cpu_kill()
+	dsb	sy
 
 	str	w20, [x19]			// request this core's stop
 	dsb	sy
