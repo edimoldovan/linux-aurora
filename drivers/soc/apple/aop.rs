@@ -1383,6 +1383,7 @@ impl AopData {
     /// Starts the AFK handshake on every advertised endpoint. An endpoint
     /// the match data does not require may fail to start; it is skipped.
     fn start_afk(&self) -> Result<()> {
+        let mut started_count = 0u32;
         for ep in 0..AFK_ENDPOINT_COUNT as usize {
             let rtk_ep_num = AFK_ENDPOINT_START + ep as u8;
             let mut guard = self.rtkit.lock();
@@ -1399,7 +1400,7 @@ impl AopData {
                 Ok(())
             });
             match started {
-                Ok(()) => {}
+                Ok(()) => started_count += 1,
                 Err(e) if !required => {
                     dev_warn!(
                         self.dev,
@@ -1411,6 +1412,7 @@ impl AopData {
                 Err(e) => return Err(e),
             }
         }
+        dev_info!(self.dev, "{} AFK endpoints started", started_count);
         Ok(())
     }
     fn register_service(
@@ -2309,6 +2311,22 @@ const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     required_endpoints: &[0x20, 0x21, 0x22, 0x23, 0x2b],
 };
 
+/// T6050 (J714c ADT: iop,ascwrap-v6, iop-aop-nub rtbuddy-v2, firmware
+/// pre-loaded): T8140's protocol, without the setup port. The ADT's
+/// aop-exclave-mailbox aperture (0x4d067c000) hangs the AP on its first
+/// read, and the firmware boots and starts its AFK endpoints without it
+/// (J714c: RTKit protocol 12, 13 endpoints).
+const HW_CFG_T6050: AopHwConfig = AopHwConfig {
+    ec0p: 0,
+    aopt: 0,
+    alig: 0,
+    patch_bootargs: false,
+    epic_v4: true,
+    setup_port: false,
+    quiesce_on_unbind: true,
+    required_endpoints: &[0x20, 0x21, 0x22, 0x23, 0x2b],
+};
+
 kernel::of_device_table!(
     OF_TABLE,
     MODULE_OF_TABLE,
@@ -2319,6 +2337,7 @@ kernel::of_device_table!(
         (of::DeviceId::new(c_str!("apple,t6000-aop")), &HW_CFG_T6000),
         (of::DeviceId::new(c_str!("apple,t6020-aop")), &HW_CFG_T6020),
         (of::DeviceId::new(c_str!("apple,t8140-aop")), &HW_CFG_T8140),
+        (of::DeviceId::new(c_str!("apple,t6050-aop")), &HW_CFG_T6050),
     ]
 );
 

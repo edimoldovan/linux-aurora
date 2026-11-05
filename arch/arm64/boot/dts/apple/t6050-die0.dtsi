@@ -184,6 +184,68 @@
 	};
 
 	/*
+	 * AOP (always-on processor) and the audio DMA it owns. ADT /arm-io/aop
+	 * (iop,ascwrap-v6, pre-loaded firmware mac17jaop): asc 0x90600000+0x88000,
+	 * mmio 0x90c00000+0x2f0000, mailbox AIC 578-581 (ADT order [579 578 581
+	 * 580] = send-not-empty, send-empty, recv-not-empty, recv-empty, as mtp);
+	 * no AP power or clock gates. /arm-io/aop-exclave-mailbox
+	 * (iop,secure-rtbuddy-proxy, T8140's "setup port"): 0x2d067c000+0x4000,
+	 * ADT interrupts [585 582], dart-aop mapper 1; reading it hangs the AP,
+	 * and the firmware boots without it, so it is not described. /arm-io/dart-aop:
+	 * 0x90fc0000+0xc000, AIC 616, mappers aop 0, exclave-aop 1,
+	 * admac-base-ns 8, admac-leap-ns 10, admac-leap-s 11.
+	 * /arm-io/admac-base-ns (admac-evolution,t6050): 0x93800000+0x34000,
+	 * AIC 637, 13 tx + 13 rx channels. DMA windows as t8140.dtsi: the ADT
+	 * has the same vm-base-0 (0x10040000000) and vm-base-1 (0x20000000000).
+	 */
+	aop_mbox: mailbox@290608000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0x90608000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 578 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 579 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 580 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 581 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	aop_dart: iommu@290fc0000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x2 0x90fc0000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 616 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	aop: aop@290c00000 {
+		compatible = "apple,t6050-aop";
+		reg = <0x2 0x90c00000 0x0 0x2f0000>,
+		      <0x2 0x90600000 0x0 0x88000>;
+		reg-names = "mmio", "asc";
+		mboxes = <&aop_mbox>;
+		mbox-names = "mbox";
+		iommus = <&aop_dart 0>;
+		apple,dma-range = <0x110 0x0 0x10 0x0>;
+		status = "disabled";
+	};
+
+	admac_base_ns: dma-controller@293800000 {
+		compatible = "apple,t6050-admac", "apple,t8140-admac";
+		reg = <0x2 0x93800000 0x0 0x34000>;
+		dma-channels = <13>;
+		interrupts-extended = <&aic AIC_IRQ 637 IRQ_TYPE_LEVEL_HIGH>,
+				      <0>, <0>, <0>;
+		#dma-cells = <1>;
+		iommus = <&aop_dart 8>;
+		apple,dma-range = <0x110 0x0 0x0 0x10000000>;
+		status = "disabled";
+	};
+
+	/*
 	 * J714c also has a dockchannel UART (aapl,dock-channels,
 	 * 0x88e28000/0x10004 + 0x88e0c000/0x18, AIC IRQ 360). The in-tree
 	 * apple,dockchannel-uart driver expects three named windows

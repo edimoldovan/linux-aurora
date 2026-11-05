@@ -270,3 +270,20 @@
 		ti,vmon-slot-no = <22>;
 	};
 };
+
+/*
+ * AOP, step 1 of the audio bring-up: the co-processor and its mailbox.
+ * The base-ns ADMAC sits in an AOP-owned power domain and is enabled with
+ * the audio streams, together with the aop_audio child.
+ */
+&aop_dart {
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+&aop {
+	status = "okay";
+};
