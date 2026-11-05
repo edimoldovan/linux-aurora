@@ -1621,15 +1621,22 @@ config ARM64_APPLE_CPU_HOTPLUG
 
 	  - park an offline CPU in the kernel's holding pen with its MMU
 	    and caches off (apple_cpu_hotplug=park), or
-	  - on t8103 (M1), stop and power it down through the PMGR
-	    CPU-start block and restart it through m1n1's reset vector
-	    (apple_cpu_hotplug=powerdown).
+	  - on t8103 (M1) with a legacy m1n1 stage 2, stop and power it
+	    down through the PMGR CPU-start block and restart it through
+	    m1n1's reset vector (apple_cpu_hotplug=powerdown-legacy).
 
 	  The boot CPU stays online, and the last online core of a cluster
-	  is only ever parked. Powerdown currently needs an m1n1 stage 2
-	  older than v1.9.9 and apple_cpu_hotplug=powerdown-legacy: v1.9.9
-	  and later restart a core on a stack the kernel cannot verify is
-	  reserved. In every other case it falls back to park.
+	  is only ever parked. Powerdown needs powerdown-legacy and an
+	  m1n1 whose version is a clean release tag no newer than v1.6.1;
+	  a git-describe suffix such as v1.6.1-47-g1b469fcb or -dirty
+	  does not count. In every other case, including plain
+	  apple_cpu_hotplug=powerdown, it falls back to park and says why.
+
+	  m1n1 v1.9.9 and later restart a core on a stack in m1n1's .bss.
+	  The kernel could in principle locate it through m1n1's
+	  smp_reset_stacks table next to the release slots, inside m1n1's
+	  EFI-reserved image, but that layout is not a stable interface,
+	  so these are refused as a conservative policy.
 
 	  A parked CPU waits clock-gated in WFE, which costs more power
 	  than an idle online CPU in cpuidle: this is groundwork for

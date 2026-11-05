@@ -17,20 +17,27 @@
  *   apple_cpu_hotplug=park       offline: L1 cleaned, MMU and caches off,
  *                                back into the kernel's secondary_holding_pen
  *                                (no power change). online: pen release + SEV.
- *   apple_cpu_hotplug=powerdown  t8103 only. offline: per-core stop through
- *                                the PMGR CPU-start block and CYC_OVRD, as
- *                                m1n1 smp_stop_cpu() does. online: PMGR CPU
- *                                start; the core resets at its RVBAR into
- *                                m1n1, which re-applies the chicken bits and
- *                                jumps to the release slot, still holding
- *                                secondary_holding_pen.
  *   apple_cpu_hotplug=powerdown-legacy
- *                                the same, accepting an m1n1 stage 2 older
- *                                than v1.9.9.
+ *                                t8103 with a legacy m1n1 stage 2 only (a
+ *                                clean release tag no newer than v1.6.1, see
+ *                                apple_m1n1_classify()). offline: per-core
+ *                                stop through the PMGR CPU-start block and
+ *                                CYC_OVRD, as m1n1 smp_stop_cpu() does.
+ *                                online: PMGR CPU start; the core resets at
+ *                                its RVBAR into m1n1, which re-applies the
+ *                                chicken bits and jumps to the release slot,
+ *                                still holding secondary_holding_pen.
+ *   apple_cpu_hotplug=powerdown  never powers a core down at present: it is
+ *                                refused and falls back to park, with the
+ *                                reason in the log and in debugfs. With a
+ *                                legacy m1n1 it asks for powerdown-legacy;
+ *                                with v1.9.9 and later, or an m1n1 version
+ *                                that is not a recognised release tag, there
+ *                                is no powerdown at all (see
+ *                                apple_m1n1_reentry below).
  *
- * Powerdown is currently only used with a legacy (< v1.9.9) m1n1 and
- * powerdown-legacy; every other combination falls back to park (see
- * apple_m1n1_reentry below for why v1.9.9 and later are refused).
+ * So powerdown happens only with powerdown-legacy, on t8103, with a legacy
+ * m1n1; every other combination parks.
  *
  * Rules that hold in every mode:
  * - The boot CPU never goes offline: its RVBAR is locked by iBoot to m1n1,
@@ -143,22 +150,29 @@
  * core's secondary_stacks[] entry. Since m1n1 e327b97f4ab9 those are a
  * static array in m1n1's .bss, above the release slots in .data.smp_shared,
  * so outside the RVBAR..release-slot range that apple_cpu_prepare_powerdown()
- * checks. m1n1 /memreserve/s its whole [_base, _end), but the EFI stub drops
- * /memreserve/ entries and the kernel has no way to learn _end, so it cannot
- * verify that those stack pages are not its own. A restart onto a stack the
- * kernel has handed out would silently corrupt kernel memory, so these
- * stage 2s get park. Legacy re-entry runs on dummy_stack, which is in
- * smp.c's own .bss next to the legacy spin_table (both static, a few KB in
- * all); the check is widened by APPLE_M1N1_LEGACY_SLACK past the release
- * slot to cover it whichever order the linker chose. m1n1's own 128 KB
- * boot stack follows .bss, so the slack stays inside [_base, _end).
+ * checks. The kernel could in principle check them too: smp_reset_stacks[]
+ * (MPIDR and stack top per core) sits in the same 64 KB .data.smp_shared
+ * block as the release slots, and the m1n1 -> U-Boot -> EFI chain hands
+ * m1n1's whole [_base, _end) to the kernel as EFI reserved memory. But that
+ * table's layout and place in the block are not an interface m1n1 promises,
+ * and a restart onto a stack the kernel has handed out would silently
+ * corrupt kernel memory. So, as a conservative policy rather than for want
+ * of a way to look, these stage 2s get park until m1n1 offers a stable way
+ * to find the re-entry stacks. The same holds for any version string that
+ * is not a recognised release tag (apple_m1n1_classify()).
+ *
+ * Legacy re-entry runs on dummy_stack, which is in smp.c's own .bss next to
+ * the legacy spin_table (both static, a few KB in all); the check is widened
+ * by APPLE_M1N1_LEGACY_SLACK past the release slot to cover it whichever
+ * order the linker chose. m1n1's own 128 KB boot stack follows .bss, so the
+ * slack stays inside [_base, _end).
  */
 #define APPLE_M1N1_LEGACY_SLACK		SZ_64K
 
 enum apple_m1n1_reentry {
-	APPLE_M1N1_UNKNOWN,	/* no or unparseable version: park only */
-	APPLE_M1N1_LEGACY,	/* < v1.9.9: shared stack, stale slot */
-	APPLE_M1N1_MPIDR,	/* >= v1.9.9: per-core stack and slot */
+	APPLE_M1N1_UNKNOWN,	/* not a recognised release tag: park only */
+	APPLE_M1N1_LEGACY,	/* tag <= v1.6.1: shared stack, stale slot */
+	APPLE_M1N1_MPIDR,	/* tag >= v1.9.9: per-core stack and slot */
 };
 
 static const char *const apple_m1n1_reentry_name[] = {
@@ -266,13 +280,16 @@ static int __init apple_cpu_hotplug_setup(char *arg)
 
 	if (!strcmp(arg, "park") || !strcmp(arg, "1")) {
 		apple_hp_mode = APPLE_HP_PARK;
+		apple_hp_allow_legacy = false;
 	} else if (!strcmp(arg, "powerdown")) {
 		apple_hp_mode = APPLE_HP_POWERDOWN;
+		apple_hp_allow_legacy = false;
 	} else if (!strcmp(arg, "powerdown-legacy")) {
 		apple_hp_mode = APPLE_HP_POWERDOWN;
 		apple_hp_allow_legacy = true;
 	} else if (!strcmp(arg, "0") || !strcmp(arg, "off")) {
 		apple_hp_mode = APPLE_HP_NONE;
+		apple_hp_allow_legacy = false;
 	} else {
 		return -EINVAL;
 	}
@@ -881,33 +898,82 @@ static const struct cpu_operations apple_spin_table_ops = {
 };
 
 /*
- * m1n1 stage 2 writes its version, "git describe" style (v1.6.1,
- * v1.4.21-12-gabcdef, v2.0.0-dirty), to /chosen.
+ * One version component: 1 to 4 decimal digits. Returns the character after
+ * it, or NULL.
  */
-static enum apple_m1n1_reentry __init apple_m1n1_probe(void)
+static const char * __init apple_m1n1_parse_num(const char *s, unsigned int *n)
 {
-	struct device_node *chosen;
-	const char *ver = NULL;
+	unsigned int digits = 0;
+
+	*n = 0;
+	while (*s >= '0' && *s <= '9') {
+		if (++digits > 4)
+			return NULL;
+		*n = *n * 10 + (*s++ - '0');
+	}
+
+	return digits ? s : NULL;
+}
+
+/*
+ * m1n1 stage 2 writes its version to /chosen as version.sh made it: "git
+ * describe --tags --always --dirty" in a git tree (v1.6.1,
+ * v1.6.1-47-g1b469fcb, v1.6.1-dirty, or a bare hash with no tag), else the
+ * source directory name or $M1N1_VERSION_TAG. Only a clean release tag,
+ * "[v]MAJ.MIN.PATCH" and nothing after it, says which code is running:
+ *
+ * - <= v1.6.1: LEGACY. There is no tag between v1.6.1 and v1.9.9, and the
+ *   MPIDR-indexed .bss stacks (e327b97f4ab9, 1b469fcb618f) landed as
+ *   v1.6.1-45 and -47, so "v1.6.1-N-g<hash>" may well have them; any
+ *   suffix makes it UNKNOWN. "-dirty" (uncommitted changes) does too, and
+ *   so do release candidates ("v1.6.1-rc1").
+ * - >= v1.9.9: MPIDR. A describe suffix on these is UNKNOWN as well; both
+ *   park in powerdown mode, so nothing is lost by not guessing.
+ * - Anything else, including a missing, empty or unparseable property and a
+ *   clean tag between the two that no m1n1 release has: UNKNOWN.
+ */
+static enum apple_m1n1_reentry __init apple_m1n1_classify(const char *ver)
+{
 	unsigned int maj, min, patch;
 
-	chosen = of_find_node_by_path("/chosen");
-	if (chosen) {
-		of_property_read_string(chosen, "asahi,m1n1-stage2-version", &ver);
-		of_node_put(chosen);
-	}
-	apple_m1n1_version = ver;
 	if (!ver)
 		return APPLE_M1N1_UNKNOWN;
-
 	if (*ver == 'v')
 		ver++;
-	if (sscanf(ver, "%u.%u.%u", &maj, &min, &patch) != 3)
+
+	ver = apple_m1n1_parse_num(ver, &maj);
+	if (!ver || *ver++ != '.')
+		return APPLE_M1N1_UNKNOWN;
+	ver = apple_m1n1_parse_num(ver, &min);
+	if (!ver || *ver++ != '.')
+		return APPLE_M1N1_UNKNOWN;
+	ver = apple_m1n1_parse_num(ver, &patch);
+	if (!ver || *ver)
 		return APPLE_M1N1_UNKNOWN;
 
 	if (maj > 1 || (maj == 1 && (min > 9 || (min == 9 && patch >= 9))))
 		return APPLE_M1N1_MPIDR;
+	if (maj < 1 || (maj == 1 && (min < 6 || (min == 6 && patch <= 1))))
+		return APPLE_M1N1_LEGACY;
 
-	return APPLE_M1N1_LEGACY;
+	return APPLE_M1N1_UNKNOWN;
+}
+
+static enum apple_m1n1_reentry __init apple_m1n1_probe(void)
+{
+	struct device_node *chosen;
+	const char *ver = NULL;
+
+	chosen = of_find_node_by_path("/chosen");
+	if (chosen) {
+		if (of_property_read_string(chosen, "asahi,m1n1-stage2-version",
+					    &ver))
+			ver = NULL;
+		of_node_put(chosen);
+	}
+	apple_m1n1_version = ver;
+
+	return apple_m1n1_classify(ver);
 }
 
 /*
@@ -934,12 +1000,13 @@ apple_cpu_hotplug_ops(const struct cpu_operations *ops)
 		if (!of_machine_is_compatible("apple,t8103"))
 			apple_hp_fallback = "not t8103";
 		else if (apple_m1n1_reentry == APPLE_M1N1_UNKNOWN)
-			apple_hp_fallback = "m1n1 version unknown";
+			apple_hp_fallback =
+				"m1n1 version is not a recognised release tag";
 		else if (apple_m1n1_reentry == APPLE_M1N1_MPIDR)
 			apple_hp_fallback =
-				"m1n1 v1.9.9+ restarts a core on a stack in its .bss that the kernel cannot verify is reserved";
+				"m1n1 v1.9.9+ restarts a core on a .bss stack with no stable interface to check it is reserved";
 		else if (!apple_hp_allow_legacy)
-			apple_hp_fallback = "m1n1 older than v1.9.9 needs apple_cpu_hotplug=powerdown-legacy";
+			apple_hp_fallback = "legacy m1n1 (v1.6.1 or older) needs apple_cpu_hotplug=powerdown-legacy";
 
 		if (apple_hp_fallback) {
 			pr_warn("powerdown refused (%s), using park\n",
