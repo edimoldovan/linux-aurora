@@ -1870,12 +1870,22 @@ struct macaudio_platform_cfg macaudio_j493_cfg = {
  * is capped at -30 dB until a speakersafetyd profile is validated.
  */
 struct macaudio_platform_cfg macaudio_j714_cfg = {
-	.enable_speakers = false,
+	/*
+	 * Speakers on with speakersafetyd's j714 profile (bring-up values:
+	 * J716-conservative thermal limits); the kernel keeps the unlocked
+	 * ceiling at max_vol until that profile is validated.
+	 */
+	.enable_speakers = true,
 	.amp = AMP_SN012776,
 	.speakers = SPKR_2W1T,
 	.stereo = true,
 	.amp_gain = 10,
-	.safe_vol = -20,
+	/*
+	 * Locked (no speakersafetyd holding the controls) and unlocked limits
+	 * both at the bring-up ceiling: the volume never rises above it,
+	 * whichever state the daemon leaves the card in.
+	 */
+	.safe_vol = -30,
 	.max_vol = -30,
 	/*
 	 * The AOP's audio streams (t8140_aop_audio, T6050 variant) instead

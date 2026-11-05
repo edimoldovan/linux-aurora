@@ -151,7 +151,8 @@
 };
 
 /*
- * Audio, stage A: the I2C side only.
+ * Audio: the amplifiers and the jack codec on I2C; the I2S side is the
+ * AOP's (below).
  *
  * ADT /arm-io/i2c1: audio-speaker 0x38 (the primary amp, holds
  * speaker-config), audio-speaker-left-woofer-2 0x39, audio-speaker-left-
@@ -172,13 +173,12 @@
  * carries I in slot 4n and V in slot 4n+2, the tas2764/J516 convention
  * (the ADT labels the two the other way round).
  *
- * No sound card: T6050 has no AP-side MCA. The I2S ports and their power
- * domains belong to the AOP firmware (ADT /arm-io/iop-audio-controller,
- * AOPAudioService, streams on admac-base-ns), as on T8140 where
- * t8140_aop_audio provides the CPU DAIs; nothing drives them on T6050 yet.
- * Without a card the amps stay in hardware shutdown: tas2764 requests the
- * shutdown line as output-low at probe and raises it only from the ASoC
- * component probe. The jack codec probes fully and arms plug detection.
+ * T6050 has no AP-side MCA: the I2S ports and their power domains belong
+ * to the AOP firmware (ADT /arm-io/iop-audio-controller, AOPAudioService,
+ * streams on admac-base-ns), and t8140_aop_audio's T6050 variant provides
+ * the CPU DAIs for the sound node below, as on T8140. The amps leave
+ * hardware shutdown only from the ASoC component probe, so the shared
+ * shutdown line stays low until the card binds.
  */
 &pinctrl_ap {
 	status = "okay";
