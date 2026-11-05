@@ -35,6 +35,7 @@
 #include <linux/execmem.h>
 
 #include <asm/boot.h>
+#include <asm/ctxr_execmem.h>
 #include <asm/fixmap.h>
 #include <asm/kasan.h>
 #include <asm/kernel-pgtable.h>
@@ -295,6 +296,8 @@ void __init arm64_memblock_init(void)
 	}
 
 	early_init_fdt_scan_reserved_mem();
+
+	ctxr_exec_reserve();
 }
 
 void __init bootmem_init(void)
@@ -507,8 +510,19 @@ struct execmem_info __init *execmem_arch_setup(void)
 {
 	unsigned long fallback_start = 0, fallback_end = 0;
 	unsigned long start = 0, end = 0;
+	enum execmem_range_flags cflags = 0;
 
 	module_init_limits();
+
+	/*
+	 * When a CTXR executable window is active, back the executable ranges
+	 * (text, BPF, kprobes and — by inheritance — ftrace) with pages drawn
+	 * from the window so every executable physical page stays confined.
+	 * Module *data* (EXECMEM_MODULE_DATA, set explicitly below) is never
+	 * executed and is left on ordinary vmalloc backing.
+	 */
+	if (ctxr_exec_execmem_setup())
+		cflags = EXECMEM_CONFINE;
 
 	/*
 	 * Where possible, prefer to allocate within direct branch range of the
@@ -536,18 +550,29 @@ struct execmem_info __init *execmem_arch_setup(void)
 				.alignment = 1,
 				.fallback_start	= fallback_start,
 				.fallback_end	= fallback_end,
+				.flags	= cflags,
+			},
+			[EXECMEM_MODULE_DATA] = {
+				.start	= start,
+				.end	= end,
+				.pgprot	= PAGE_KERNEL,
+				.alignment = 1,
+				.fallback_start	= fallback_start,
+				.fallback_end	= fallback_end,
 			},
 			[EXECMEM_KPROBES] = {
 				.start	= VMALLOC_START,
 				.end	= VMALLOC_END,
 				.pgprot	= PAGE_KERNEL_ROX,
 				.alignment = 1,
+				.flags	= cflags,
 			},
 			[EXECMEM_BPF] = {
 				.start	= VMALLOC_START,
 				.end	= VMALLOC_END,
 				.pgprot	= PAGE_KERNEL,
 				.alignment = 1,
+				.flags	= cflags,
 			},
 		},
 	};
