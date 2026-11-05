@@ -90,6 +90,12 @@ struct macaudio_platform_cfg {
 	int amp_gain;
 	int safe_vol;
 	/*
+	 * Ceiling in dB for the speaker volume controls while speakersafetyd
+	 * holds them unlocked. 0 means no ceiling (0 dB). For bring-up of
+	 * machines whose speaker profile is not validated yet.
+	 */
+	int max_vol;
+	/*
 	 * The speaker codec's output widget, "OUT" (the TAS and SSM
 	 * amplifiers) unless set.
 	 */
@@ -191,6 +197,10 @@ static int please_blow_up_my_speakers;
 module_param(please_blow_up_my_speakers, int, 0644);
 MODULE_PARM_DESC(please_blow_up_my_speakers, "Allow unsafe or untested operating configurations");
 
+static int speaker_max_db;
+module_param(speaker_max_db, int, 0444);
+MODULE_PARM_DESC(speaker_max_db, "Lower the unlocked speaker volume ceiling to this many dB (<= 0; can only lower it)");
+
 SND_SOC_DAILINK_DEFS(primary,
 	DAILINK_COMP_ARRAY(COMP_CPU("mca-pcm-0")), // CPU
 	DAILINK_COMP_ARRAY(COMP_DUMMY()), // CODEC
@@ -281,6 +291,17 @@ static struct macaudio_link_props macaudio_fe_link_props[] = {
 	}
 };
 
+/* Unlocked ceiling in dB: the lower of the machine's and the module's, <= 0 */
+static int macaudio_max_vol(struct macaudio_snd_data *ma)
+{
+	int cap = min(ma->cfg->max_vol, 0);
+
+	if (speaker_max_db < cap)
+		cap = max(speaker_max_db, -100);
+
+	return cap;
+}
+
 static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 {
 	int ret, max;
@@ -297,25 +318,25 @@ static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 		return;
 	case AMP_TAS5770:
 		if (unlock)
-			max = TAS5770_0DB;
+			max = TAS5770_DB(macaudio_max_vol(ma));
 		else
 			max = 1; //TAS5770_DB(ma->cfg->safe_vol);
 		break;
 	case AMP_SN012776:
 		if (unlock)
-			max = SN012776_0DB;
+			max = SN012776_DB(macaudio_max_vol(ma));
 		else
 			max = 1; //SN012776_DB(ma->cfg->safe_vol);
 		break;
 	case AMP_SSM3515:
 		if (unlock)
-			max = SSM3515_0DB;
+			max = SSM3515_DB(macaudio_max_vol(ma));
 		else
 			max = SSM3515_DB(ma->cfg->safe_vol);
 		break;
 	case AMP_MAX98360A:
 		if (unlock)
-			max = MAX98360A_0DB;
+			max = MAX98360A_DB(macaudio_max_vol(ma));
 		else
 			max = MAX98360A_DB(ma->cfg->safe_vol);
 		break;
@@ -325,6 +346,9 @@ static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 	if (ret < 0)
 		dev_err(ma->card.dev, "Failed to %slock volume %s: %d\n",
 			unlock ? "un" : "", name, ret);
+	else if (unlock && macaudio_max_vol(ma) < 0)
+		dev_info(ma->card.dev, "Speaker volume ceiling %d dB\n",
+			 macaudio_max_vol(ma));
 	/*
 	 * With a software gain the limit is the whole protection: refuse to
 	 * play rather than run the amplifier at full scale unlimited.
@@ -1837,6 +1861,18 @@ struct macaudio_platform_cfg macaudio_j493_cfg = {
 	true,	AMP_SN012776,	SPKR_2W,	true,	15,	-20,
 };
 
+/*
+ * MacBook Pro (14-inch, M5 Max), AID40. Same amps and layout as j314/j316
+ * (6x SN012776 on i2c1/i2c3 at 0x38-0x3d, 2W+1T per side, sense slots in
+ * ADT order), new chassis and acoustic ID: the speaker thermal model is
+ * not validated. Speakers stay off unless please_blow_up_my_speakers=1,
+ * the amp gain is held below the ADT value (15) and the unlocked volume
+ * is capped at -30 dB until a speakersafetyd profile is validated.
+ */
+struct macaudio_platform_cfg macaudio_j714_cfg = {
+	false,	AMP_SN012776,	SPKR_2W1T,	true,	10,	-20,	-30,
+};
+
 struct macaudio_platform_cfg macaudio_fallback_cfg = {
 	false,	AMP_NONE,	SPKR_NONE,	false,	0,	0,
 };
@@ -1898,6 +1934,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j615    AID21   sn012776    15      2x 2W+1T Compat: apple,j415-macaudio */
 	/* j700    AID44   max98360a   -       2x 1W    (AOP-fed, software gain) */
 	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
+	/* j714    AID40   sn012776    10      2x 2W+1T speakers off by default */
+	{ .compatible = "apple,j714-macaudio", .data = &macaudio_j714_cfg },
 	/* Fallback, jack only */
 	{ .compatible = "apple,macaudio"},
 	{ }
