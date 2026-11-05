@@ -49,6 +49,22 @@ struct cpu_operations {
 int __init init_cpu_ops(int cpu);
 extern const struct cpu_operations *get_cpu_ops(int cpu);
 
+#ifdef CONFIG_ARM64_APPLE_CPU_HOTPLUG
+const struct cpu_operations * __init
+apple_cpu_hotplug_ops(const struct cpu_operations *ops);
+bool apple_cpu_hotplug_active(void);
+#else
+static inline const struct cpu_operations *
+apple_cpu_hotplug_ops(const struct cpu_operations *ops)
+{
+	return ops;
+}
+static inline bool apple_cpu_hotplug_active(void)
+{
+	return false;
+}
+#endif
+
 static inline void __init init_bootcpu_ops(void)
 {
 	init_cpu_ops(0);

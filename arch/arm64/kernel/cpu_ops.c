@@ -109,6 +109,9 @@ int __init init_cpu_ops(int cpu)
 		return -EOPNOTSUPP;
 	}
 
+	/* Apple: spin-table plus offline support, chosen on the command line. */
+	cpu_ops[cpu] = apple_cpu_hotplug_ops(cpu_ops[cpu]);
+
 	return 0;
 }
 

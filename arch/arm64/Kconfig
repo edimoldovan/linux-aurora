@@ -1610,6 +1610,25 @@ config HOTPLUG_CPU
 	  Say Y here to experiment with turning CPUs off and on.  CPUs
 	  can be controlled through /sys/devices/system/cpu.
 
+config ARM64_APPLE_CPU_HOTPLUG
+	bool "CPU offline for Apple silicon spin-table CPUs (EXPERIMENTAL)"
+	depends on HOTPLUG_CPU && ARCH_APPLE
+	default y
+	help
+	  m1n1 starts the secondary CPUs of Apple silicon Macs through
+	  spin-table, which cannot take a CPU offline again. This adds CPU
+	  operations that can:
+
+	  - park an offline CPU in the kernel's holding pen with its MMU
+	    and caches off (apple_cpu_hotplug=park), or
+	  - on t8103 (M1), stop and power it down through the PMGR
+	    CPU-start block and restart it through m1n1's reset vector
+	    (apple_cpu_hotplug=powerdown).
+
+	  The boot CPU stays online. Without one of these parameters on the
+	  kernel command line nothing changes. While enabled, kexec and
+	  hibernation stay refused as with plain spin-table.
+
 # Common NUMA Features
 config NUMA
 	bool "NUMA Memory Allocation and Scheduler Support"
