@@ -1327,9 +1327,17 @@ static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
 	if (ret)
 		return ret;
 
-	/* T6050: the loader never waits for this acknowledgement. */
-	if (of_machine_is_compatible("apple,t6050"))
+	/*
+	 * T6050: the loader never waits for this acknowledgement, and not every
+	 * coprocessor sends it. Give it a short window so a caller that starts an
+	 * endpoint right away (macsmc) sees the AP state; carry on without it.
+	 */
+	if (of_machine_is_compatible("apple,t6050")) {
+		if (!wait_for_completion_timeout(&rtk->ap_pwr_ack_completion,
+						 msecs_to_jiffies(200)))
+			dev_dbg(rtk->dev, "RTKit: no AP power state ACK\n");
 		return 0;
+	}
 
 	ret = apple_rtkit_wait(rtk, &rtk->ap_pwr_ack_completion);
 	if (ret)
