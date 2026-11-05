@@ -418,9 +418,6 @@ reply:
 					    buffer->iova);
 		}
 		apple_rtkit_send_message(rtk, ep, reply, NULL, false);
-	} else if (apple_rtkit_coproc_places_buffers(rtk)) {
-		/* acknowledge the co-processor's own buffer with its request */
-		apple_rtkit_send_message(rtk, ep, msg, NULL, false);
 	}
 
 	return 0;

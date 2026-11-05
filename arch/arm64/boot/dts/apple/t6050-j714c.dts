@@ -285,6 +285,10 @@
 	status = "okay";
 };
 
+&aop_setup_mbox {
+	status = "okay";
+};
+
 &aop {
 	status = "okay";
 };

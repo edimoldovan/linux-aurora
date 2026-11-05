@@ -37,6 +37,7 @@ use kernel::{
         IoSysMap,
         Mmio,
         Region, //
+        SysMem,
     },
     module_platform_driver,
     new_condvar,
@@ -436,6 +437,12 @@ impl AFKEndpoint {
         msg: u64,
     ) -> Result<()> {
         let opc = msg >> 48;
+        dev_dbg!(
+            client.dev,
+            "AFK endpoint {:#04x} message {:#x}",
+            self.index,
+            msg
+        );
         match opc {
             AFK_OPC_INIT => {
                 rtkit.send_message(self.index, AFK_MSG_INIT_ACK)?;
@@ -683,6 +690,17 @@ impl AFKEndpoint {
                     self.drop_message(&client.dev, fmt!("short message ({} bytes)", msg_buf.len()))
                 }
                 Some((header, msg)) => {
+                    let channel = qeh.channel;
+                    dev_dbg!(
+                        client.dev,
+                        "AFK endpoint {:#04x} EPIC category {:#x} subtype {:#x} tag {} channel {} len {}",
+                        self.index,
+                        header.category,
+                        header.subtype,
+                        header.tag,
+                        channel,
+                        msg.len()
+                    );
                     if let Err(e) = self.handle_ipc(client, &qeh, &header, msg) {
                         let channel = qeh.channel;
                         self.drop_message(
@@ -740,6 +758,13 @@ impl AFKEndpoint {
                 let name = &data[..EPIC_ANNOUNCE_NAME_LEN];
                 let name = &name[..name.iter().position(|x| *x == 0).unwrap_or(name.len())];
                 let chan = le_u32(data, EPIC_ANNOUNCE_CHANNEL_OFFSET);
+                dev_info!(
+                    client.dev,
+                    "AFK endpoint {:#04x} channel {} announces {}",
+                    self.index,
+                    chan,
+                    core::str::from_utf8(name).unwrap_or("?")
+                );
                 return Into::<Arc<_>>::into(client).register_service(self, chan, name);
             } else if subtype == EPIC_SUBTYPE_FAKEHID_REPORT {
                 return client.process_fakehid_report(self, qhdr.channel, data);
@@ -1000,6 +1025,8 @@ struct SetupState {
     /// The next unassigned page of the arena.
     next_page: usize,
     endpoints: [Option<SetupEndpoint>; SETUP_ENDPOINTS.len()],
+    /// The service endpoints this SoC's firmware serves on the port.
+    expected: &'static [u8],
     map_done: bool,
     ap_ready: bool,
     power_sent: bool,
@@ -1008,12 +1035,13 @@ struct SetupState {
 }
 
 impl SetupState {
-    fn new() -> SetupState {
+    fn new(expected: &'static [u8]) -> SetupState {
         SetupState {
             mbox: None,
             arena: None,
             next_page: 0,
             endpoints: [None; SETUP_ENDPOINTS.len()],
+            expected,
             map_done: false,
             ap_ready: false,
             power_sent: false,
@@ -1055,7 +1083,7 @@ impl SetupState {
     /// Boot is complete once the AP power state is on and every service
     /// endpoint has its buffers.
     fn ready(&self) -> bool {
-        self.ap_ready && self.endpoint_count() == SETUP_ENDPOINTS.len()
+        self.ap_ready && self.endpoint_count() == self.expected.len()
     }
 
     /// Sends one word to a setup-port endpoint. Callers run in process
@@ -1189,6 +1217,8 @@ struct AopData {
     dev: ARef<device::Device>,
     /// The firmware speaks EPIC with version 4 sub-headers.
     epic_v4: bool,
+    /// See [`AopHwConfig::early_ap`].
+    early_ap: bool,
     /// Runs the service registrations one at a time; drained on removal.
     registration_queue: OwnedQueue,
     /// Serializes queueing a registration with the start of removal, so that
@@ -1344,6 +1374,7 @@ impl AopData {
                 AopData {
                     dev: dev.as_ref().into(),
                     epic_v4: cfg.epic_v4,
+                    early_ap: cfg.early_ap,
                     registration_queue,
                     registration_gate <- new_mutex!(()),
                     removing: Atomic::new(false),
@@ -1353,7 +1384,7 @@ impl AopData {
                     required_endpoints: cfg.required_endpoints,
                     setup_queue,
                     setup_lost: Atomic::new(false),
-                    setup <- new_mutex!(SetupState::new()),
+                    setup <- new_mutex!(SetupState::new(cfg.setup_endpoints)),
                     setup_cv <- new_condvar!(),
                     rtkit <- new_mutex!(None),
                     endpoints <- pin_init::pin_init_array_from_fn(|i| {
@@ -1378,7 +1409,11 @@ impl AopData {
     fn wake(&self) -> Result<()> {
         let mut guard = self.rtkit.lock();
         let mut rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
-        rtk.as_mut().wake()
+        if self.early_ap {
+            rtk.as_mut().wake_early_ap()
+        } else {
+            rtk.as_mut().wake()
+        }
     }
     /// Starts the AFK handshake on every advertised endpoint. An endpoint
     /// the match data does not require may fail to start; it is skipped.
@@ -1400,7 +1435,10 @@ impl AopData {
                 Ok(())
             });
             match started {
-                Ok(()) => started_count += 1,
+                Ok(()) => {
+                    started_count += 1;
+                    dev_dbg!(self.dev, "AFK endpoint {:#04x} started, init sent", rtk_ep_num);
+                }
                 Err(e) if !required => {
                     dev_warn!(
                         self.dev,
@@ -1941,10 +1979,7 @@ impl AopData {
     /// from the arena.
     fn setup_endpoint_request(&self, st: &mut SetupState, ep: u8, word: u64) -> Result<()> {
         let requested = (word & 0xffff_ffff) as usize;
-        let slot = SETUP_ENDPOINTS
-            .iter()
-            .position(|e| *e == ep)
-            .ok_or(EINVAL)?;
+        let slot = st.expected.iter().position(|e| *e == ep).ok_or(EINVAL)?;
         if st.endpoints[slot].is_some() || (requested != 0x400 && requested != 0x1000) {
             return Err(EINVAL);
         }
@@ -2182,7 +2217,7 @@ impl AopData {
                 "setup port: boot incomplete (AP power on: {}, endpoints: {}/{}): {:?}",
                 st.ap_ready,
                 st.endpoint_count(),
-                SETUP_ENDPOINTS.len(),
+                st.expected.len(),
                 e
             );
             return Err(e);
@@ -2191,20 +2226,77 @@ impl AopData {
     }
 }
 
-struct NoBuffer;
-impl rtkit::Buffer for NoBuffer {
+/// Address bits of a buffer the co-processor places itself; the firmware sets
+/// higher bits in its requests.
+const RTKIT_BUFFER_ADDR_MASK: u64 = (1 << 40) - 1;
+
+/// A shared buffer handed to RTKit: the host's coherent allocation for a
+/// request at address 0 (ioreport, oslog), or firmware memory at the address
+/// the firmware names (its crashlog region, which the ADT lists as
+/// crashlog-region under iop-aop-nub), reached through memremap.
+enum AopShmem {
+    Host { mem: Coherent<[u8]> },
+    Firmware { ptr: *mut u8, size: usize, iova: usize },
+}
+
+// SAFETY: the raw pointer is a memremap mapping owned by this value alone and
+// only dereferenced through `buf()`; the RTKit core serializes its use.
+unsafe impl Send for AopShmem {}
+
+impl Drop for AopShmem {
+    fn drop(&mut self) {
+        if let AopShmem::Firmware { ptr, .. } = *self {
+            // SAFETY: `ptr` came from `memremap` and is not used after this.
+            unsafe { bindings::memunmap(ptr.cast()) };
+        }
+    }
+}
+
+impl rtkit::Buffer for AopShmem {
     fn iova(&self) -> Result<usize> {
-        unreachable!()
+        Ok(match self {
+            AopShmem::Host { mem } => mem.dma_handle() as usize,
+            AopShmem::Firmware { iova, .. } => *iova,
+        })
     }
     fn buf(&mut self) -> Result<IoSysMap<'_, Region>> {
-        unreachable!()
+        let (ptr, size) = match self {
+            AopShmem::Host { mem } => (mem.as_mut_ptr().cast::<u8>(), mem.size()),
+            AopShmem::Firmware { ptr, size, .. } => (*ptr, *size),
+        };
+        // SAFETY: `ptr` maps `size` bytes, 4-byte aligned, for as long as `self` lives.
+        Ok(IoSysMap::Sys(unsafe { SysMem::new(Region::ptr_from_raw_parts_mut(ptr, size)) }))
     }
 }
 
 #[vtable]
 impl rtkit::Operations for AopData {
     type Data = Arc<AopData>;
-    type Buffer = NoBuffer;
+    type Buffer = AopShmem;
+    /// The T6050 AOP places its crashlog buffer itself (a request with the
+    /// address set, on endpoint 1, which its endpoint map does not list); a
+    /// placed buffer gets no reply. Other buffers it asks the host for.
+    const COPROC_PLACES_BUFFERS: bool = true;
+
+    fn shmem_alloc(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, size: usize) -> Result<AopShmem> {
+        // SAFETY: this runs from the RTKit receive worker, which `AopData::remove()`
+        // stops before the device is unbound, so the device is bound here.
+        let bound_dev = unsafe { data.dev.as_bound() };
+        let mem = Coherent::<u8>::zeroed_slice(bound_dev, size, GFP_KERNEL)?;
+        dev_dbg!(data.dev, "RTKit buffer: {} bytes allocated at iova {:#x}", size, mem.dma_handle());
+        Ok(AopShmem::Host { mem })
+    }
+
+    fn shmem_map(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, iova: usize, size: usize) -> Result<AopShmem> {
+        let phys = (iova as u64) & RTKIT_BUFFER_ADDR_MASK;
+        dev_dbg!(data.dev, "RTKit buffer: firmware places {} bytes at {:#x}", size, phys);
+        // SAFETY: maps firmware memory the firmware points the host at; nothing else uses it.
+        let ptr = unsafe { bindings::memremap(phys as _, size, bindings::MEMREMAP_WB as _) };
+        if ptr.is_null() {
+            return Err(ENOMEM);
+        }
+        Ok(AopShmem::Firmware { ptr: ptr.cast(), size, iova })
+    }
 
     fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, ep: u8, msg: u64) {
         let Some(index) = afk_endpoint_index(ep) else {
@@ -2248,6 +2340,12 @@ struct AopHwConfig {
     epic_v4: bool,
     /// The firmware boots through a second, "setup", mailbox as well.
     setup_port: bool,
+    /// The setup port's service endpoints; boot completes once each has its
+    /// buffers. T8140 has five, T6050 three (its TRUSTED compartment's).
+    setup_endpoints: &'static [u8],
+    /// Wake with the AP powered before the IOP's power acknowledgment
+    /// (T6050).
+    early_ap: bool,
     /// Shut the co-processor down on unbind and retain its buffers if the
     /// shutdown cannot be confirmed.
     quiesce_on_unbind: bool,
@@ -2262,6 +2360,8 @@ const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
+    setup_endpoints: &[],
+    early_ap: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
 };
@@ -2272,6 +2372,8 @@ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
+    setup_endpoints: &[],
+    early_ap: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
 };
@@ -2282,6 +2384,8 @@ const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
+    setup_endpoints: &[],
+    early_ap: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
 };
@@ -2292,6 +2396,8 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
+    setup_endpoints: &[],
+    early_ap: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
 };
@@ -2307,6 +2413,8 @@ const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     patch_bootargs: false,
     epic_v4: true,
     setup_port: true,
+    setup_endpoints: &SETUP_ENDPOINTS,
+    early_ap: false,
     quiesce_on_unbind: true,
     required_endpoints: &[0x20, 0x21, 0x22, 0x23, 0x2b],
 };
@@ -2322,7 +2430,9 @@ const HW_CFG_T6050: AopHwConfig = AopHwConfig {
     alig: 0,
     patch_bootargs: false,
     epic_v4: true,
-    setup_port: false,
+    setup_port: true,
+    setup_endpoints: &[0x20, 0x23, 0x32],
+    early_ap: true,
     quiesce_on_unbind: true,
     required_endpoints: &[0x20, 0x21, 0x22, 0x23, 0x2b],
 };
@@ -2397,8 +2507,10 @@ impl platform::Driver for AopDriver {
             data.setup_finish_boot()?;
             // Before any client reaches the ALS service: a failure here costs
             // the sensor, not the AOP.
-            if let Err(e) = data.setup_als_calibration() {
-                dev_warn!(pdev.as_ref(), "ALS calibration failed ({:?})", e);
+            if cfg.setup_endpoints.contains(&SETUP_ALS_EP) {
+                if let Err(e) = data.setup_als_calibration() {
+                    dev_warn!(pdev.as_ref(), "ALS calibration failed ({:?})", e);
+                }
             }
             data.start_afk()?;
         } else {

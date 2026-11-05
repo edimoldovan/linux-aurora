@@ -212,8 +212,35 @@
 		status = "disabled";
 	};
 
+	/*
+	 * The AOP's "setup port": ADT /arm-io/aop-exclave-mailbox
+	 * (iop,secure-rtbuddy-proxy), the ASC's second mailbox 1 GiB above
+	 * it as on T8140, interrupts [585, 582], messages through dart-aop
+	 * stream 1 (mapper-exclave-aop, vm-base-1 0x20000000000). The
+	 * firmware's TRUSTED compartment serves three endpoints on it (0x20,
+	 * 0x23, 0x32) and may only use DRAM in that stream-1 window; its AFK
+	 * endpoints on the main mailbox answer only after this handshake.
+	 */
+	aop_setup_mbox: mailbox@2d067c000 {
+		compatible = "apple,t6050-aop-setup-mailbox", "apple,t8140-aop-setup-mailbox";
+		reg = <0x2 0xd067c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 582 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 585 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		iommus = <&aop_dart 1>;
+		apple,dma-range = <0x200 0x0 0x10 0x0>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
 	aop_dart: iommu@290fc0000 {
-		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		/*
+		 * Locked by the loader with inherited roots, like mtp_dart: the
+		 * t8142 compatible turns on apple-dart's retained-root path
+		 * (fw_mirror), which the plain t8110 fallback leaves off.
+		 */
+		compatible = "apple,t6050-dart", "apple,t8142-dart", "apple,t8110-dart";
 		reg = <0x2 0x90fc0000 0x0 0xc000>;
 		#iommu-cells = <1>;
 		interrupt-parent = <&aic>;
@@ -226,9 +253,16 @@
 		reg = <0x2 0x90c00000 0x0 0x2f0000>,
 		      <0x2 0x90600000 0x0 0x88000>;
 		reg-names = "mmio", "asc";
-		mboxes = <&aop_mbox>;
-		mbox-names = "mbox";
+		mboxes = <&aop_mbox>, <&aop_setup_mbox>;
+		mbox-names = "mbox", "setup";
 		iommus = <&aop_dart 0>;
+		/*
+		 * The firmware's UNTRUSTED compartment (the AFK side) may only
+		 * use DRAM at IOVA 0x10040078000..0x20000000000 (its cL4 mmio
+		 * list); a host buffer elsewhere makes it panic. Stream 0's
+		 * inherited root holds the firmware's own slot 16; the host's
+		 * buffers go into the next slot, as on T8140.
+		 */
 		apple,dma-range = <0x110 0x0 0x10 0x0>;
 		status = "disabled";
 

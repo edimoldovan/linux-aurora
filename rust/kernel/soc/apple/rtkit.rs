@@ -298,6 +298,13 @@ impl<T: Operations> RtKit<T> {
         to_result(unsafe { bindings::apple_rtkit_wake(self.rtk) })
     }
 
+    /// Boots (wakes up) the RTKit coprocessor with the AP powered before
+    /// the IOP's power acknowledgment, for firmware that waits for it.
+    pub fn wake_early_ap(self: Pin<&mut Self>) -> Result {
+        // SAFETY: `rtk` is valid per the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_wake_early_ap(self.rtk) })
+    }
+
     /// Waits for the RTKit coprocessor to finish booting.
     pub fn boot(self: Pin<&mut Self>) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.
