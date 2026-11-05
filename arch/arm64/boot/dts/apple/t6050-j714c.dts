@@ -130,3 +130,21 @@
 &gpu {
 	status = "okay";
 };
+
+#include "hwmon-common.dtsi"
+#include "hwmon-fan-dual.dtsi"
+#include "hwmon-laptop.dtsi"
+
+/*
+ * The T6050 SMC spells the fan mode keys F0md/F1md; F0Md/F1Md from
+ * hwmon-fan*.dtsi do not exist (as on J714s in omarchy-m5).
+ */
+&smc_hwmon {
+	fan-F0Ac {
+		apple,fan-mode = "F0md";
+	};
+
+	fan-F1Ac {
+		apple,fan-mode = "F1md";
+	};
+};
