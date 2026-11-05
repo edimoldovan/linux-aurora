@@ -1870,7 +1870,19 @@ struct macaudio_platform_cfg macaudio_j493_cfg = {
  * is capped at -30 dB until a speakersafetyd profile is validated.
  */
 struct macaudio_platform_cfg macaudio_j714_cfg = {
-	false,	AMP_SN012776,	SPKR_2W1T,	true,	10,	-20,	-30,
+	.enable_speakers = false,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_2W1T,
+	.stereo = true,
+	.amp_gain = 10,
+	.safe_vol = -20,
+	.max_vol = -30,
+	/*
+	 * The AOP's audio streams (t8140_aop_audio, T6050 variant) instead
+	 * of the MCA: the jack's serializer runs 2 x 32-bit frames.
+	 */
+	.fe_dai_names = { "j714-pcm-0", "j714-pcm-1", "j714-pcm-2" },
+	.primary_bclk_ratio = 64,
 };
 
 struct macaudio_platform_cfg macaudio_fallback_cfg = {

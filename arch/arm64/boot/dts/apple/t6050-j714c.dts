@@ -272,9 +272,10 @@
 };
 
 /*
- * AOP, step 1 of the audio bring-up: the co-processor and its mailbox.
- * The base-ns ADMAC sits in an AOP-owned power domain and is enabled with
- * the audio streams, together with the aop_audio child.
+ * AOP: the co-processor, its mailbox, the base-ns ADMAC and the audio
+ * streams. The sound card: the jack on the AOP's cout/cin streams, the six
+ * amps on its spkr stream (ADT order, amp-tx-zd-config rows 0 and 1 as the
+ * idle masks), speakers off by default in the j714 macaudio config.
  */
 &aop_dart {
 	status = "okay";
@@ -286,4 +287,55 @@
 
 &aop {
 	status = "okay";
+};
+
+&aop_audio {
+	apple,chassis-name = "J714";
+	apple,machine-kind = "MacBook Pro";
+};
+
+&admac_base_ns {
+	status = "okay";
+};
+
+/ {
+	sound: sound {
+		compatible = "apple,j714-macaudio", "apple,macaudio";
+		model = "MacBook Pro J714";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 0>;
+			};
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+
+		dai-link@1 {
+			reg = <1>;
+			link-name = "Speakers";
+			dai-tdm-idle-mode-0 = "zero";
+			dai-tdm-idle-mode-1 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0xf0f0f0>;
+			dai-tdm-slot-tx-idle-mask-1 = <0x0f0f0f>;
+
+			cpu {
+				sound-dai = <&aop_audio 4>;
+			};
+			codec {
+				sound-dai = <&speaker_left_woof1>,
+					    <&speaker_right_woof1>,
+					    <&speaker_left_woof2>,
+					    <&speaker_right_woof2>,
+					    <&speaker_left_tweet>,
+					    <&speaker_right_tweet>;
+			};
+		};
+	};
 };

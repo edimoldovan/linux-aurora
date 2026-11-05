@@ -231,6 +231,23 @@
 		iommus = <&aop_dart 0>;
 		apple,dma-range = <0x110 0x0 0x10 0x0>;
 		status = "disabled";
+
+		/*
+		 * The AOPAudioService streams on the base-ns ADMAC (ADT
+		 * /arm-io/iop-audio-controller): audio-speaker tx-0 and rx-0
+		 * (6 x 32-bit out, 12 x 16-bit V/I sense back), audio-codec-
+		 * output tx-2, audio-codec-input rx-2. The ADT's tx-N is Linux
+		 * channel 2N and rx-N is 2N+1 (apple-admac hardwires even
+		 * channels to MEM_TO_DEV). No power domains: the audio fabric
+		 * is the firmware's.
+		 */
+		aop_audio: audio {
+			compatible = "apple,t6050-aop-audio";
+			dmas = <&admac_base_ns 0>, <&admac_base_ns 1>,
+			       <&admac_base_ns 4>, <&admac_base_ns 5>;
+			dma-names = "spkr", "spkr-sense", "cout", "cin";
+			#sound-dai-cells = <1>;
+		};
 	};
 
 	admac_base_ns: dma-controller@293800000 {

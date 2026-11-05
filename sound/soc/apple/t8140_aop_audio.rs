@@ -556,7 +556,9 @@ struct SndSocT8140AopData {
     dev: ARef<device::Device>,
     adata: Arc<dyn AOP>,
     service: EPICService,
-    ring: Arc<SourceRing>,
+    ring: Option<Arc<SourceRing>>,
+    /// What this SoC leaves to the AP, see [`HwConfig`].
+    hw: &'static HwConfig,
     ring_bytes: Atomic<u32>,
     sequence: Atomic<u32>,
     /// The low-power microphone PCM holds a reference on `lpai_run`.
@@ -903,6 +905,9 @@ impl SndSocT8140AopData {
     /// power up fails the stream; recovering a domain from that state is the
     /// power-domain driver's business, not a consumer's.
     fn power_up(&self, name: &str, pds: &[&Option<PowerDomain>], attempts: u32) -> Result<()> {
+        if !self.hw.ap_power_domains {
+            return Ok(());
+        }
         for (i, slot) in pds.iter().enumerate() {
             let Some(pd) = slot else {
                 dev_err!(self.dev, "{}: power domain not attached\n", name);
@@ -967,6 +972,9 @@ impl SndSocT8140AopData {
     /// microphone is attached for the firmware's lifetime, so hold it in
     /// `runn` around `f`, once its first report has arrived.
     fn with_fabric_raised<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<R> {
+        if !self.hw.lpai {
+            return f();
+        }
         self.lpai_run_get()?;
         let mut polls = 0;
         while !self.reported.load(Relaxed) && polls < FABRIC_RAISE_POLLS {
@@ -1340,7 +1348,7 @@ impl ReportListener for SndSocT8140AopData {
         let dma_area = unsafe { (*(*st.substream).runtime).dma_area };
         let buffer_bytes = st.buffer_bytes;
         let new_ptr = copy_span(
-            &self.ring,
+            self.ring.as_ref().ok_or(ENODEV)?,
             dma_area,
             buffer_bytes,
             ring_bytes,
@@ -2103,12 +2111,25 @@ unsafe extern "C" fn asoc_pcm_open(
     };
     // SAFETY: the substream is live for the duration of the op.
     let playback = unsafe { substream_is_playback(substream) };
-    let Some(name) = FE_DMA_NAMES[fe][usize::from(!playback)] else {
+    let Some(name) = data.hw.fe_dma_names[fe][usize::from(!playback)] else {
         return ENODEV.to_errno();
     };
-    let leap = fe == FE_SPKR;
+    let leap = fe == FE_SPKR && data.hw.spkr_leap;
     if leap {
         if let Err(e) = data.power_up_raising(data.spkr.name, &data.spkr_domains()) {
+            return e.to_errno();
+        }
+    }
+    if !data.hw.ap_power_domains {
+        // The firmware owns the audio fabric, the ADMAC's power with it:
+        // attach the stream's service and request pw0 before the first
+        // touch of the channel's registers.
+        let svc = if fe == 0 {
+            data.jack_service(playback)
+        } else {
+            &data.spkr
+        };
+        if let Err(e) = data.service_startup(svc, &[]) {
             return e.to_errno();
         }
     }
@@ -2134,7 +2155,7 @@ unsafe extern "C" fn asoc_pcm_open(
     };
     let mut hw = dmaengine_hw();
     let mut formats = u64::MAX;
-    if fe == FE_SPKR {
+    if leap {
         // S32 in, converted by `asoc_pcm_copy` through the ceiling into the
         // float32 the LEAP consumes: no mmap, and a bounded queue.
         hw.info = bindings::SNDRV_PCM_INFO_INTERLEAVED;
@@ -2584,6 +2605,9 @@ unsafe extern "C" fn spkr_dai_startup(
     // SAFETY: the substream is live for the duration of the op.
     let ret = if unsafe { substream_is_playback(substream) } {
         data.spkr_startup()
+    } else if data.hw.sense_channels > 0 {
+        // The V/I sense rides the speaker service's own RX channel.
+        Ok(())
     } else {
         data.sense_startup()
     };
@@ -2609,6 +2633,8 @@ unsafe extern "C" fn spkr_dai_prepare(
     // SAFETY: the substream is live for the duration of the op.
     let ret = if unsafe { substream_is_playback(substream) } {
         data.spkr_prepare()
+    } else if data.hw.sense_channels > 0 {
+        Ok(())
     } else {
         data.sense_prepare()
     };
@@ -2668,7 +2694,7 @@ unsafe extern "C" fn spkr_dai_shutdown(
     // SAFETY: the substream is live for the duration of the op.
     if unsafe { substream_is_playback(substream) } {
         data.spkr_shutdown();
-    } else {
+    } else if data.hw.sense_channels == 0 {
         data.sense_shutdown();
     }
 }
@@ -2729,6 +2755,8 @@ fn pcm_stream(
 /// of each 32-bit DMA word: S24_LE.
 const OUT_FORMATS: u64 = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S24_LE;
 const S32_FORMATS: u64 = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S32_LE;
+/// The V/I sense return: 16-bit slots.
+const SENSE_FORMATS: u64 = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S16_LE;
 
 /// The DAI table: [0] the cout back-end, [1..=3] the front-end PCMs, [4] the
 /// speaker back-end.  The order is ABI: `sound-dai = <&aop_audio N>` in the
@@ -2737,7 +2765,17 @@ const S32_FORMATS: u64 = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S32_LE;
 /// renumbers every DAI after it and silently repoints the existing links.
 const DAI_COUNT: usize = 2 + FE_COUNT;
 
-fn dai_drivers(ops: &DaiOps) -> [bindings::snd_soc_dai_driver; DAI_COUNT] {
+/// The speaker back-end's capture: the SpeakerTap words (T8140) or the
+/// amplifiers' V/I sense in 16-bit slots (T6050).
+fn sense_stream(name: &'static core::ffi::CStr, hw: &HwConfig) -> bindings::snd_soc_pcm_stream {
+    if hw.sense_channels > 0 {
+        pcm_stream(name, SENSE_FORMATS, hw.sense_channels)
+    } else {
+        pcm_stream(name, S32_FORMATS, 2)
+    }
+}
+
+fn dai_drivers(ops: &DaiOps, hw: &HwConfig) -> [bindings::snd_soc_dai_driver; DAI_COUNT] {
     [
         bindings::snd_soc_dai_driver {
             name: c"cout".as_char_ptr(),
@@ -2749,7 +2787,7 @@ fn dai_drivers(ops: &DaiOps) -> [bindings::snd_soc_dai_driver; DAI_COUNT] {
             ..Default::default()
         },
         bindings::snd_soc_dai_driver {
-            name: c"j700-pcm-0".as_char_ptr(),
+            name: hw.fe_dai_names[0].as_char_ptr(),
             id: FE_DAI_ID_BASE,
             ops: &ops.fe,
             playback: pcm_stream(c"PCM0 TX", OUT_FORMATS, 2),
@@ -2758,19 +2796,23 @@ fn dai_drivers(ops: &DaiOps) -> [bindings::snd_soc_dai_driver; DAI_COUNT] {
             ..Default::default()
         },
         bindings::snd_soc_dai_driver {
-            name: c"j700-pcm-1".as_char_ptr(),
+            name: hw.fe_dai_names[1].as_char_ptr(),
             id: FE_DAI_ID_BASE + 1,
             ops: &ops.fe,
             // the speaker front-end: S32 in, converted through the ceiling
-            playback: pcm_stream(c"PCM1 TX", S32_FORMATS, 2),
+            playback: pcm_stream(
+                c"PCM1 TX",
+                if hw.spkr_leap { S32_FORMATS } else { OUT_FORMATS },
+                hw.spkr_channels,
+            ),
             ..Default::default()
         },
         bindings::snd_soc_dai_driver {
-            name: c"j700-pcm-2".as_char_ptr(),
+            name: hw.fe_dai_names[2].as_char_ptr(),
             id: FE_DAI_ID_BASE + 2,
             ops: &ops.fe,
             // the speaker tap front-end: the words on the speaker wire
-            capture: pcm_stream(c"PCM2 RX", S32_FORMATS, 2),
+            capture: sense_stream(c"PCM2 RX", hw),
             ..Default::default()
         },
         // The internal speaker back-end: LEAP TX0 under the AOP spkr service,
@@ -2780,8 +2822,12 @@ fn dai_drivers(ops: &DaiOps) -> [bindings::snd_soc_dai_driver; DAI_COUNT] {
             name: c"spkr".as_char_ptr(),
             id: BE_DAI_ID_SPKR,
             ops: &ops.spkr,
-            playback: pcm_stream(c"SPKR TX", S32_FORMATS, 2),
-            capture: pcm_stream(c"SPKR RX", S32_FORMATS, 2),
+            playback: pcm_stream(
+                c"SPKR TX",
+                if hw.spkr_leap { S32_FORMATS } else { OUT_FORMATS },
+                hw.spkr_channels,
+            ),
+            capture: sense_stream(c"SPKR RX", hw),
             ..Default::default()
         },
     ]
@@ -2806,7 +2852,7 @@ const _: () = assert!(mem::offset_of!(AsocContext, component) == 0);
 impl AsocContext {
     fn new(data: Arc<SndSocT8140AopData>) -> Result<KBox<Self>> {
         let ops = KBox::new(DaiOps::new(), GFP_KERNEL)?;
-        let dais = KBox::new(Opaque::new(dai_drivers(&ops)), GFP_KERNEL)?;
+        let dais = KBox::new(Opaque::new(dai_drivers(&ops, data.hw)), GFP_KERNEL)?;
         let volume = KBox::new(
             Opaque::new(bindings::soc_mixer_control {
                 min: 0,
@@ -2849,7 +2895,7 @@ impl AsocContext {
             trigger: Some(asoc_pcm_trigger),
             sync_stop: Some(asoc_pcm_sync_stop),
             pointer: Some(asoc_pcm_pointer),
-            copy: Some(asoc_pcm_copy),
+            copy: if data.hw.spkr_leap { Some(asoc_pcm_copy) } else { None },
             ..Default::default()
         };
         Ok(KBox::new(
@@ -2931,6 +2977,9 @@ impl SndSocT8140AopDriver {
             closed: AtomicFlag::new(false),
         };
 
+        // Without the low-power microphone there is no card of our own:
+        // the back-ends and front-ends below belong to the machine card.
+        if data.hw.lpai {
         // The low-power microphone: its ring is reported to us by the
         // firmware for the AOP's lifetime.
         data.attach_device(AUDIO_DEV_LPAI, "lpai")?;
@@ -3014,6 +3063,8 @@ impl SndSocT8140AopDriver {
         if ret < 0 {
             dev_err!(data.dev, "unable to register the sound card\n");
             return Err(Error::from_errno(ret));
+        }
+
         }
 
         // The ASoC side: the jack (cout) and speaker back-ends, the
@@ -3195,23 +3246,81 @@ unsafe extern "C" fn hpai_pcm_hw_params(
     }
 }
 
+/// What the SoC leaves to the AP around the AOP's audio services.
+struct HwConfig {
+    /// The low-power microphone: its ring is bound through the setup port
+    /// and read here (T8140). On T6050 it is exclave-owned: no ring, no
+    /// card of our own, and no raising the fabric through it.
+    lpai: bool,
+    /// The serializer leaves are AP PMGR domains named on the audio node
+    /// (T8140). On T6050 they are the firmware's (no_ps): nothing to power,
+    /// and each stream's service is attached before its DMA channel.
+    ap_power_domains: bool,
+    /// The speaker back-end feeds the LEAP: float32 through the software
+    /// ceiling for SD_MODE amplifiers (T8140). Otherwise it is an MCA
+    /// serializer stream to TDM amplifiers, like the jack's.
+    spkr_leap: bool,
+    /// Speaker playback channels.
+    spkr_channels: u32,
+    /// The speaker back-end's capture: the tap service on its own channel
+    /// (0, T8140) or the speaker service's own V/I sense return with this
+    /// many 16-bit channels (T6050).
+    sense_channels: u32,
+    /// Front-end DAI names, the machine driver's `fe_dai_names`.
+    fe_dai_names: [&'static core::ffi::CStr; FE_COUNT],
+    /// DMA names per front-end and stream, [playback, capture].
+    fe_dma_names: [[Option<&'static core::ffi::CStr>; 2]; FE_COUNT],
+}
+
+const HW_T8140: HwConfig = HwConfig {
+    lpai: true,
+    ap_power_domains: true,
+    spkr_leap: true,
+    spkr_channels: 2,
+    sense_channels: 0,
+    fe_dai_names: [c"j700-pcm-0", c"j700-pcm-1", c"j700-pcm-2"],
+    fe_dma_names: FE_DMA_NAMES,
+};
+
+/// T6050 (J714c): six SN012776 amplifiers on base-ns TX0 with their V/I
+/// sense (12 x 16 bit) back on base-ns RX0 under the same spkr service, the
+/// jack on base-ns TX2/RX2 as on T8140. The audio power domains are the
+/// firmware's and the low-power microphone is exclave-owned.
+const HW_T6050: HwConfig = HwConfig {
+    lpai: false,
+    ap_power_domains: false,
+    spkr_leap: false,
+    spkr_channels: 6,
+    sense_channels: 12,
+    fe_dai_names: [c"j714-pcm-0", c"j714-pcm-1", c"j714-pcm-2"],
+    fe_dma_names: [
+        [Some(c"cout"), Some(c"cin")],
+        [Some(c"spkr"), None],
+        [None, Some(c"spkr-sense")],
+    ],
+};
+
 kernel::of_device_table!(
     OF_TABLE,
     MODULE_OF_TABLE,
     <SndSocT8140AopDriver as platform::Driver>::IdInfo,
-    [(of::DeviceId::new(c_str!("apple,t8140-aop-audio")), ())]
+    [
+        (of::DeviceId::new(c_str!("apple,t8140-aop-audio")), &HW_T8140),
+        (of::DeviceId::new(c_str!("apple,t6050-aop-audio")), &HW_T6050),
+    ]
 );
 
 impl platform::Driver for SndSocT8140AopDriver {
-    type IdInfo = ();
+    type IdInfo = &'static HwConfig;
     type Data<'bound> = SndSocT8140AopDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
-        _info: Option<&'bound Self::IdInfo>,
+        info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
+        let hw: &'static HwConfig = *info.ok_or(ENODEV)?;
         let dev = ARef::<device::Device>::from(pdev.as_ref());
         // SAFETY: this is a service device the AOP core registered, being
         // probed here; the lookup defers the probe until the core has
@@ -3230,11 +3339,16 @@ impl platform::Driver for SndSocT8140AopDriver {
         // owned by the AOP driver because the firmware binds it once per boot.
         // SAFETY: no DMA is in flight on this device yet.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::new::<42>())? };
-        let ring = adata.source_ring(pdev.as_ref(), RING_BYTES)?;
+        let ring = if hw.lpai {
+            Some(adata.source_ring(pdev.as_ref(), RING_BYTES)?)
+        } else {
+            None
+        };
 
         // The serializer leaves.  A missing one only disables the paths that
         // need it; those fail to open with ENODEV.
         let mut pds: [Option<PowerDomain>; 5] = [None, None, None, None, None];
+        if hw.ap_power_domains {
         for (slot, (name, dt_name)) in pds.iter_mut().zip([
             ("mca1", c"mca1"),
             ("mca0", c"mca0"),
@@ -3248,6 +3362,7 @@ impl platform::Driver for SndSocT8140AopDriver {
                 Err(e) => dev_warn!(dev, "{} power domain attach failed: {:?}\n", name, e),
             }
         }
+        }
         let [pd_mca1, pd_mca0, pd_tx0, pd_leap_mca, pd_rx0] = pds;
 
         let fwnode = pdev.as_ref().fwnode().ok_or(ENOENT)?;
@@ -3257,6 +3372,7 @@ impl platform::Driver for SndSocT8140AopDriver {
                 adata,
                 service: svc,
                 ring,
+                hw,
                 ring_bytes: Atomic::new(0),
                 sequence: Atomic::new(0),
                 powered: AtomicFlag::new(false),
