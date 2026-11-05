@@ -59,6 +59,8 @@
 
 	dwc3_0: usb@2a2280000 {
 		compatible = "generic-xhci";
+		/* Keeps the PHY set up and the domain on across s2idle. */
+		wakeup-source;
 		reg = <0x2 0xa2280000 0x0 0x8000>;
 		interrupts = <AIC_IRQ 1419 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&dwc3_0_dart_0 0>, <&dwc3_0_dart_1 1>;
@@ -315,6 +317,8 @@
 
 	dwc3_1: usb@2aa280000 {
 		compatible = "generic-xhci";
+		/* Keeps the PHY set up and the domain on across s2idle. */
+		wakeup-source;
 		reg = <0x2 0xaa280000 0x0 0x8000>;
 		interrupts = <AIC_IRQ 1451 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&dwc3_1_dart_0 0>, <&dwc3_1_dart_1 1>;
@@ -352,6 +356,8 @@
 
 	dwc3_2: usb@382280000 {
 		compatible = "generic-xhci";
+		/* Keeps the PHY set up and the domain on across s2idle. */
+		wakeup-source;
 		reg = <0x3 0x82280000 0x0 0x8000>;
 		interrupts = <AIC_IRQ 1483 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&dwc3_2_dart_0 0>, <&dwc3_2_dart_1 1>;

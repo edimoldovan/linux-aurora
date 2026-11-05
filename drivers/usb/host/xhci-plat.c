@@ -294,6 +294,8 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 	}
 
 	device_set_wakeup_capable(&pdev->dev, true);
+	if (device_property_read_bool(&pdev->dev, "wakeup-source"))
+		device_wakeup_enable(&pdev->dev);
 
 	xhci->main_hcd = hcd;
 
