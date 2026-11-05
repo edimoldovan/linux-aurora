@@ -52,6 +52,7 @@
 			reg = <0 0 0 0>; /* Filled by the loader. */
 			status = "okay"; /* m1n1 only enables it on chips it knows. */
 			power-domains = <&ps_disp_cpu>;
+			apple,internal-panel; /* simpledrm reports it as eDP */
 		};
 	};
 
