@@ -98,6 +98,15 @@
 		interrupts = <AIC_IRQ 721 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
+	fpwm0: pwm@505040000 {
+		compatible = "apple,t6050-fpwm", "apple,s5l-fpwm";
+		reg = <0x5 0x05040000 0x0 0x4000>;
+		power-domains = <&ps_fpwm0>;
+		clocks = <&clkref>;
+		#pwm-cells = <2>;
+		status = "disabled";
+	};
+
 	gpio0: gpio@29c000000 {
 		compatible = "apple,t6050-gpio", "apple,t8103-gpio";
 		reg = <0x2 0x9c000000 0x0 0x44000>;
