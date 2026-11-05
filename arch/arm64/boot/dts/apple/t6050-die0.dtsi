@@ -78,6 +78,18 @@
 		#performance-domain-cells = <0>;
 	};
 
+	cpufreq_m1: cpufreq@211e20000 {
+		compatible = "apple,t6050-cluster-cpufreq", "apple,cluster-cpufreq";
+		reg = <0x2 0x11e20000 0x0 0x1000>;
+		#performance-domain-cells = <0>;
+	};
+
+	cpufreq_p0: cpufreq@212e20000 {
+		compatible = "apple,t6050-cluster-cpufreq", "apple,cluster-cpufreq";
+		reg = <0x2 0x12e20000 0x0 0x1000>;
+		#performance-domain-cells = <0>;
+	};
+
 	wdt: watchdog@28836c000 {
 		compatible = "apple,t6050-wdt", "apple,t8103-wdt";
 		reg = <0x2 0x8836c000 0x0 0x4000>;
