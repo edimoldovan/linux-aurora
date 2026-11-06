@@ -35,7 +35,7 @@
 		interrupt-names = "send-empty", "send-not-empty",
 				  "recv-empty", "recv-not-empty";
 		#mbox-cells = <0>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	pmp_dart: iommu@2841a0000 {
@@ -44,7 +44,7 @@
 		#iommu-cells = <1>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 371 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	pmp: pmp@284500000 {
@@ -58,7 +58,7 @@
 		iommus = <&pmp_dart 0>;
 		apple,board-id = <0xa>;
 		apple,dram-vendor-id = <0xff>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	pmp_report: pmp-report@284240000 {
@@ -69,7 +69,7 @@
 		#address-cells = <1>;
 		#size-cells = <0>;
 		apple,pmp = <&pmp>;
-		status = "disabled";
+		status = "okay";
 	};
 };
 
