@@ -501,6 +501,13 @@ const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
 };
 
+/// T6050: dart-pmp0's window is [0x10000000000, 0x11000000000) at 1 TiB, so the
+/// rtkit buffers need a mask wide enough to reach it. The generic
+/// apple,t6000-pmp-v2 default sets none and leaves the mask at 32-bit.
+const HW_CFG_T6050: PmpHwConfig = PmpHwConfig {
+    dma_mask: Some(DmaMask::new::<42>()),
+};
+
 impl Drop for PmpDriver {
     fn drop(&mut self) {
         // SAFETY: The Arc remains live until unregister has joined any caller.
@@ -514,6 +521,7 @@ kernel::of_device_table!(
     <PmpDriver as platform::Driver>::IdInfo,
     [
         (of::DeviceId::new(c"apple,t8140-pmp-v2"), &HW_CFG_T8140),
+        (of::DeviceId::new(c"apple,t6050-pmp-v2"), &HW_CFG_T6050),
         (of::DeviceId::new(c"apple,t6000-pmp-v2"), &HW_CFG_DEFAULT),
     ]
 );
