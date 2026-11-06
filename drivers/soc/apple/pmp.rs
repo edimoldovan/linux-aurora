@@ -160,7 +160,9 @@ impl PmpData {
     fn start(&self) -> Result<()> {
         let mut guard = self.rtkit.lock();
         let mut rtk = guard.as_mut().as_pin_mut().unwrap();
-        rtk.as_mut().wake()?;
+        // The T6050 PMP waits for AP readiness before acknowledging IOP power
+        // (as ANS/AOP/USB2 do), so plain wake() times out the IOP power ACK.
+        rtk.as_mut().wake_early_ap()?;
         rtk.start_endpoint(PMP_ENDPOINT)
     }
     fn patch_bootargs(
