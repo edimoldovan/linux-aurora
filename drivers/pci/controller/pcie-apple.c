@@ -3410,8 +3410,13 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	 * the tunneled setup path can consume that handoff.
 	 */
 	if (hw->adopt_link) {
-		if (!of_get_available_child_count(dev->of_node) ||
-		    of_property_present(dev->of_node, "power-domains"))
+		/*
+		 * An adopted host may name its ports' power domain. The driver core
+		 * attaches it before probe; the boot loader left it on, so nothing
+		 * changes, and the host becomes its consumer: genpd's sync_state no
+		 * longer switches it off under a live link.
+		 */
+		if (!of_get_available_child_count(dev->of_node))
 			return -EINVAL;
 		for_each_available_child_of_node_scoped(dev->of_node, child) {
 			u32 reg;

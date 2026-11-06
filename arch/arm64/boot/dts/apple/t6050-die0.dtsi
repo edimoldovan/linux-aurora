@@ -418,6 +418,8 @@
 	pcie0: pcie@1cb0000000 {
 		compatible = "apple,t6050-pcie";
 		device_type = "pci";
+		/* The GP port's domain; its parents up to ps_apcie_gp follow it. */
+		power-domains = <&ps_aphy_gp_aus5>;
 		nonposted-mmio;
 		interrupt-parent = <&aic>;
 
