@@ -367,6 +367,19 @@
 		apple,dma-range = <0 0x02000000 0 0x10000000>;
 	};
 
+	/*
+	 * /arm-io/dart-apcie0: apcie port 0's, which carries the N1 (its mappers Control, Alpha and
+	 * Beta on streams 1, 2 and 3). The port is trained before Linux (pcie-exp1-host.py v13 over
+	 * the proxy, later the resident m1n1); the board file enables it.
+	 */
+	dart_apcie0: iommu@410000000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x4 0x10000000 0x0 0x20000>;
+		interrupts = <AIC_IRQ 1524 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
 	mtp_dockchannel: fifo@294b14000 {
 		compatible = "apple,t6050-dockchannel", "apple,dockchannel";
 		reg = <0x2 0x94b14000 0x0 0x1000>;
@@ -391,5 +404,34 @@
 			apple,fifo-size = <0x800>;
 			apple,helper-cpu = <&mtp>;
 		};
+	};
+};
+
+/ {
+	/*
+	 * The internal PCIe host (apcie), as aurora-silicon's t6050-die0.dtsi (j716c/dt) has it: the
+	 * boot stage trains the links of the ports the board uses and keeps power, clocks, the PHYs
+	 * and PERST; Linux owns the routing, MSI and the DARTs. The board names its ports (registers,
+	 * interrupts, iommu-map, bus-range, a node per port). One MSI domain for all ports; the
+	 * J714c's ADT gives pci-bridge0 vectors 0-31 of apcie0's 128 (AIC 1824 + vector).
+	 */
+	pcie0: pcie@1cb0000000 {
+		compatible = "apple,t6050-pcie";
+		device_type = "pci";
+		nonposted-mmio;
+		interrupt-parent = <&aic>;
+
+		msi-controller;
+		msi-parent = <&pcie0>;
+		msi-ranges = <&aic AIC_IRQ 1824 IRQ_TYPE_EDGE_RISING 32>;
+		apple,msi-vector-base = <0>;
+
+		iommu-map-mask = <0xffff>;
+		dma-coherent;
+		linux,pci-domain = <0>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges = <0x02000000 0x0 0x80000000 0xb 0x80000000 0x0 0x40000000>,
+			 <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0x0 0x20000000>;
 	};
 };

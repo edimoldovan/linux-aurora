@@ -39,6 +39,9 @@
 		gpu = &gpu;
 		keyboard = &keyboard;
 		serial0 = &serial0;
+		/* kboot fills the N1's factory addresses from /chosen through these */
+		wifi0 = &n1_alpha;
+		bluetooth0 = &n1_beta;
 	};
 
 	chosen {
@@ -346,4 +349,72 @@
 			};
 		};
 	};
+};
+
+/*
+ * The N1 (Wi-Fi and Bluetooth) on apcie0 port 0, as aurora-silicon's t6050-j716c.dts names it;
+ * the J714c has the same port, registers and pins (ADT 2026-11-05). The port is trained before
+ * Linux (pcie-exp1-host.py v13 over the proxy): PERST# GPIO 80 is high and the link is in L0.
+ * Platform id = (board-id 0x0a << 16) | 0x6050 by aurora's J716c rule; the FTAB comes from the
+ * macOS install (not shipped by aurora).
+ */
+&pcie0 {
+	reg = <0x1c 0xb0000000 0x0 0x10000000>,
+	      <0x4 0x14000000 0x0 0x4000>,
+	      <0x4 0x10028000 0x0 0x8000>,
+	      <0x4 0x17010000 0x0 0x4000>,
+	      <0x4 0x10024000 0x0 0x4000>;
+	reg-names = "config", "rc", "port0", "phy0", "intr2axi0";
+	interrupts = <AIC_IRQ 1523 IRQ_TYPE_LEVEL_HIGH>;
+	interrupt-names = "port0";
+
+	/* The N1's three functions are on DART streams 1-3 */
+	iommu-map = <0x100 &dart_apcie0 1 3>;
+	bus-range = <0 4>;
+
+	port00: pci@0,0 {
+		device_type = "pci";
+		reg = <0x0 0 0 0 0>;
+		bus-range = <1 1>;
+		apple,link-trained-by-bootloader;
+		/* PERST#, driven only by the root-port reset after the N1's ROM stage */
+		reset-gpios = <&pinctrl_ap 80 GPIO_ACTIVE_LOW>;
+		status = "okay";
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &port00 0 0 0 0>,
+				<0 0 0 2 &port00 0 0 0 1>,
+				<0 0 0 3 &port00 0 0 0 2>,
+				<0 0 0 4 &port00 0 0 0 3>;
+
+		n1_control: control@0,0 {
+			compatible = "pci106b,1900";
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			firmware-name = "apple/centauri/j714c-ftab.bin";
+			apple,centauri-platform-id = <0x000a6050>;
+			apple,centauri-protocol = <27>;
+		};
+
+		n1_alpha: wifi@0,1 {
+			compatible = "pci106b,1902";
+			reg = <0x10100 0x0 0x0 0x0 0x0>;
+			local-mac-address = [00 00 00 00 00 00];
+		};
+
+		n1_beta: bluetooth@0,2 {
+			compatible = "pci106b,1903";
+			reg = <0x10200 0x0 0x0 0x0 0x0>;
+			local-bd-address = [00 00 00 00 00 00];
+		};
+	};
+};
+
+&dart_apcie0 {
+	status = "okay";
 };
