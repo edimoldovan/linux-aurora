@@ -179,6 +179,11 @@ static int centauri_rom_boot(struct centauri *c)
 
 	if (!ret && stage != 4)
 		ret = -EIO;
+	if (ret)
+		dev_err(dev, "ROM boot: image response %#x, stage %#x, platform id %#x, image %zu bytes: %d\n",
+			c->image_response, stage, c->platform_id, fw->size, ret);
+	else
+		dev_info(dev, "ROM boot accepted: stage %#x, platform id %#x\n", stage, c->platform_id);
 	goto release;
 free_buffers:
 	centauri_free_boot(c);
