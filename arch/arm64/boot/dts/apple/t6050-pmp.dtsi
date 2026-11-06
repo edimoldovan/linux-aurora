@@ -44,6 +44,12 @@
 		#iommu-cells = <1>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 371 IRQ_TYPE_LEVEL_HIGH>;
+		/* rtkit host buffers (syslog/crashlog shmem) must land in this DART
+		 * window at 1 TiB (dart-pmp0 ADT vm-base/vm-size); start 16 MiB above
+		 * the base so allocations clear the firmware's inherited __ETEXT
+		 * mapping at 0x10000000000. Pairs with the 42-bit DMA mask the pmp
+		 * driver sets for t6050. Mirrors t8140's pmp_dart. */
+		apple,dma-range = /bits/ 64 <0x10001000000 0xfff000000>;
 		status = "okay";
 	};
 
