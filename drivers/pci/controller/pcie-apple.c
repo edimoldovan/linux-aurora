@@ -2055,6 +2055,8 @@ static int apple_pcie_t6050_port_train(struct apple_pcie_port *port)
  * lane PHY, PERST# release and LTSSM to a Gen3 x1 link. The caller has quiesced the
  * endpoint and saved the root port's state; the PCI core restores it.
  */
+static struct apple_pcie *apple_pcie_lookup(struct device *dev);
+
 static int apple_pcie_t6050_reset_root_port(struct pci_host_bridge *bridge,
 					    struct pci_dev *rp)
 {
