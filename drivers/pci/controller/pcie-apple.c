@@ -2413,7 +2413,7 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	dev_dbg(pcie->dev, "%pOF: %d RID/SID mapping entries\n", np, i);
 
 	port->sid_map_sz = i;
-
+rid2sid_ready:
 	list_add_tail(&port->entry, &pcie->ports);
 	init_completion(&pcie->event);
 
