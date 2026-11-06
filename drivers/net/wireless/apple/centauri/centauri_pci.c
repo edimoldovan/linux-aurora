@@ -383,6 +383,17 @@ static void centauri_remove(struct pci_dev *pdev)
 	WRITE_ONCE(c->removing, true);
 	cancel_delayed_work_sync(&c->boot_work);
 	mutex_lock(&c->boot_lock);
+	/*
+	 * Nothing to stop on an N1 whose ROM boot never started (no firmware file, no
+	 * DMA, bus mastering never enabled): on the J714c the config-space accesses of
+	 * centauri_stop_dma hang the SoC at a restart in that state.
+	 */
+	if (!c->boot_attempted) {
+		dev_info(&pdev->dev, "N1 never booted: leaving it untouched\n");
+		c->boot_phase = CEN_BOOT_STOPPED;
+		mutex_unlock(&c->boot_lock);
+		return;
+	}
 	centauri_wifi_unregister(c);
 	centauri_free_boot(c);
 	c->boot_phase = CEN_BOOT_STOPPED;
