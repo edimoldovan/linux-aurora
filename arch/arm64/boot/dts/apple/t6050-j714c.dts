@@ -26,6 +26,7 @@
 
 #include "t6050.dtsi"
 #include "t6050-smc.dtsi"
+#include "t6050-pmp.dtsi"
 #include "t6050-j714c-display.dtsi"
 
 / {

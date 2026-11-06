@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * T6050 power management processor (PMP) and its DART, mailbox and report.
+ *
+ * The PMP powers the GPU `cs` domain (notify_pmp): the asahi g17 driver takes an
+ * apple-pmp vote for it, as the g15 driver does on T6030 (apple_pmp_set_device_power).
+ *
+ * Addresses from the J714c ADT (read offline from j714c.adt):
+ *   /arm-io/pmp0 (iop,ascwrap-v6): reg[0] asc 0x284e00000+0x88000 (CPU_CONTROL at +0x44,
+ *     live-verified), reg[2] firmware/SRAM 0x284500000+0x100000 (= iop-pmp0-nub region-base),
+ *     reg[3] PTD update 0x284250000; mailbox AIC [397 396 399 398].
+ *   /arm-io/dart-pmp0 (dart,t8110): 0x2841a0000+0xc000, DAPF 0x2841b0000, AIC 371.
+ * Conventions mirror the AOP/MTP ascwrap-v6 coprocessors in t6050-die0.dtsi.
+ *
+ * Kept status="disabled": enabling the PMP is deliberate and has preconditions —
+ *  (1) the m1n1 dart-pmp0 DAPF entry must be resident, or pmp.rs faults on the
+ *      closed ASC window (the probe wedge seen in bring-up);
+ *  (2) pmp-report.c needs a T6050 report-offsets + "apple,t6050-pmp-v2-report" match
+ *      (the driver stops at t6031/t8122/t8140 today);
+ *  (3) the PMP needs the ~150 per-mac apple,tunable-* plus apple,tunable-soc-device
+ *      and apple,tunable-ptd-range (and apple,dram-capacity / apple,pio-ranges) from
+ *      the ADT iop-pmp0-nub, injected separately (generated from the ADT, or by m1n1).
+ * Enable the four nodes (and add the data above) for the GPU test boot.
+ */
+
+&soc {
+	pmp_mbox: mailbox@284e08000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0x84e08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 396 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 397 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 398 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 399 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	pmp_dart: iommu@2841a0000 {
+		compatible = "apple,t6050-dart", "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x2 0x841a0000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 371 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	pmp: pmp@284500000 {
+		compatible = "apple,t6050-pmp-v2", "apple,t6000-pmp-v2";
+		/* "pmp" = firmware/SRAM region; "asc" = ascwrap control (CPU_CONTROL at +0x44) */
+		reg = <0x2 0x84500000 0x0 0x100000>,
+		      <0x2 0x84e00000 0x0 0x4000>;
+		reg-names = "pmp", "asc";
+		mboxes = <&pmp_mbox>;
+		mbox-names = "mbox";
+		iommus = <&pmp_dart 0>;
+		apple,board-id = <0xa>;
+		apple,dram-vendor-id = <0xff>;
+		status = "disabled";
+	};
+
+	pmp_report: pmp-report@284240000 {
+		/* pmp-report.c needs a T6050 match + offsets; see the header note. */
+		compatible = "apple,t6050-pmp-v2-report";
+		/* PTD read aperture + update page (ADT pmp0 reg[3] - 0x10000) */
+		reg = <0x2 0x84240000 0x0 0x14000>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		apple,pmp = <&pmp>;
+		status = "disabled";
+	};
+};
+
+/ {
+	aliases {
+		pmp0 = &pmp_dart;
+	};
+};
