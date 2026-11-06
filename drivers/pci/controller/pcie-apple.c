@@ -2544,10 +2544,16 @@ static int apple_msi_init(struct apple_pcie *pcie)
 	if (pcie->hw->adopt_link) {
 		ret = of_property_read_u32(to_of_node(fwnode), "apple,msi-vector-base",
 					   &pcie->msi_vector_base);
-		if (ret || pcie->msi_vector_base != 64 ||
-		    (pcie->nvecs != 32 && pcie->nvecs != 64) ||
-		    args.args_count != 4 || args.args[0] != 0 || args.args[1] != 0 ||
-		    args.args[2] != 1888 || args.args[3] != IRQ_TYPE_EDGE_RISING ||
+		/*
+		 * The host's slice of apcie's 128 vectors (ADT msi-vector-offset 1824): the
+		 * J716c's bridge owns 64-127 (AIC 1888, four interrupt cells), the J714c's
+		 * pci-bridge0 owns 0-31 (AIC 1824, three cells).
+		 */
+		if (ret || (pcie->nvecs != 32 && pcie->nvecs != 64) ||
+		    (args.args_count != 3 && args.args_count != 4) || args.args[0] != 0 ||
+		    (args.args_count == 4 && args.args[1] != 0) ||
+		    args.args[args.args_count - 2] != 1824 + pcie->msi_vector_base ||
+		    args.args[args.args_count - 1] != IRQ_TYPE_EDGE_RISING ||
 		    DOORBELL_ADDR != 0xfffff000)
 			goto invalid_slice;
 	}
