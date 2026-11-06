@@ -803,9 +803,24 @@ struct SndSocT8140AopData {
     spkr_want_run: AtomicFlag,
     /// A microphone-array stream has been triggered and not yet stopped.
     hpai_want_run: AtomicFlag,
-    /// The speaker sense capture has been triggered and not yet stopped
-    /// (T6050): its RX DMA drains the speaker service's V/I sense.
-    sense_run: AtomicFlag,
+    /// The sense capture (T6050) reads the drain's ring: the bytes the drain
+    /// has produced into it (monotonic), the capture's origin at its start,
+    /// and the capture substream while it runs.
+    sense_ring_pos: core::sync::atomic::AtomicU64,
+    /// The count at the drain's last arm: the DMA starts over at the ring's
+    /// first byte, so a count maps to `(count - base) % ring`.
+    sense_arm_base: core::sync::atomic::AtomicU64,
+    sense_start_pos: core::sync::atomic::AtomicU64,
+    sense_sub: core::sync::atomic::AtomicPtr<bindings::snd_pcm_substream>,
+    /// The sense RX channel, requested on first use and kept: the capture
+    /// and the drain take turns on it.
+    sense_chan: core::sync::atomic::AtomicPtr<bindings::dma_chan>,
+    /// The driver's drain of the sense RX: its coherent buffer (allocated
+    /// with the channel, kept) and whether its cyclic transfer runs.
+    /// Changed under `spkr_lock`.
+    sense_drain_cpu: core::sync::atomic::AtomicPtr<core::ffi::c_void>,
+    sense_drain_dma: core::sync::atomic::AtomicU64,
+    sense_drain_running: AtomicFlag,
     /// Orders the speaker service's `pwrd` and `pw0` between the start work
     /// and the prepare and shutdown paths.
     #[pin]
@@ -852,10 +867,9 @@ impl WorkItem<JACK_WORK> for SndSocT8140AopData {
     }
 }
 
-/// The speaker stream start (pwrd + unmute), queued by the back-end DAI's
-/// trigger START: those are sleeping firmware calls, and the DMA must already
-/// be running when the LEAP starts consuming.  Also queued by the sense
-/// capture's triggers, to stop or restart the service with it.
+/// The speaker stream start (pwrd + unmute) or stop (mute + pw0), queued by
+/// the back-end DAI's trigger: those are sleeping firmware calls, and the DMA
+/// must already be running when the LEAP starts consuming.
 impl WorkItem<SPKR_START_WORK> for SndSocT8140AopData {
     type Pointer = Arc<Self>;
 
@@ -1490,57 +1504,78 @@ impl SndSocT8140AopData {
     fn spkr_prepare(&self) -> Result<()> {
         self.flush_spkr_start();
         let _guard = self.spkr_lock.lock();
-        if !self.spkr.running.load(Relaxed) {
-            return Ok(());
+        self.spkr_retire();
+        if !self.hw.spkr_leap {
+            // An MCA serializer stream (T6050): the service runs from here,
+            // before ASoC unmutes the amplifiers, so they see their TDM
+            // clock when they come out of shutdown; faulted on a missing
+            // clock, most of them stay down for the whole stream. The DMA
+            // follows at trigger START.
+            self.spkr_start()?;
         }
-        self.spkr_set_mute(true)?;
-        self.service_set_power(&self.spkr, SPKR_POWER_STATE_PW0)?;
-        self.spkr.running.store(false, Relaxed);
         Ok(())
     }
 
-    /// Whether the speaker service's V/I sense RX is drained, or it has none.
-    fn sense_drained(&self) -> bool {
-        self.hw.sense_channels == 0 || self.sense_run.load(Relaxed)
-    }
-
-    /// Speaker stream start, from the system workqueue right after trigger
-    /// START: the DMA must be running before pwrd starts the LEAP consuming
-    /// (issued from prepare, before the DMA, the wire stays silent), then the
-    /// firmware unmute, the value observed on the bus once the amplifier
-    /// output is enabled.
-    ///
-    /// With a V/I sense RX, the service runs only while the sense capture
-    /// drains it: the firmware stops the stream once that RX goes undrained,
-    /// and a later pw0 and pwrd do not bring the sense back.  So it stops as
-    /// soon as the capture does (a suspend, an overrun, speakersafetyd
-    /// exiting), and starts again when the capture does and playback is
-    /// still triggered.
-    fn spkr_go(&self) -> Result<()> {
-        let _guard = self.spkr_lock.lock();
-        if self.spkr.running.load(Relaxed) {
-            if !self.sense_drained() {
-                if let Err(e) = self.spkr_set_mute(true) {
-                    dev_err!(self.dev, "spkr: mute failed: {:?}\n", e);
-                }
-                // As in `service_shutdown`: a failed pw0 still ends this run,
-                // so the sense capture's next start sends a fresh pwrd.
-                let ret = self.service_set_power(&self.spkr, SPKR_POWER_STATE_PW0);
-                self.spkr.running.store(false, Relaxed);
-                return ret;
-            }
-            return Ok(());
-        }
-        if !self.spkr_want_run.load(Relaxed) || !self.sense_drained() {
-            return Ok(());
+    /// Drain armed, `pwrd`, unmute. Under `spkr_lock`.
+    fn spkr_start(&self) -> Result<()> {
+        if self.hw.sense_channels > 0 {
+            self.sense_drain_arm()?;
         }
         self.service_run(&self.spkr)?;
+        if !self.hw.spkr_leap {
+            // Let the serializer clock settle before ASoC unmutes the
+            // amplifiers right after this prepare.
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(20));
+        }
         if let Err(e) = self.spkr_set_mute(false) {
-            let _ = self.service_set_power(&self.spkr, SPKR_POWER_STATE_PW0);
-            self.spkr.running.store(false, Relaxed);
+            self.spkr_retire();
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Speaker stream start or stop, from the system workqueue right after
+    /// the trigger: the DMA must be running before pwrd starts the LEAP
+    /// consuming (issued from prepare, before the DMA, the wire stays silent),
+    /// then the firmware unmute, the value observed on the bus once the
+    /// amplifier output is enabled.
+    ///
+    /// The service follows playback alone. With a V/I sense RX (T6050) the
+    /// firmware stops the stream within about 0.2 s of that RX going
+    /// undrained, and does not deliver on it again until the service is
+    /// restarted, even to a restarted DMA. So the driver's own drain DMA runs
+    /// on the RX for the whole run and the sense capture reads its ring. The
+    /// service never stops under a running playback: the amplifiers keep
+    /// their clock through a daemon restart, which they do not survive
+    /// otherwise.
+    fn spkr_go(&self) -> Result<()> {
+        let _guard = self.spkr_lock.lock();
+        if self.spkr.running.load(Relaxed) {
+            if !self.spkr_want_run.load(Relaxed) {
+                self.spkr_retire();
+            }
+            return Ok(());
+        }
+        if !self.spkr_want_run.load(Relaxed) {
+            return Ok(());
+        }
+        self.spkr_start()
+    }
+
+    /// End the speaker service's run: mute, pw0, the drain off. A failed pw0
+    /// still ends the run, so the next trigger sends a fresh pwrd. Under
+    /// `spkr_lock`.
+    fn spkr_retire(&self) {
+        if self.spkr.running.load(Relaxed) {
+            if let Err(e) = self.spkr_set_mute(true) {
+                dev_err!(self.dev, "spkr: mute failed: {:?}\n", e);
+            }
+            if let Err(e) = self.service_set_power(&self.spkr, SPKR_POWER_STATE_PW0) {
+                dev_err!(self.dev, "spkr: pw0 failed: {:?}\n", e);
+            }
+            self.spkr.running.store(false, Relaxed);
+        }
+        self.sense_drain_disarm();
     }
 
     /// Called from sleeping prepare/shutdown paths while ALSA serializes
@@ -1563,7 +1598,156 @@ impl SndSocT8140AopData {
             }
         }
         self.service_shutdown(&self.spkr, &self.spkr_domains());
+        self.sense_drain_disarm();
     }
+
+    // ---- the sense RX drain (T6050): a cyclic transfer into the driver's
+    // ring for the whole run of the speaker service, never stopped by the
+    // capture, which reads the ring (`asoc_pcm_copy`, `asoc_pcm_pointer`). ----
+
+    /// The sense RX channel and the drain's buffer, requested and allocated
+    /// on first use and kept for the driver's life.
+    fn sense_chan(&self) -> Result<*mut bindings::dma_chan> {
+        let chan = self.sense_chan.load(core::sync::atomic::Ordering::Relaxed);
+        if !chan.is_null() {
+            return Ok(chan);
+        }
+        // SAFETY: the platform device is live and the name is NUL-terminated.
+        let chan = from_err_ptr(unsafe {
+            bindings::dma_request_chan(self.dev.as_raw(), c"spkr-sense".as_char_ptr())
+        })?;
+        // SAFETY: `chan` is a live channel of the ADMAC, whose device does
+        // the allocation; freed in `teardown` after the channel is released.
+        let dev = unsafe { (*(*chan).device).dev };
+        let mut dma: bindings::dma_addr_t = 0;
+        // SAFETY: as above.
+        let cpu = unsafe {
+            bindings::dma_alloc_attrs(dev, SENSE_DRAIN_BYTES, &mut dma, bindings::GFP_KERNEL, 0)
+        };
+        if cpu.is_null() {
+            // SAFETY: requested above, unused.
+            unsafe { bindings::dma_release_channel(chan) };
+            return Err(ENOMEM);
+        }
+        self.sense_drain_cpu.store(cpu, core::sync::atomic::Ordering::Relaxed);
+        self.sense_drain_dma.store(dma, core::sync::atomic::Ordering::Relaxed);
+        self.sense_chan.store(chan, core::sync::atomic::Ordering::Relaxed);
+        Ok(chan)
+    }
+
+    /// Arm the drain: a cyclic transfer into its buffer. Under `spkr_lock`,
+    /// with the capture not owning the channel.
+    fn sense_drain_arm(&self) -> Result<()> {
+        if self.sense_drain_running.load(Relaxed) {
+            return Ok(());
+        }
+        let chan = self.sense_chan()?;
+        // SAFETY: `chan` is live and the buffer is the one allocated with it;
+        // `self` outlives the transfer, disarmed before the driver data goes.
+        let param = ptr::from_ref(self).cast_mut().cast::<core::ffi::c_void>();
+        self.sense_arm_base.store(self.sense_ring_pos.load(core::sync::atomic::Ordering::Relaxed), core::sync::atomic::Ordering::Relaxed);
+        if let Err(e) = unsafe { sense_drain_submit(chan, self.sense_drain_dma.load(core::sync::atomic::Ordering::Relaxed), param) } {
+            dev_err!(self.dev, "sense drain: start failed: {:?}\n", e);
+            return Err(e);
+        }
+        self.sense_drain_running.store(true, Relaxed);
+        Ok(())
+    }
+
+    /// Disarm the drain and wait for the channel to stop. Under `spkr_lock`.
+    fn sense_drain_disarm(&self) {
+        if !self.sense_drain_running.load(Relaxed) {
+            return;
+        }
+        let chan = self.sense_chan.load(core::sync::atomic::Ordering::Relaxed);
+        // SAFETY: `chan` is the live channel the drain runs on.
+        unsafe {
+            let ops = &*(*chan).device;
+            if let Some(terminate) = ops.device_terminate_all {
+                terminate(chan);
+            }
+            if let Some(sync) = ops.device_synchronize {
+                sync(chan);
+            }
+        }
+        self.sense_drain_running.store(false, Relaxed);
+    }
+
+}
+
+/// A period of the drain landed in the ring: count it, and wake a running
+/// sense capture. DMA completion context.
+///
+/// # Safety
+///
+/// `param` is the driver data the drain was armed with, alive until the
+/// drain is disarmed and synchronized.
+unsafe extern "C" fn sense_dma_period(param: *mut core::ffi::c_void) {
+    // SAFETY: by the contract above.
+    let data = unsafe { &*param.cast::<SndSocT8140AopData>() };
+    data.sense_ring_pos.fetch_add(SENSE_DRAIN_PERIOD as u64, core::sync::atomic::Ordering::Relaxed);
+    let sub = data.sense_sub.load(core::sync::atomic::Ordering::Relaxed);
+    if !sub.is_null() {
+        // SAFETY: a substream of this component's PCM, which outlives the
+        // drain; the core checks its runtime under the stream lock.
+        unsafe { bindings::snd_pcm_period_elapsed(sub) };
+    }
+}
+
+/// Configure the sense channel (16-bit words, one burst of four) and submit
+/// the drain's cyclic transfer, with `param` for its period callback.
+///
+/// # Safety
+///
+/// `chan` is a live, requested channel of the ADMAC, `dma` the address of a
+/// buffer of `SENSE_DRAIN_BYTES` on its device, `param` the driver data.
+unsafe fn sense_drain_submit(
+    chan: *mut bindings::dma_chan,
+    dma: bindings::dma_addr_t,
+    param: *mut core::ffi::c_void,
+) -> Result<()> {
+    let mut cfg = bindings::dma_slave_config::default();
+    cfg.direction = bindings::dma_transfer_direction_DMA_DEV_TO_MEM;
+    cfg.src_addr_width = bindings::dma_slave_buswidth_DMA_SLAVE_BUSWIDTH_2_BYTES;
+    cfg.src_port_window_size = 4;
+    // SAFETY: by the caller's contract.
+    let ops = unsafe { &*(*chan).device };
+    let config = ops.device_config.ok_or(ENOSYS)?;
+    let prep = ops.device_prep_dma_cyclic.ok_or(ENOSYS)?;
+    let issue = ops.device_issue_pending.ok_or(ENOSYS)?;
+    // SAFETY: the channel's own ops, with a live channel and configuration.
+    let rc = unsafe { config(chan, &mut cfg) };
+    if rc < 0 {
+        return Err(Error::from_errno(rc));
+    }
+    // SAFETY: as above.
+    let desc = unsafe {
+        prep(
+            chan,
+            dma,
+            SENSE_DRAIN_BYTES,
+            SENSE_DRAIN_PERIOD,
+            bindings::dma_transfer_direction_DMA_DEV_TO_MEM,
+            0,
+        )
+    };
+    if desc.is_null() {
+        return Err(EIO);
+    }
+    // SAFETY: a descriptor the channel just prepared, not submitted yet.
+    unsafe {
+        (*desc).callback = Some(sense_dma_period);
+        (*desc).callback_param = param;
+    }
+    // SAFETY: as above.
+    let submit = unsafe { (*desc).tx_submit }.ok_or(ENOSYS)?;
+    // SAFETY: as above.
+    if unsafe { submit(desc) } < 0 {
+        return Err(EIO);
+    }
+    // SAFETY: as above.
+    unsafe { issue(chan) };
+    Ok(())
 }
 
 /// Copy `len` bytes from the source ring (absolute producer offset `from`)
@@ -2288,8 +2472,10 @@ const FE_SPKR: usize = 1;
 /// The front-end that captures the speaker tap or, on T6050, the amplifiers'
 /// V/I sense return (j7xx-pcm-2, the card's "Speaker Sense" PCM).
 const FE_SENSE: usize = 2;
-
-static SENSE_WORDS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The driver's sense RX drain ring (T6050): 256 frames of 12 x 16-bit words
+/// per period, 128 periods (0.68 s). The sense capture reads it.
+const SENSE_DRAIN_PERIOD: usize = 256 * 12 * 2;
+const SENSE_DRAIN_BYTES: usize = SENSE_DRAIN_PERIOD * 128;
 
 /// Digital ceiling of the speaker path, as a Q31 gain applied to every
 /// sample userspace writes: 0.5, the amplifier's full scale.
@@ -2473,10 +2659,12 @@ unsafe extern "C" fn asoc_pcm_open(
             return e.to_errno();
         }
     }
-    if !data.hw.ap_power_domains {
+    if !data.hw.ap_power_domains && !sense_copy {
         // The firmware owns the audio fabric, the ADMAC's power with it:
         // attach the stream's service and request pw0 before the first
-        // touch of the channel's registers.
+        // touch of the channel's registers. Not for the sense capture: it
+        // has no channel of its own, and a pw0 would stop a running
+        // speaker service under it.
         let svc = if fe == 0 {
             data.jack_service(playback)
         } else {
@@ -2485,6 +2673,40 @@ unsafe extern "C" fn asoc_pcm_open(
         let _guard = (fe != 0).then(|| data.spkr_lock.lock());
         if let Err(e) = data.service_startup(svc, &[]) {
             return e.to_errno();
+        }
+    }
+    if sense_copy {
+        // The capture reads the drain's ring: no DMA of its own, a vmalloc
+        // buffer that sizes the stream, its words copied from the ring.
+        let mut hw = dmaengine_hw();
+        hw.info = bindings::SNDRV_PCM_INFO_INTERLEAVED | bindings::SNDRV_PCM_INFO_BATCH;
+        hw.formats = SENSE_FORMATS;
+        hw.rates = bindings::SNDRV_PCM_RATE_48000;
+        hw.rate_min = 48000;
+        hw.rate_max = 48000;
+        hw.channels_min = data.hw.sense_channels;
+        hw.channels_max = data.hw.sense_channels;
+        // Periods of at least one drain period (the pointer advances by
+        // one), buffers up to half the ring.
+        hw.buffer_bytes_max = SENSE_DRAIN_BYTES / 2;
+        hw.period_bytes_min = SENSE_DRAIN_PERIOD;
+        hw.period_bytes_max = SENSE_DRAIN_BYTES / 8;
+        hw.periods_max = (SENSE_DRAIN_BYTES / 2 / SENSE_DRAIN_PERIOD) as u32;
+        hw.fifo_size = 0;
+        // SAFETY: the substream's runtime exists for the op's duration; a
+        // vmalloc buffer needs no device, and is set once per substream.
+        unsafe {
+            (*(*substream).runtime).hw = hw;
+            if (*substream).dma_buffer.dev.type_ != bindings::SNDRV_DMA_TYPE_UNKNOWN as i32 {
+                return 0;
+            }
+            return bindings::snd_pcm_set_managed_buffer(
+                substream,
+                bindings::SNDRV_DMA_TYPE_VMALLOC as i32,
+                ptr::null_mut(),
+                0,
+                0,
+            );
         }
     }
     // SAFETY: the platform device is live and the channel name is
@@ -2517,9 +2739,6 @@ unsafe extern "C" fn asoc_pcm_open(
         hw.periods_max = (SPKR_BUFFER_MAX / PCM_PERIOD_BYTES_MIN) as u32;
         formats = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S32_LE;
     }
-    if sense_copy {
-        hw.info = bindings::SNDRV_PCM_INFO_INTERLEAVED;
-    }
     let ret = pcm_open_dmaengine(substream, chan, hw, formats);
     if ret < 0 {
         // SAFETY: `chan` was requested above and is not attached to the
@@ -2550,11 +2769,16 @@ unsafe extern "C" fn asoc_pcm_close(
     if unsafe { rtd_is_be(rtd) } {
         return 0;
     }
+    // SAFETY: as for `rtd_is_be`.
+    let fe = unsafe { fe_index(rtd) };
+    if fe == Some(FE_SENSE) && data.hw.sense_channels > 0 {
+        // No DMA of its own to close.
+        return 0;
+    }
     // SAFETY: the substream is live and its dmaengine runtime was set up by
     // `snd_dmaengine_pcm_open` in `asoc_pcm_open`.
     let ret = unsafe { bindings::snd_dmaengine_pcm_close_release_chan(substream) };
-    // SAFETY: as for `rtd_is_be`.
-    if unsafe { fe_index(rtd) } == Some(FE_SPKR) {
+    if fe == Some(FE_SPKR) {
         data.power_down(&data.spkr_domains());
     }
     ret
@@ -2565,13 +2789,22 @@ unsafe extern "C" fn asoc_pcm_close(
 /// Called by ASoC on this driver's registered component, with live
 /// arguments belonging to one of its links.
 unsafe extern "C" fn asoc_pcm_hw_params(
-    _component: *mut bindings::snd_soc_component,
+    component: *mut bindings::snd_soc_component,
     substream: *mut bindings::snd_pcm_substream,
     params: *mut bindings::snd_pcm_hw_params,
 ) -> i32 {
     // SAFETY: ASoC hands its ops a live substream whose private data is the
     // `snd_soc_pcm_runtime` of one of this component's links.
-    if unsafe { rtd_is_be(substream_rtd(substream)) } {
+    let rtd = unsafe { substream_rtd(substream) };
+    // SAFETY: as above.
+    if unsafe { rtd_is_be(rtd) } {
+        return 0;
+    }
+    // SAFETY: the component is ours and live for the call; rtd as above.
+    if unsafe { component_data(component) }.hw.sense_channels > 0
+        && unsafe { fe_index(rtd) } == Some(FE_SENSE)
+    {
+        // The sense capture has no DMA of its own.
         return 0;
     }
     // SAFETY: the substream is live and its dmaengine runtime was set up by
@@ -2623,7 +2856,15 @@ unsafe extern "C" fn asoc_pcm_prepare(
     // `snd_soc_pcm_runtime` of one of this component's links.
     let rtd = unsafe { substream_rtd(substream) };
     // SAFETY: as above.
-    if unsafe { rtd_is_be(rtd) } || unsafe { fe_index(rtd) } != Some(FE_SPKR) {
+    if unsafe { rtd_is_be(rtd) } {
+        return 0;
+    }
+    // SAFETY: as above.
+    let fe = unsafe { fe_index(rtd) };
+    if fe == Some(FE_SENSE) {
+        return 0;
+    }
+    if fe != Some(FE_SPKR) {
         return 0;
     }
     // SAFETY: ALSA calls this op with a live substream; its runtime and DMA
@@ -2719,13 +2960,24 @@ unsafe extern "C" fn asoc_pcm_copy(
             // taken from the ring, which wraps. The last word of a read takes
             // its bit 0 from the slot after the read, which the DMA may not
             // have written yet: one LSB per read, below the sense noise.
-            if bytes & 1 != 0 || dma_bytes & 1 != 0 || dma_bytes == 0 {
+            let ring_base = data.sense_drain_cpu.load(core::sync::atomic::Ordering::Relaxed).cast::<u8>().cast_const();
+            if bytes & 1 != 0 || ring_base.is_null() {
                 return EINVAL.to_errno();
             }
-            // SAFETY: the DMA area holds dma_bytes bytes for the stream's life.
-            let ring = unsafe { slice::from_raw_parts(area, dma_bytes) };
+            // The read's place in the ring: the capture's origin plus the
+            // frames the application has taken so far (`pos` is that count
+            // within its own buffer).
+            // SAFETY: the substream's runtime and control exist for the op.
+            let appl = unsafe { (*(*(*substream).runtime).control).appl_ptr } as u64;
+            let frame_bytes = u64::from(data.hw.sense_channels) * 2;
+            let ring_bytes = SENSE_DRAIN_BYTES;
+            let pos = ((data.sense_start_pos.load(core::sync::atomic::Ordering::Relaxed) + appl * frame_bytes)
+                .wrapping_sub(data.sense_arm_base.load(core::sync::atomic::Ordering::Relaxed))
+                % ring_bytes as u64) as usize;
+            // SAFETY: the ring is SENSE_DRAIN_BYTES long for the driver's life.
+            let ring = unsafe { slice::from_raw_parts(ring_base, ring_bytes) };
             let word_at = |p: usize| -> u16 {
-                let p = p % dma_bytes;
+                let p = p % ring_bytes;
                 u16::from_le_bytes([ring[p], ring[p + 1]])
             };
             let mut chunk = [0u8; 512];
@@ -2794,14 +3046,37 @@ unsafe extern "C" fn asoc_pcm_copy(
 /// Called by ASoC on this driver's registered component, with live
 /// arguments belonging to one of its links.
 unsafe extern "C" fn asoc_pcm_trigger(
-    _component: *mut bindings::snd_soc_component,
+    component: *mut bindings::snd_soc_component,
     substream: *mut bindings::snd_pcm_substream,
     cmd: i32,
 ) -> i32 {
     // SAFETY: ASoC hands its ops a live substream whose private data is the
     // `snd_soc_pcm_runtime` of one of this component's links.
-    if unsafe { rtd_is_be(substream_rtd(substream)) } {
+    let rtd = unsafe { substream_rtd(substream) };
+    // SAFETY: as above.
+    if unsafe { rtd_is_be(rtd) } {
         return 0;
+    }
+    // SAFETY: the component is ours and live for the call; rtd as above.
+    let data = unsafe { component_data(component) };
+    if data.hw.sense_channels > 0 && unsafe { fe_index(rtd) } == Some(FE_SENSE) {
+        // The capture reads the drain's ring from here on, or stops.
+        return match cmd as u32 {
+            bindings::SNDRV_PCM_TRIGGER_START
+            | bindings::SNDRV_PCM_TRIGGER_RESUME
+            | bindings::SNDRV_PCM_TRIGGER_PAUSE_RELEASE => {
+                data.sense_start_pos.store(data.sense_ring_pos.load(core::sync::atomic::Ordering::Relaxed), core::sync::atomic::Ordering::Relaxed);
+                data.sense_sub.store(substream, core::sync::atomic::Ordering::Relaxed);
+                0
+            }
+            bindings::SNDRV_PCM_TRIGGER_STOP
+            | bindings::SNDRV_PCM_TRIGGER_SUSPEND
+            | bindings::SNDRV_PCM_TRIGGER_PAUSE_PUSH => {
+                data.sense_sub.store(ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
+                0
+            }
+            _ => EINVAL.to_errno(),
+        };
     }
     // SAFETY: the substream is live and its dmaengine runtime was set up by
     // `snd_dmaengine_pcm_open` in `asoc_pcm_open`.
@@ -2817,12 +3092,21 @@ unsafe extern "C" fn asoc_pcm_trigger(
 /// Called by ASoC on this driver's registered component, with live
 /// arguments belonging to one of its links.
 unsafe extern "C" fn asoc_pcm_sync_stop(
-    _component: *mut bindings::snd_soc_component,
+    component: *mut bindings::snd_soc_component,
     substream: *mut bindings::snd_pcm_substream,
 ) -> i32 {
     // SAFETY: ASoC hands its ops a live substream whose private data is the
     // `snd_soc_pcm_runtime` of one of this component's links.
-    if unsafe { rtd_is_be(substream_rtd(substream)) } {
+    let rtd = unsafe { substream_rtd(substream) };
+    // SAFETY: as above.
+    if unsafe { rtd_is_be(rtd) } {
+        return 0;
+    }
+    // SAFETY: the component is ours and live for the call; rtd as above.
+    if unsafe { component_data(component) }.hw.sense_channels > 0
+        && unsafe { fe_index(rtd) } == Some(FE_SENSE)
+    {
+        // No DMA of its own to synchronize.
         return 0;
     }
     // SAFETY: the substream is live and its dmaengine runtime was set up by
@@ -2835,14 +3119,30 @@ unsafe extern "C" fn asoc_pcm_sync_stop(
 /// Called by ASoC on this driver's registered component, with live
 /// arguments belonging to one of its links.
 unsafe extern "C" fn asoc_pcm_pointer(
-    _component: *mut bindings::snd_soc_component,
+    component: *mut bindings::snd_soc_component,
     substream: *mut bindings::snd_pcm_substream,
 ) -> bindings::snd_pcm_uframes_t {
     // SAFETY: ASoC hands its ops a live substream whose private data is the
     // `snd_soc_pcm_runtime` of one of this component's links.
-    if unsafe { rtd_is_be(substream_rtd(substream)) } {
+    let rtd = unsafe { substream_rtd(substream) };
+    // SAFETY: as above.
+    if unsafe { rtd_is_be(rtd) } {
         // -ENOTSUPP as the pointer callback returns it (mca does the same).
         return (-i64::from(bindings::ENOTSUPP)) as bindings::snd_pcm_uframes_t;
+    }
+    // SAFETY: the component is ours and live for the call; rtd as above.
+    let data = unsafe { component_data(component) };
+    if data.hw.sense_channels > 0 && unsafe { fe_index(rtd) } == Some(FE_SENSE) {
+        // Frames the drain has produced since the capture's start, in the
+        // capture's buffer.
+        let produced = data.sense_ring_pos.load(core::sync::atomic::Ordering::Relaxed).wrapping_sub(data.sense_start_pos.load(core::sync::atomic::Ordering::Relaxed));
+        let frame_bytes = u64::from(data.hw.sense_channels) * 2;
+        // SAFETY: the substream's runtime exists for the op's duration.
+        let buffer = unsafe { (*(*substream).runtime).buffer_size } as u64;
+        if buffer == 0 {
+            return 0;
+        }
+        return ((produced / frame_bytes) % buffer) as bindings::snd_pcm_uframes_t;
     }
     // SAFETY: the substream is live and its dmaengine runtime was set up by
     // `snd_dmaengine_pcm_open` in `asoc_pcm_open`.
@@ -3042,10 +3342,8 @@ unsafe extern "C" fn spkr_dai_prepare(
     }
 }
 
-/// Atomic context: queue the sleeping start, or note the stop.  The V/I
-/// sense capture (T6050) queues the same work on both, so the speaker
-/// service stops with it and starts again with it; a tap without sense
-/// needs nothing here.
+/// Atomic context: queue the sleeping start or stop of the speaker service
+/// with the playback trigger. The capture side needs nothing here.
 ///
 /// # Safety
 ///
@@ -3059,21 +3357,17 @@ unsafe extern "C" fn spkr_dai_trigger(
     // SAFETY: ASoC calls DAI ops with a DAI of our registered component.
     let context = unsafe { dai_context(dai) };
     // SAFETY: the substream is live for the duration of the op.
-    let playback = unsafe { substream_is_playback(substream) };
-    if !playback && context.data.hw.sense_channels == 0 {
+    if !unsafe { substream_is_playback(substream) } {
+        // The capture's DMA is ALSA's; the service follows playback.
         return 0;
     }
-    let flag = if playback {
-        &context.data.spkr_want_run
-    } else {
-        &context.data.sense_run
-    };
+    let flag = &context.data.spkr_want_run;
     match cmd as u32 {
         bindings::SNDRV_PCM_TRIGGER_START
         | bindings::SNDRV_PCM_TRIGGER_RESUME
         | bindings::SNDRV_PCM_TRIGGER_PAUSE_RELEASE => {
             flag.store(true, Relaxed);
-            // Err = already queued: the pending run will see the flags.
+            // Err = already queued: the pending run will see the flag.
             let _ = workqueue::system_dfl().enqueue::<_, SPKR_START_WORK>(context.data.clone());
             0
         }
@@ -3081,9 +3375,7 @@ unsafe extern "C" fn spkr_dai_trigger(
         | bindings::SNDRV_PCM_TRIGGER_SUSPEND
         | bindings::SNDRV_PCM_TRIGGER_PAUSE_PUSH => {
             flag.store(false, Relaxed);
-            if !playback {
-                let _ = workqueue::system_dfl().enqueue::<_, SPKR_START_WORK>(context.data.clone());
-            }
+            let _ = workqueue::system_dfl().enqueue::<_, SPKR_START_WORK>(context.data.clone());
             0
         }
         _ => EINVAL.to_errno(),
@@ -3618,6 +3910,26 @@ impl SndSocT8140AopDriver {
                 )
             };
         }
+        {
+            let _guard = self.data.spkr_lock.lock();
+            self.data.sense_drain_disarm();
+        }
+        let chan = self.data.sense_chan.swap(ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
+        if !chan.is_null() {
+            // SAFETY: requested and the buffer allocated in `sense_chan`; no
+            // stream uses either now.
+            unsafe {
+                let dev = (*(*chan).device).dev;
+                bindings::dma_release_channel(chan);
+                bindings::dma_free_attrs(
+                    dev,
+                    SENSE_DRAIN_BYTES,
+                    self.data.sense_drain_cpu.load(core::sync::atomic::Ordering::Relaxed),
+                    self.data.sense_drain_dma.load(core::sync::atomic::Ordering::Relaxed),
+                    0,
+                );
+            }
+        }
         self.data.flush_spkr_start();
         self.data.flush_hpai_start();
         if !self.card.is_null() {
@@ -3836,7 +4148,14 @@ impl platform::Driver for SndSocT8140AopDriver {
                 pd_rx0,
                 spkr_want_run: AtomicFlag::new(false),
                 hpai_want_run: AtomicFlag::new(false),
-                sense_run: AtomicFlag::new(false),
+                sense_ring_pos: core::sync::atomic::AtomicU64::new(0),
+                sense_arm_base: core::sync::atomic::AtomicU64::new(0),
+                sense_start_pos: core::sync::atomic::AtomicU64::new(0),
+                sense_sub: core::sync::atomic::AtomicPtr::new(ptr::null_mut()),
+                sense_chan: core::sync::atomic::AtomicPtr::new(ptr::null_mut()),
+                sense_drain_cpu: core::sync::atomic::AtomicPtr::new(ptr::null_mut()),
+                sense_drain_dma: core::sync::atomic::AtomicU64::new(0),
+                sense_drain_running: AtomicFlag::new(false),
                 spkr_lock <- new_mutex!(()),
                 spkr_volume: Atomic::new(SPKR_VOLUME_MAX),
                 spkr_start_work <- new_work!("SndSocT8140AopData::spkr_start_work"),
