@@ -278,8 +278,14 @@
 		aop_audio: audio {
 			compatible = "apple,t6050-aop-audio";
 			dmas = <&admac_base_ns 0>, <&admac_base_ns 1>,
-			       <&admac_base_ns 4>, <&admac_base_ns 5>;
-			dma-names = "spkr", "spkr-sense", "cout", "cin";
+			       <&admac_base_ns 4>, <&admac_base_ns 5>,
+			       <&admac_leap_s 1>;
+			/*
+			 * "hpai" is the microphone array: the ADT routes
+			 * audio-hp-mic to leap-s-adma-rx-0, Linux channel 1 of
+			 * the LEAP-S ADMAC (even channels transmit, odd receive).
+			 */
+			dma-names = "spkr", "spkr-sense", "cout", "cin", "hpai";
 			#sound-dai-cells = <1>;
 		};
 	};
@@ -292,6 +298,26 @@
 				      <0>, <0>, <0>;
 		#dma-cells = <1>;
 		iommus = <&aop_dart 8>;
+		apple,dma-range = <0x110 0x0 0x0 0x10000000>;
+		status = "disabled";
+	};
+
+	/*
+	 * The LEAP-S ADMAC through its non-secure proxy aperture: ADT
+	 * /arm-io/admac-hp-mic-ec-proxy at 0x2d3200000 = admac-leap-s
+	 * 0x293200000 + 1 GiB, the T8140 pattern (its admac_leap_s sits at
+	 * 0x353200000 = 0x313200000 + 1 GiB). dart-aop stream 11. The AOP
+	 * firmware owns the LEAP fabric: no resets and no AP power domains;
+	 * the hpai service's pw0 raises it before a channel is requested.
+	 */
+	admac_leap_s: dma-controller@2d3200000 {
+		compatible = "apple,t6050-admac", "apple,t8140-admac";
+		reg = <0x2 0xd3200000 0x0 0x34000>;
+		dma-channels = <9>;
+		interrupts-extended = <&aic AIC_IRQ 638 IRQ_TYPE_LEVEL_HIGH>,
+				      <0>, <0>, <0>;
+		#dma-cells = <1>;
+		iommus = <&aop_dart 11>;
 		apple,dma-range = <0x110 0x0 0x0 0x10000000>;
 		status = "disabled";
 	};

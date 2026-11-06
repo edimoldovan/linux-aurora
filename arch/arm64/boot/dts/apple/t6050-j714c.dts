@@ -302,6 +302,10 @@
 	status = "okay";
 };
 
+&admac_leap_s {
+	status = "okay";
+};
+
 / {
 	sound: sound {
 		compatible = "apple,j714-macaudio", "apple,macaudio";
