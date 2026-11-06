@@ -1191,12 +1191,30 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8140 = {
 	.fast_die_lanes = 2,
 };
 
+/*
+ * T6050, from the J714c ADT ptd-range: SOC-DEV-PS-REQ at PTD index 0x1e0
+ * (read 0x1e00, update 0x10000 + 0xf00), SOC-DEV-PS-ACK at 0x1e8 (0x1e80),
+ * PMP-STATUS at 0x1 (0x10). soc-device records are in ID order, as on T6030.
+ */
+static const struct apple_pmp_report_offsets apple_pmp_offsets_t6050 = {
+	.tgt_read = 0x1e00,
+	.tgt_write = 0x10f00,
+	.actual = 0x1e80,
+	.status = 0x10,
+	.starts_pmp = true,
+	.name = "T6050",
+	.fallback = "initcall_blacklist=__asahi_init",
+	.pwrstate = "apple,t6050-pmgr-pwrstate",
+	.devices_ordered = true,
+};
+
 static const struct of_device_id apple_pmp_report_of_match[] = {
 	{ .compatible = "apple,j613-25g83-pmp-report", .data = &apple_pmp_offsets_j613_25g83 },
 	{ .compatible = "apple,t6000-pmp-v2-report", .data = &apple_pmp_offsets_t600x },
 	{ .compatible = "apple,t6020-pmp-v2-report", .data = &apple_pmp_offsets_t602x },
 	{ .compatible = "apple,t6030-pmp-v2-report", .data = &apple_pmp_offsets_t6030 },
 	{ .compatible = "apple,t6031-pmp-v2-report", .data = &apple_pmp_offsets_t6031 },
+	{ .compatible = "apple,t6050-pmp-v2-report", .data = &apple_pmp_offsets_t6050 },
 	{ .compatible = "apple,t8112-pmp-v2-report", .data = &apple_pmp_offsets_t8112 },
 	{ .compatible = "apple,t8122-pmp-v2-report", .data = &apple_pmp_offsets_t8122 },
 	{ .compatible = "apple,t8140-pmp-v2-report", .data = &apple_pmp_offsets_t8140 },
