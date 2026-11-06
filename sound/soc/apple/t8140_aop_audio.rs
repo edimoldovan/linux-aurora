@@ -1943,6 +1943,9 @@ const FE_DMA_NAMES: [[Option<&core::ffi::CStr>; 2]; FE_COUNT] = [
 /// The front-end that plays the internal speaker (j700-pcm-1, the card's
 /// "Secondary" PCM): its data goes through `spkr_copy` below.
 const FE_SPKR: usize = 1;
+/// The front-end that captures the speaker tap or, on T6050, the amplifiers'
+/// V/I sense return (j7xx-pcm-2, the card's "Speaker Sense" PCM).
+const FE_SENSE: usize = 2;
 
 /// Digital ceiling of the speaker path, as a Q31 gain applied to every
 /// sample userspace writes: 0.5, the amplifier's full scale.
@@ -2118,6 +2121,9 @@ unsafe extern "C" fn asoc_pcm_open(
         return ENODEV.to_errno();
     };
     let leap = fe == FE_SPKR && data.hw.spkr_leap;
+    // The sense return goes through `asoc_pcm_copy`, which re-aligns its
+    // words: readers must not map the ring (T6050).
+    let sense_copy = !playback && fe == FE_SENSE && data.hw.sense_channels > 0;
     if leap {
         if let Err(e) = data.power_up_raising(data.spkr.name, &data.spkr_domains()) {
             return e.to_errno();
@@ -2165,6 +2171,9 @@ unsafe extern "C" fn asoc_pcm_open(
         hw.buffer_bytes_max = SPKR_BUFFER_MAX;
         hw.periods_max = (SPKR_BUFFER_MAX / PCM_PERIOD_BYTES_MIN) as u32;
         formats = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S32_LE;
+    }
+    if sense_copy {
+        hw.info = bindings::SNDRV_PCM_INFO_INTERLEAVED;
     }
     let ret = pcm_open_dmaengine(substream, chan, hw, formats);
     if ret < 0 {
@@ -2352,6 +2361,45 @@ unsafe extern "C" fn asoc_pcm_copy(
     if !playback {
         // SAFETY: ALSA hands us a live iov_iter for the whole call.
         let iov = unsafe { kernel::iov::IovIterDest::from_raw(iter) };
+        // SAFETY: the component is ours and live for the call.
+        let data = unsafe { component_data(component) };
+        // SAFETY: rtd is live for the call.
+        if data.hw.sense_channels > 0 && unsafe { fe_index(rtd) } == Some(FE_SENSE) {
+            // J714c: the serializer samples the amplifiers' sense words one
+            // BCLK early (the TAS2764 puts SDOUT one clock after the frame
+            // edge, and offset 0 mutes the right-side amplifiers on this
+            // board), so each 16-bit word arrives as its own bits 14..0
+            // followed by the next word's bit 15. Re-slice the stream one bit
+            // later: word k = (w[k] << 1) | (w[k+1] >> 15), the successor
+            // taken from the ring, which wraps. The last word of a read takes
+            // its bit 0 from the slot after the read, which the DMA may not
+            // have written yet: one LSB per read, below the sense noise.
+            if bytes & 1 != 0 || dma_bytes & 1 != 0 || dma_bytes == 0 {
+                return EINVAL.to_errno();
+            }
+            // SAFETY: the DMA area holds dma_bytes bytes for the stream's life.
+            let ring = unsafe { slice::from_raw_parts(area, dma_bytes) };
+            let word_at = |p: usize| -> u16 {
+                let p = p % dma_bytes;
+                u16::from_le_bytes([ring[p], ring[p + 1]])
+            };
+            let mut chunk = [0u8; 512];
+            let mut off = 0;
+            while off < bytes {
+                let n = core::cmp::min(chunk.len(), bytes - off) & !1;
+                for i in (0..n).step_by(2) {
+                    let w = word_at(pos + off + i);
+                    let next = word_at(pos + off + i + 2);
+                    let v = (w << 1) | (next >> 15);
+                    chunk[i..i + 2].copy_from_slice(&v.to_le_bytes());
+                }
+                if iov.copy_to_iter(&chunk[..n]) != n {
+                    return EFAULT.to_errno();
+                }
+                off += n;
+            }
+            return 0;
+        }
         return if iov.copy_to_iter(dst) == bytes {
             0
         } else {
@@ -2360,8 +2408,10 @@ unsafe extern "C" fn asoc_pcm_copy(
     }
     // SAFETY: as above.
     let iov = unsafe { kernel::iov::IovIterSource::from_raw(iter) };
-    // SAFETY: as for `rtd_is_be`.
-    if unsafe { fe_index(rtd) } != Some(FE_SPKR) {
+    // SAFETY: the component is ours and live for the call.
+    let leap_spkr = unsafe { fe_index(rtd) } == Some(FE_SPKR)
+        && unsafe { component_data(component) }.hw.spkr_leap;
+    if !leap_spkr {
         return if iov.copy_from_iter(dst) == bytes {
             0
         } else {
@@ -2898,7 +2948,11 @@ impl AsocContext {
             trigger: Some(asoc_pcm_trigger),
             sync_stop: Some(asoc_pcm_sync_stop),
             pointer: Some(asoc_pcm_pointer),
-            copy: if data.hw.spkr_leap { Some(asoc_pcm_copy) } else { None },
+            copy: if data.hw.spkr_leap || data.hw.sense_channels > 0 {
+                Some(asoc_pcm_copy)
+            } else {
+                None
+            },
             ..Default::default()
         };
         Ok(KBox::new(
