@@ -44,12 +44,11 @@
 		#iommu-cells = <1>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 371 IRQ_TYPE_LEVEL_HIGH>;
-		/* rtkit host buffers (syslog/crashlog shmem) must land in this DART
-		 * window at 1 TiB (dart-pmp0 ADT vm-base/vm-size); start 16 MiB above
-		 * the base so allocations clear the firmware's inherited __ETEXT
-		 * mapping at 0x10000000000. Pairs with the 42-bit DMA mask the pmp
-		 * driver sets for t6050. Mirrors t8140's pmp_dart. */
-		apple,dma-range = /bits/ 64 <0x10001000000 0xfff000000>;
+		/* Full dart-pmp0 window at 1 TiB (ADT vm-base/vm-size). The firmware's
+		 * __ETEXT at the window base is re-created as an IOMMU_RESV_DIRECT region
+		 * (see &pmp_fw); the iommu core reserves that in the allocator, so rtkit
+		 * buffers never land on it. Pairs with the 42-bit DMA mask. */
+		apple,dma-range = /bits/ 64 <0x10000000000 0x1000000000>;
 		status = "okay";
 	};
 
@@ -62,6 +61,7 @@
 		mboxes = <&pmp_mbox>;
 		mbox-names = "mbox";
 		iommus = <&pmp_dart 0>;
+		memory-region = <&pmp_fw>;
 		apple,board-id = <0xa>;
 		apple,dram-vendor-id = <0xff>;
 		status = "okay";
@@ -82,5 +82,23 @@
 / {
 	aliases {
 		pmp0 = &pmp_dart;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/* The PMP firmware's __ETEXT lives in DRAM at phys 0x10001eb4000, which
+		 * iBoot maps at IOVA 0x10000000000. The kernel's fresh dart-pmp0 page
+		 * table drops that mapping (iommu_iova_to_phys reads 0x0), so the
+		 * firmware cannot reach its own code to finish powering on. Re-create it
+		 * as an IOMMU_RESV_DIRECT mapping on the pmp device and keep Linux off
+		 * the DRAM page (no-map); phys is unreserved RAM otherwise. */
+		pmp_fw: pmp-fw@10001eb4000 {
+			reg = <0x100 0x01eb4000 0x0 0x12000>;
+			no-map;
+			iommu-addresses = <&pmp 0x100 0x0 0x0 0x12000>;
+		};
 	};
 };
