@@ -1865,28 +1865,26 @@ struct macaudio_platform_cfg macaudio_j493_cfg = {
  * MacBook Pro (14-inch, M5 Max), AID40. Same amps and layout as j314/j316
  * (6x SN012776 on i2c1/i2c3 at 0x38-0x3d, 2W+1T per side, sense slots in
  * ADT order), new chassis and acoustic ID: the speaker thermal model is
- * not validated. Speakers stay off unless please_blow_up_my_speakers=1,
- * the amp gain is held below the ADT value (15) and the unlocked volume
- * is capped at -30 dB until a speakersafetyd profile is validated.
+ * not validated. As on j314/j316, the amp gain is the ADT value (15) and
+ * the unlocked volume has no ceiling: speakersafetyd's j714 profile, with
+ * thermal limits more conservative than j316's, protects the speakers.
  */
 struct macaudio_platform_cfg macaudio_j714_cfg = {
 	/*
 	 * Speakers on with speakersafetyd's j714 profile (bring-up values:
-	 * J716-conservative thermal limits); the kernel keeps the unlocked
-	 * ceiling at max_vol until that profile is validated.
+	 * J716-conservative thermal limits).
 	 */
 	.enable_speakers = true,
 	.amp = AMP_SN012776,
 	.speakers = SPKR_2W1T,
 	.stereo = true,
-	.amp_gain = 10,
+	.amp_gain = 15,
 	/*
-	 * Locked (no speakersafetyd holding the controls) and unlocked limits
-	 * both at the bring-up ceiling: the volume never rises above it,
-	 * whichever state the daemon leaves the card in.
+	 * Locked (no speakersafetyd holding the controls): -30 dB. Unlocked,
+	 * with the daemon modelling the voice coils: no ceiling, as j314/j316.
 	 */
 	.safe_vol = -30,
-	.max_vol = -30,
+	.max_vol = 0,
 	/*
 	 * The AOP's audio streams (t8140_aop_audio, T6050 variant) instead
 	 * of the MCA: the jack's serializer runs 2 x 32-bit frames.
