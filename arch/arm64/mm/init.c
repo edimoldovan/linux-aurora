@@ -341,6 +341,8 @@ void __init arch_mm_preinit(void)
 	unsigned int flags = SWIOTLB_VERBOSE;
 	bool swiotlb = max_pfn > PFN_DOWN(arm64_dma_phys_limit);
 
+	ctxr_exec_keep_reserved();
+
 	if (is_realm_world()) {
 		swiotlb = true;
 		flags |= SWIOTLB_FORCE;
