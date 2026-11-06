@@ -42,6 +42,7 @@
 #include <asm/cpu.h>
 #include <asm/cputype.h>
 #include <asm/cpu_ops.h>
+#include <asm/ctxr_execmem.h>
 #include <asm/daifflags.h>
 #include <asm/kvm_mmu.h>
 #include <asm/mmu_context.h>
@@ -793,6 +794,10 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
 	 * secondary CPUs present.
 	 */
 	if (max_cpus == 0)
+		return;
+
+	/* Leave CPUs confined to an unusable CTXR window in the bootloader. */
+	if (ctxr_exec_secondaries_held())
 		return;
 
 	/*
