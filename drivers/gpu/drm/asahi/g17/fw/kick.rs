@@ -355,6 +355,9 @@ pub(crate) struct KickArgs<'a> {
     /// queue. A queue's first kick names `timestamp.prev()` on render queues
     /// and [`KickTimestamp::ZERO`] on compute queues.
     pub(crate) parent: KickTimestamp,
+    /// The entry lists `parent`. macOS (AGXG17X encodeDependencyList) lists it on
+    /// every compute kick; on a queue's first kick it names the stamp before the kick.
+    pub(crate) implicit_parent: bool,
     /// Kicks of other queues this kick must wait for.
     pub(crate) barriers: &'a [KickDependency],
     /// GPU address of the work descriptor (firmware alias).
@@ -404,7 +407,10 @@ pub(crate) struct KickEntry {
     pub(crate) register_arrays: [u64; 4],
     pub(crate) unk_170: u64,
     pub(crate) unk_178: u64,
-    pub(crate) pad_180: [u8; KICK_ENTRY_STRIDE - 0x180],
+    /// Type of each listed dependency, two bits each; 1 for every barrier and
+    /// the implicit parent (AGXG17X encodeDependencyList).
+    pub(crate) dependency_types: u64,
+    pub(crate) pad_188: [u8; KICK_ENTRY_STRIDE - 0x188],
 }
 
 static_assert!(size_of::<KickEntry>() == KICK_ENTRY_STRIDE);
@@ -461,12 +467,15 @@ impl KickEntry {
         for (slot, barrier) in dependencies.iter_mut().zip(args.barriers) {
             *slot = barrier.word();
         }
-        dependencies[barriers] = KickDependency {
-            qid: args.qid,
-            timestamp: args.parent,
+        let mut count = barriers;
+        if args.implicit_parent {
+            dependencies[barriers] = KickDependency {
+                qid: args.qid,
+                timestamp: args.parent,
+            }
+            .word();
+            count += 1;
         }
-        .word();
-        let count = barriers + 1;
         let mask = if count == KICK_DEPENDENCIES {
             u32::MAX
         } else {
@@ -488,7 +497,8 @@ impl KickEntry {
             register_arrays: args.register_arrays.map(RegisterArrayBinding::word),
             unk_170: 0,
             unk_178: Self::UNK_178,
-            pad_180: [0; KICK_ENTRY_STRIDE - 0x180],
+            dependency_types: (0..count).fold(0u64, |types, index| types | 1 << (2 * index)),
+            pad_188: [0; KICK_ENTRY_STRIDE - 0x188],
         })
     }
 }

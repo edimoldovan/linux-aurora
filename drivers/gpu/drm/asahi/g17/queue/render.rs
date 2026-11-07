@@ -596,6 +596,8 @@ impl Pair {
             qid: qids[stage],
             timestamp: kicks[stage],
             parent: parents[stage],
+            // Render keeps its parent on the first kick; not yet checked against AGXG17X.
+            implicit_parent: true,
             barriers,
             descriptor_va: self.memory.graph.descriptor_va(stage, ordinal),
             queue_va: queues[stage],
