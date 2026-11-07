@@ -2,8 +2,9 @@
 /*
  * T6050 power management processor (PMP) and its DART, mailbox and report.
  *
- * The PMP powers the GPU `cs` domain (notify_pmp): the asahi g17 driver takes an
- * apple-pmp vote for it, as the g15 driver does on T6030 (apple_pmp_set_device_power).
+ * The ADT marks the PMGR gfx state notify_pmp (id 16): the GPU votes through
+ * the PTD request for soc-device 0x10 ("GFX_", acknowledged), the pmp-gfx
+ * report entry below, not through T6030's apple_pmp_set_device_power().
  *
  * Addresses from the J714c ADT (read offline from j714c.adt):
  *   /arm-io/pmp0 (iop,ascwrap-v6): reg[0] asc 0x284e00000+0x88000 (CPU_CONTROL at +0x44,
@@ -12,15 +13,15 @@
  *   /arm-io/dart-pmp0 (dart,t8110): 0x2841a0000+0xc000, DAPF 0x2841b0000, AIC 371.
  * Conventions mirror the AOP/MTP ascwrap-v6 coprocessors in t6050-die0.dtsi.
  *
- * Kept status="disabled": enabling the PMP is deliberate and has preconditions —
- *  (1) the m1n1 dart-pmp0 DAPF entry must be resident, or pmp.rs faults on the
- *      closed ASC window (the probe wedge seen in bring-up);
- *  (2) pmp-report.c needs a T6050 report-offsets + "apple,t6050-pmp-v2-report" match
- *      (the driver stops at t6031/t8122/t8140 today);
- *  (3) the PMP needs the ~150 per-mac apple,tunable-* plus apple,tunable-soc-device
- *      and apple,tunable-ptd-range (and apple,dram-capacity / apple,pio-ranges) from
- *      the ADT iop-pmp0-nub, injected separately (generated from the ADT, or by m1n1).
- * Enable the four nodes (and add the data above) for the GPU test boot.
+ * The pmp node stays status="disabled": pmp-report.c (starts_pmp on T6050) takes the
+ * start over only from a disabled node. Its always-on entries seed SoC-device power
+ * requests in the PTD (DISPINT, ANS); the start then checks the halted PMP CPU, the
+ * SRAM image UUID and boot arguments, and the seeded PTD, and only then enables this
+ * node for pmp.rs to run the firmware. The start is queued by the first
+ * apple_pmp_report_wait_ready() caller. Preconditions: the m1n1 dart-pmp0 DAPF entry
+ * must be resident, or pmp.rs faults on the closed ASC window; the per-mac
+ * apple,tunable-* (tunable-uuid, tunable-soc-device, tunable-ptd-range) come from the
+ * ADT iop-pmp0-nub (t6050-j714c-pmp-tunables.dtsi).
  */
 
 &soc {
@@ -64,19 +65,119 @@
 		memory-region = <&pmp_fw>;
 		apple,board-id = <0xa>;
 		apple,dram-vendor-id = <0xff>;
-		status = "okay";
+		/* ADT /arm-io/pmgr pmc and pmc-pmgr, iop-pmp0-nub soc-chip-variant */
+		apple,pmc = <1>;
+		apple,pmc-pmgr = <0x3f>;
+		apple,soc-chip-variant = <1>;
+		/* Asked for by the firmware but not in the ADT nub: values from macOS's
+		 * ApplePMPv2 (ioreg). macOS has no pmc-max-bwr-latency-us either. */
+		apple,tunable-ane-af-bw-dvfs-filter = [ff ff ff ff];
+		apple,tunable-ane-dcs-bw-dvfs-filter = [ff ff ff ff];
+		apple,tunable-ane-lnk0-af-bw-dvfs-filter = [ff ff ff ff];
+		apple,tunable-ane-lnk0-af-bw-enable = [01 00 00 00];
+		apple,tunable-ane-lnk1-af-bw-dvfs-filter = [ff ff ff ff];
+		apple,tunable-ane-lnk1-af-bw-enable = [01 00 00 00];
+		apple,tunable-tuning-version = [00 00 00 00];
+		apple,tunable-fast-die-ctrl-loop = [01 00 00 00 00 00 00 00 00 00 00 00 8f 02 00 00
+			00 00 01 00 00 00 6e 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 01 00
+			16 00 00 00 01 00 00 00 02 00 00 00 03 00 00 00
+			04 00 00 00 05 00 00 00 06 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 61 6e 65 30 00 00 00 00 00 00 00 00
+			00 00 00 00 02 00 00 00 00 00 00 00 01 00 00 00
+			3d 0a 00 00 00 00 04 00 00 00 6e 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 01 00 16 00 00 00 20 00 00 00 21 00 00 00
+			25 00 00 00 1e 00 00 00 1f 00 00 00 24 00 00 00
+			22 00 00 00 23 00 00 00 26 00 00 00 29 00 00 00
+			2a 00 00 00 2f 00 00 00 2b 00 00 00 2c 00 00 00
+			30 00 00 00 2d 00 00 00 2e 00 00 00 31 00 00 00
+			27 00 00 00 28 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 6d 61 63 63 30 00 00 00
+			00 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00
+			02 00 00 00 41 00 00 00 00 00 04 00 00 00 6e 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 01 00 16 00 00 00 09 00 00 00
+			0a 00 00 00 10 00 00 00 0d 00 00 00 0e 00 00 00
+			12 00 00 00 1a 00 00 00 1b 00 00 00 1d 00 00 00
+			18 00 00 00 19 00 00 00 1c 00 00 00 07 00 00 00
+			08 00 00 00 0f 00 00 00 0b 00 00 00 0c 00 00 00
+			11 00 00 00 13 00 00 00 14 00 00 00 15 00 00 00
+			16 00 00 00 17 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 70 61 63 63
+			00 00 00 00 00 00 00 00 00 00 00 00 04 00 00 00
+			00 00 00 00 03 00 00 00 3d 0a 00 00 00 00 04 00
+			00 00 6e 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 01 00 16 00 00 00
+			34 00 00 00 35 00 00 00 39 00 00 00 32 00 00 00
+			33 00 00 00 38 00 00 00 36 00 00 00 37 00 00 00
+			3a 00 00 00 3d 00 00 00 3e 00 00 00 43 00 00 00
+			3f 00 00 00 40 00 00 00 44 00 00 00 41 00 00 00
+			42 00 00 00 45 00 00 00 3b 00 00 00 3c 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			6d 61 63 63 31 00 00 00 00 00 00 00 00 00 00 00];
+		/* pmp-report enables this node once the PTD requests are seeded. */
+		status = "disabled";
 	};
 
 	pmp_report: pmp-report@284240000 {
-		/* pmp-report.c needs a T6050 match + offsets; see the header note. */
 		compatible = "apple,t6050-pmp-v2-report";
 		/* PTD read aperture + update page (ADT pmp0 reg[3] - 0x10000) */
 		reg = <0x2 0x84240000 0x0 0x14000>;
+		power-domains = <&ps_pms_sram>;
 		#address-cells = <1>;
 		#size-cells = <0>;
 		apple,pmp = <&pmp>;
 		status = "okay";
+
+		/* reg = soc-device record index (ADT id - 1); DISPINT is acknowledged at handover. */
+		pmp_report_dispint: report@12 {
+			compatible = "apple,t6050-pmp-v2-report-entry",
+				     "apple,t6000-pmp-v2-report-entry";
+			reg = <0x12>;
+			label = "pmp-dispint";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_disp_cpu>;
+			apple,always-on;
+		};
+
+		pmp_report_ans: report@24 {
+			compatible = "apple,t6050-pmp-v2-report-entry",
+				     "apple,t6000-pmp-v2-report-entry";
+			reg = <0x24>;
+			label = "pmp-ans";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_ans>;
+			apple,always-on;
+			/* Its soc-device record has no acknowledge flag (as on T6031). */
+			apple,no-ack;
+		};
+
+		/* The GPU's vote, behind the gfx power state. */
+		pmp_report_gfx: report@f {
+			compatible = "apple,t6050-pmp-v2-report-entry",
+				     "apple,t6000-pmp-v2-report-entry";
+			reg = <0xf>;
+			label = "pmp-gfx";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_gfx>;
+		};
 	};
+};
+
+&gpu {
+	power-domains = <&pmp_report_gfx>;
 };
 
 / {

@@ -51,6 +51,9 @@
  * @pwrstate: with @starts_pmp, the compatible of the SoC's PMGR power states
  * @devices_ordered: with @starts_pmp, soc-device record i holds device ID
  *	i + 1
+ * @start_at_probe: with @starts_pmp, start the PMP when the report probes, as
+ *	macOS starts it at boot, rather than on the first consumer's
+ *	apple_pmp_report_wait_ready()
  */
 struct apple_pmp_report_offsets {
 	u32 tgt_read;
@@ -64,6 +67,7 @@ struct apple_pmp_report_offsets {
 	const char *fallback;
 	const char *pwrstate;
 	bool devices_ordered;
+	bool start_at_probe;
 };
 
 struct apple_pmp_start;
@@ -461,6 +465,7 @@ static int apple_pmp_start_check_power(struct apple_pmp_report *rep)
 		const char *label = apple_pmp_start_domains[i].label;
 		struct device_node *np = apple_pmp_start_domain(rep, label);
 		struct regmap *regmap;
+		bool fw_owned;
 		u32 offset, val;
 		int ret;
 
@@ -471,6 +476,7 @@ static int apple_pmp_start_check_power(struct apple_pmp_report *rep)
 		}
 		ret = of_property_read_u32(np, "reg", &offset);
 		regmap = syscon_node_to_regmap(np->parent);
+		fw_owned = of_property_read_bool(np, "apple,firmware-owned");
 		of_node_put(np);
 		if (ret)
 			return ret;
@@ -485,8 +491,12 @@ static int apple_pmp_start_check_power(struct apple_pmp_report *rep)
 				rep->offsets->name, label, val);
 			return -EIO;
 		}
-		/* The PMGR power state driver applies the floor when it probes. */
-		if (apple_pmp_start_domains[i].floor &&
+		/*
+		 * The PMGR power state driver applies the floor when it probes. A
+		 * firmware-owned state takes no AP writes (T6050's DCP CPU SErrors),
+		 * so its floor is the firmware's.
+		 */
+		if (apple_pmp_start_domains[i].floor && !fw_owned &&
 		    FIELD_GET(APPLE_PMGR_PS_MIN, val) != APPLE_PMGR_PS_ACTIVE) {
 			dev_err(rep->dev, "%s PMP not started: the %s minimum state is not active (%#x)\n",
 				rep->offsets->name, label, val);
@@ -1057,6 +1067,50 @@ out:
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_wait_ready);
 
+/*
+ * With @start_at_probe, the start waits on the first always-on entry, off the
+ * probe path, since the wait blocks until that entry's request is acknowledged.
+ */
+struct apple_pmp_report_boot {
+	struct work_struct work;
+	struct device *dev;
+	struct device_node *entry;
+};
+
+static void apple_pmp_report_boot_work(struct work_struct *work)
+{
+	struct apple_pmp_report_boot *b =
+		container_of(work, struct apple_pmp_report_boot, work);
+	int ret = apple_pmp_report_wait_ready(b->entry, msecs_to_jiffies(30000));
+
+	if (ret)
+		dev_err(b->dev, "PMP start at probe failed: %d\n", ret);
+	of_node_put(b->entry);
+	kfree(b);
+}
+
+static void apple_pmp_report_boot(struct apple_pmp_report *rep, struct device_node *np)
+{
+	struct apple_pmp_report_boot *b;
+	struct device_node *child;
+
+	if (!rep->start || !rep->offsets->start_at_probe)
+		return;
+	for_each_available_child_of_node(np, child) {
+		if (!of_property_read_bool(child, "apple,always-on"))
+			continue;
+		b = kzalloc(sizeof(*b), GFP_KERNEL);
+		if (b) {
+			b->dev = rep->dev;
+			b->entry = of_node_get(child);
+			INIT_WORK(&b->work, apple_pmp_report_boot_work);
+			queue_work(system_dfl_long_wq, &b->work);
+		}
+		of_node_put(child);
+		return;
+	}
+}
+
 static int apple_pmp_report_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1102,6 +1156,7 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to create child devices\n");
 
+	apple_pmp_report_boot(rep, np);
 	return 0;
 }
 
@@ -1206,6 +1261,7 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6050 = {
 	.fallback = "initcall_blacklist=__asahi_init",
 	.pwrstate = "apple,t6050-pmgr-pwrstate",
 	.devices_ordered = true,
+	.start_at_probe = true,
 };
 
 static const struct of_device_id apple_pmp_report_of_match[] = {
