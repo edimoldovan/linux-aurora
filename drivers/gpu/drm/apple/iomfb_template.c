@@ -2840,7 +2840,8 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->clear = 1;
 	}
 
-	if (has_surface && (dcp->use_timestamps || dcp->vrr_enabled)) {
+	if (has_surface && (dcp->use_timestamps || dcp->vrr_enabled) &&
+	    !dcp->hw.swap_no_timestamps) {
 		u64 submit_timestamp = dcp->swap_submit_timestamp;
 		u64 timestamp = arch_timer_read_counter();
 

@@ -214,6 +214,11 @@ struct apple_dcp_hw_data {
 	 * starts.
 	 */
 	bool fw_27_3;
+	/*
+	 * The firmware reads swap timestamp 6 as the time to present at, in its
+	 * own clock rather than the AP's counter: leave the swap timestamps zero.
+	 */
+	bool swap_no_timestamps;
 };
 
 enum dcp_test_point {
