@@ -18,6 +18,17 @@
 		disp0_piodma = &disp0_piodma;
 	};
 
+	/*
+	 * The ADT gives no rate for it: macOS 27.2's DCP reads 810 MHz for
+	 * getClockFrequency(0) ("returned pixelClock = 810000000").
+	 */
+	clk_disp0: clock-disp0 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <810000000>;
+		clock-output-names = "clk_disp0";
+	};
+
 	display: display-subsystem {
 		compatible = "apple,t6050-display-subsystem", "apple,display-subsystem";
 		/* disp0_dart must be first since the loader locks it */
@@ -157,7 +168,8 @@
 		apple,bw-doorbell = <&pmgr_dcp 1 6>;
 		apple,iomfb-surfaces = <0 0 1 0>;
 		apple,firmware-compat = <27 0 0>;
-		apple,clock-ids;	/* ADT clock-ids: none */
+		clocks = <&clk_disp0>;
+		apple,clock-ids = <0>;
 		memory-region = <&dcp_fw_8>, <&dcp_fw_text>, <&dcp_fw_data>, <&dcp_fw_shared>,
 				<&dcp_fw_shared_rw>, <&dcp_fw_oslog>, <&dcp_fw_5>, <&dcp_fw_6>,
 				<&dcp_fw_7>, <&dcp_fw_9>;
