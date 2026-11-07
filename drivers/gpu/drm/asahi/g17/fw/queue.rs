@@ -574,8 +574,8 @@ impl KickAnnounce {
     }
 }
 
-/// Names the kick of a compute queue that precedes the announced one
-/// (tag 16).
+/// Names the announced kick of a compute queue (tag 16); the firmware then
+/// releases that kick's slot (AGXG17X trace: its stamp is the starting kick's).
 ///
 /// A record slot larger than this structure must be zero beyond it.
 #[repr(C, packed)]
@@ -585,8 +585,8 @@ pub(crate) struct KickPredecessor {
     pub(crate) tag: u32,
     /// Kicked queue.
     pub(crate) qid: u16,
-    /// Timestamp of the queue's kick preceding the announced one.
-    pub(crate) previous: u64,
+    /// Timestamp of the announced kick.
+    pub(crate) kick: u64,
     pub(crate) unk_0e: u32,
 }
 
@@ -595,16 +595,15 @@ static_assert!(size_of::<KickPredecessor>() == 0x12);
 impl KickPredecessor {
     const UNK_0E: u32 = 0xfe;
 
-    /// Names `previous` as the kick of queue `qid` preceding the announced
-    /// one.
-    pub(crate) fn new(qid: u8, previous: KickTimestamp) -> Result<Self> {
+    /// Names `kick`, the announced kick of queue `qid`.
+    pub(crate) fn new(qid: u8, kick: KickTimestamp) -> Result<Self> {
         if qid > QID_MAX {
             return Err(EINVAL);
         }
         Ok(Self {
             tag: CommandTag::KickPredecessor as u32,
             qid: qid as u16,
-            previous: previous.get(),
+            kick: kick.get(),
             unk_0e: Self::UNK_0E,
         })
     }
