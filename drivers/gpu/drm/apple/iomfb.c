@@ -718,6 +718,34 @@ static int iomfb_queue_command(struct apple_dcp *dcp, bool oob,
 	return ret;
 }
 
+/*
+ * Firmware 27.3 numbers these calls 50 or 51 higher than firmware 27.0, and
+ * set_create_DFB and vi_set_temperature_hint one higher (macOS 27.3's
+ * IOMobileGraphicsFamily-DCP).
+ */
+static void iomfb_tag_27_3(char *tag)
+{
+	static const char map[][2][5] = {
+		{ "A389", "A390" }, { "A390", "A391" }, { "A401", "A451" },
+		{ "A406", "A456" }, { "A408", "A458" }, { "A411", "A461" },
+		{ "A412", "A462" }, { "A413", "A463" }, { "A414", "A464" },
+		{ "A415", "A465" }, { "A423", "A473" }, { "A427", "A477" },
+		{ "A428", "A478" }, { "A450", "A500" }, { "A453", "A503" },
+		{ "A454", "A504" }, { "A458", "A508" }, { "A466", "A516" },
+		{ "A467", "A517" }, { "A475", "A526" }, { "A478", "A529" },
+		{ "A479", "A530" }, { "A483", "A534" }, { "A484", "A535" },
+		{ "A485", "A536" }, { "A487", "A538" }, { "A489", "A540" },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(map); i++) {
+		if (!memcmp(tag, map[i][0], 4)) {
+			memcpy(tag, map[i][1], 4);
+			return;
+		}
+	}
+}
+
 /* Call a DCP function given by a tag */
 static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 			     const struct dcp_method_entry *call, u32 in_len,
@@ -739,6 +767,8 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G &&
 	    call->tag_h17g[0])
 		memcpy(resolved.tag, call->tag_h17g, sizeof(resolved.tag));
+	if (dcp->hw.fw_27_3)
+		iomfb_tag_27_3(resolved.tag);
 	call = &resolved;
 
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);

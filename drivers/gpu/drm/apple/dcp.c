@@ -5207,6 +5207,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6050 = {
 	.num_dptx_ports = 0,
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
+	.fw_27_3 = true,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6050_dcpext = {

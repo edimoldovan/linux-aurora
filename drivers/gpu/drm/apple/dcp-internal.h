@@ -208,6 +208,12 @@ struct apple_dcp_hw_data {
 	 * (the T8122 dcpext), see dcp_fw_is_14_7().
 	 */
 	bool fw_14_7_endpoints;
+	/*
+	 * Firmware 27.3 (T6050): the IOMFB call tags of macOS 27.3's
+	 * IOMobileGraphicsFamily-DCP, its swap record and the endpoints macOS
+	 * starts.
+	 */
+	bool fw_27_3;
 };
 
 enum dcp_test_point {
