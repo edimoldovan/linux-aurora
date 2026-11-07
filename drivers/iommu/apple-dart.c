@@ -19,11 +19,14 @@
 #include <linux/delay.h>
 #include <linux/dev_printk.h>
 #include <linux/dma-mapping.h>
+#include <linux/dma-map-ops.h>
 #include <linux/err.h>
 #include <linux/interrupt.h>
 #include <linux/io-pgtable.h>
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
+#include <linux/ioport.h>
+#include <linux/kexec.h>
 #include <linux/minmax.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -38,7 +41,10 @@
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/tunable.h>
+#include <linux/string.h>
+#include <linux/suspend.h>
 #include <linux/swab.h>
+#include <linux/sysfs.h>
 #include <linux/types.h>
 
 #include "dma-iommu.h"
@@ -133,6 +139,8 @@
 #define DART_T8110_TLB_CMD_V2 BIT(15)
 #define DART_T8110_TLB_CMD_RANGE BIT(14)
 #define DART_T8110_TLB_CMD_STT BIT(13)
+/* A second TLB busy flag (bit 0), polled on the J713 external display DARTs */
+#define DART_T8110_TLB_BUSY2 0x604
 #define DART_T8110_TLB_START 0x98
 #define DART_T8110_TLB_END 0xa0
 #define DART_T8110_FLUSH_BUSY_TIMEOUT 2000
@@ -202,6 +210,7 @@
 				   ((idx) << 2))
 
 struct apple_dart_stream_map;
+struct apple_dart_dcp;
 
 enum dart_type {
 	DART_T8020,
@@ -254,6 +263,21 @@ struct apple_dart_fw_root {
 };
 
 /*
+ * The subtrees behind the slots firmware holds in a four-level locked root
+ * (fw_mirror), recorded when the root is mapped: per slot, the root entry and
+ * a mapping of its mid-level table, and per mid entry the entry and a mapping
+ * of its leaf table. Leaf entries are read live. A table entry that no longer
+ * matches what was recorded resolves nothing. Only lookups use it: Linux
+ * still never publishes into those slots.
+ */
+struct apple_dart_fw_tree {
+	u64 *entry;
+	u64 **mid;
+	u64 **mid_entry;
+	u64 ***leaf;
+};
+
+/*
  * Private structure associated with each DART device.
  *
  * @dev: device struct
@@ -293,6 +317,15 @@ struct apple_dart {
 	u32 power_retained : 1;
 	/* Locked roots may hold firmware slots that mirror Linux mappings. */
 	u32 fw_mirror : 1;
+	/*
+	 * fw_mirror's four-level locked roots hold firmware's own subtrees, which
+	 * are recorded and reserved (apple_dart_snapshot_fw_tree()). Set only for
+	 * apple,t6050-dart, where it was tested (the DCP's log and crash log). Before
+	 * widening it, check on T6041/T8140/T8142 whether any locked stream is
+	 * four-level and what its foreign slots hold: the reservation moves DMA
+	 * placement for every client of that stream.
+	 */
+	u32 fw_tree : 1;
 	u32 fw_handoff : 1;
 	u32 tunnel_state_saved : 1;
 	u32 tunnel_state_restored : 1;
@@ -301,6 +334,42 @@ struct apple_dart {
 	bool reset_incomplete;
 	struct apple_tunable *tunables;
 	u16 version;
+
+	/* J713 internal display DARTs, borrowed from the running DCP. */
+	struct apple_dart_dcp *dcp;
+	struct apple_dart_dcp *frontend[2];
+	/* The display coprocessor whose firmware DART (SID23) this is. */
+	const struct dcp_adt_instance *dcp_instance;
+	bool preserve_display;
+	/* A J713 external display DART, borrowed from its external DCP */
+	bool dispext;
+	/*
+	 * J713 external display DART: its power confirmation across
+	 * sleep, under dispext_pm_lock (a spinlock: only these fields, never
+	 * across a register access): unverified from suspend until a state
+	 * check at a D572(1) of the current generation, which every suspend
+	 * and resume moves on; sleeping between suspend and resume; and the
+	 * register uses in flight (apple_dart_dispext_get()), which an
+	 * invalidation waits for (dispext_wq).
+	 */
+	spinlock_t dispext_pm_lock;
+	bool dispext_unverified;
+	bool dispext_sleeping;
+	u64 dispext_gen;
+	unsigned int dispext_users;
+	wait_queue_head_t dispext_wq;
+	u32 dispext_protect, dispext_lock;	/* PROTECT and PROTECT_LOCK as adopted */
+	/* Retained radio/display state left in place across suspend-to-idle. */
+	bool s2idle_kept;
+	/* Resources reachable by a retained domain outlive device removal. */
+	bool retained;
+	bool retained_mtp;
+	/* Cold ANE owns SID0 only; all other streams remain inherited. */
+	bool cold_ane;
+	u16 managed_sids;
+	bool managed_failed;
+	/* Serialize owned TCR publication against IRQ quarantine. */
+	spinlock_t managed_lock;
 
 	DECLARE_BITMAP(remapped, DART_MAX_STREAMS);
 	u8 remap_target[DART_MAX_STREAMS];
@@ -320,13 +389,174 @@ struct apple_dart {
 	u64 *locked_owned[DART_MAX_STREAMS][DART_MAX_TTBR];
 	/* Leaf tables behind the root slots firmware held when we attached. */
 	struct apple_dart_fw_root *locked_fw[DART_MAX_STREAMS][DART_MAX_TTBR];
+	/* Firmware's subtrees in a four-level locked root (TTBR 0 only). */
+	struct apple_dart_fw_tree *locked_fw_tree[DART_MAX_STREAMS];
 	/*
 	 * First DVA of the window of the domain using each locked stream.  The
 	 * window can be the client's own (apple,dma-range on the client node)
 	 * rather than the DART's.
 	 */
 	u64 locked_window[DART_MAX_STREAMS];
+	/*
+	 * First error of a TLB invalidate that failed while retiring a locked
+	 * root, per stream. The hardware may still cache translations through
+	 * the retired page tables, so apple_dart_domain_free() keeps the page
+	 * tables of every domain on such a stream. It is never cleared: only
+	 * the hardware could show that the TLB no longer holds those entries.
+	 * The first error of each stream is logged.
+	 */
+	int locked_retire_err[DART_MAX_STREAMS];
 };
+
+#ifndef MODULE
+static struct kexec_blocker apple_dart_radio_kexec = {
+	.users = ATOMIC_INIT(0),
+	.reason = "Apple radio DMA has no qualified takeover/reset boundary",
+};
+#endif
+
+static int apple_dart_retain_radio(struct apple_dart *dart)
+{
+#ifndef MODULE
+	int ret = kexec_block(&apple_dart_radio_kexec);
+
+	if (ret)
+		return ret;
+	get_device(dart->dev);
+	WRITE_ONCE(dart->retained, true);
+	return 0;
+#else
+	return -EOPNOTSUPP;
+#endif
+}
+
+#if IS_ENABLED(CONFIG_APPLE_DART_J713_DCP)
+static struct kexec_blocker apple_dart_display_kexec = {
+	.users = ATOMIC_INIT(0),
+	.reason = "retained Apple display DART tables and firmware DMA",
+};
+#endif
+
+static void apple_dart_release(void *data)
+{
+	struct apple_dart *dart = data;
+
+	if (!READ_ONCE(dart->retained))
+		kfree(dart);
+}
+
+/*
+ * devres still removes IRQs, sysfs and registrations on unexpected removal.
+ * State and mappings reachable from pinned radio or display domains must survive it.
+ * Before publication these actions perform ordinary probe rollback.
+ */
+struct apple_dart_retained_resource {
+	struct apple_dart *dart;
+	void (*release)(void *ptr, resource_size_t size);
+	void *ptr;
+	resource_size_t size;
+};
+
+static void apple_dart_release_retained_resource(void *data)
+{
+	struct apple_dart_retained_resource *r = data;
+
+	if (!READ_ONCE(r->dart->retained))
+		r->release(r->ptr, r->size);
+	kfree(r);
+}
+
+static int apple_dart_manage_retained_resource(struct apple_dart *dart,
+		void *ptr, resource_size_t size,
+		void (*release)(void *, resource_size_t))
+{
+	struct apple_dart_retained_resource *r = kmalloc(sizeof(*r), GFP_KERNEL);
+
+	if (!r) {
+		release(ptr, size);
+		return -ENOMEM;
+	}
+	*r = (struct apple_dart_retained_resource) {
+		.dart = dart, .release = release, .ptr = ptr, .size = size,
+	};
+	return devm_add_action_or_reset(dart->dev,
+					apple_dart_release_retained_resource, r);
+}
+
+static void apple_dart_free_retained_memory(void *ptr, resource_size_t size)
+{
+	kfree(ptr);
+}
+
+static void *apple_dart_retained_alloc(struct apple_dart *dart, size_t size)
+{
+	void *ptr = kzalloc(size, GFP_KERNEL);
+
+	if (!ptr || apple_dart_manage_retained_resource(dart, ptr, size,
+						apple_dart_free_retained_memory))
+		return NULL;
+	return ptr;
+}
+
+static void apple_dart_unmap_retained_memory(void *ptr, resource_size_t size)
+{
+	memunmap(ptr);
+}
+
+static void *apple_dart_retained_memremap(struct apple_dart *dart,
+					phys_addr_t start, size_t size)
+{
+	void *ptr = memremap(start, size, MEMREMAP_WB);
+
+	if (!ptr || apple_dart_manage_retained_resource(dart, ptr, size,
+						apple_dart_unmap_retained_memory))
+		return ERR_PTR(-ENOMEM);
+	return ptr;
+}
+
+static void apple_dart_release_retained_region(void *ptr, resource_size_t size)
+{
+	struct resource *res = ptr;
+
+	release_mem_region(res->start, resource_size(res));
+}
+
+static int apple_dart_retained_request_region(struct apple_dart *dart,
+			resource_size_t start, resource_size_t size, const char *name)
+{
+	struct resource *res = request_mem_region(start, size, name);
+
+	if (!res)
+		return -EBUSY;
+	return apple_dart_manage_retained_resource(dart, res, size,
+						apple_dart_release_retained_region);
+}
+
+static void apple_dart_unmap_retained_mmio(void *ptr, resource_size_t size)
+{
+	iounmap((__force void __iomem *)ptr);
+}
+
+static void __iomem *apple_dart_retained_ioremap(struct apple_dart *dart,
+						struct resource *res)
+{
+	void __iomem *ptr;
+	int ret;
+
+	ret = apple_dart_retained_request_region(dart, res->start,
+						resource_size(res), dev_name(dart->dev));
+	if (ret)
+		return IOMEM_ERR_PTR(ret);
+	/* Match devm_ioremap_resource(): Apple SoC MMIO is non-posted. */
+	if (res->flags & IORESOURCE_MEM_NONPOSTED)
+		ptr = ioremap_np(res->start, resource_size(res));
+	else
+		ptr = ioremap(res->start, resource_size(res));
+	if (!ptr || apple_dart_manage_retained_resource(dart, (__force void *)ptr,
+				resource_size(res), apple_dart_unmap_retained_mmio))
+		return IOMEM_ERR_PTR(-ENOMEM);
+	return ptr;
+}
 
 /*
  * PCIe-C is a cable-powered aperture and can report a failed transaction as
@@ -417,6 +647,7 @@ struct apple_dart_atomic_stream_map {
  */
 struct apple_dart_domain {
 	struct io_pgtable_ops *pgtbl_ops;
+	struct apple_dart_dcp *dcp;
 
 	bool finalized;
 	bool has_dma_range;
@@ -469,6 +700,20 @@ struct apple_dart_master_cfg {
 
 static struct platform_driver apple_dart_driver;
 static const struct iommu_ops apple_dart_iommu_ops;
+static bool apple_dart_fault_pending(struct apple_dart *dart);
+
+/* READY bring-up only: userspace must arm its watchdog before probing SID23. */
+static bool apple_dart_dcp_enabled;
+module_param_named(j713_dcp, apple_dart_dcp_enabled, bool, 0600);
+MODULE_PARM_DESC(j713_dcp, "Enable explicit J713 DCP DART probe after arming watchdog");
+
+static bool apple_dart_frontend_enabled;
+module_param_named(j713_display, apple_dart_frontend_enabled, bool, 0600);
+MODULE_PARM_DESC(j713_display, "Enable explicit J713 display DART admission after arming watchdog");
+
+static int apple_dart_dcp_invalidate_tlb(struct apple_dart_stream_map *stream_map);
+
+#include "apple-dart-dcp.h"
 
 static struct apple_dart_domain *to_dart_domain(struct iommu_domain *dom)
 {
@@ -485,7 +730,8 @@ static struct apple_dart_domain *to_dart_domain(struct iommu_domain *dom)
  */
 static bool apple_dart_remaps_streams(struct apple_dart *dart)
 {
-	return dart->hw->enable_remap && !dart->tunneled && !dart->per_stream;
+	return dart->hw->enable_remap && !dart->tunneled &&
+	       !dart->per_stream && !dart->managed_sids;
 }
 
 static void
@@ -612,15 +858,22 @@ static bool apple_dart_fw_handoff_enabled(const struct apple_dart *dart)
 		handoff == 1;
 }
 
+/* A 16K table page, aligned and inside the output address space. */
+static bool apple_dart_fw_table_page(const struct apple_dart *dart,
+				     phys_addr_t phys, phys_addr_t *end)
+{
+	return dart->pgsize == SZ_16K && IS_ALIGNED(phys, dart->pgsize) &&
+	       !check_add_overflow(phys, (phys_addr_t)dart->pgsize - 1, end) &&
+	       dart->oas < 64 && *end < BIT_ULL(dart->oas);
+}
+
 static bool apple_dart_fw_table_ram(const struct apple_dart *dart,
 				   phys_addr_t phys)
 {
 	unsigned long first, last, pfn;
 	phys_addr_t end;
 
-	if (dart->pgsize != SZ_16K || !IS_ALIGNED(phys, dart->pgsize) ||
-	    check_add_overflow(phys, (phys_addr_t)dart->pgsize - 1, &end) ||
-	    dart->oas >= 64 || end >= BIT_ULL(dart->oas))
+	if (!apple_dart_fw_table_page(dart, phys, &end))
 		return false;
 	first = PHYS_PFN(phys);
 	last = PHYS_PFN(end);
@@ -630,14 +883,41 @@ static bool apple_dart_fw_table_ram(const struct apple_dart *dart,
 	return true;
 }
 
-static bool apple_dart_fw_table_decode(const struct apple_dart *dart,
-				      u64 pte, phys_addr_t *phys)
+/* A valid table entry with no bits but the next table's address. */
+static bool apple_dart_fw_table_pte(const struct apple_dart *dart, u64 pte,
+				    phys_addr_t *phys)
 {
 	if (!(pte & APPLE_DART_PTE_VALID) ||
 	    (pte & ~(GENMASK_ULL(37, 10) | APPLE_DART_PTE_VALID)))
 		return false;
 	*phys = apple_dart_pte_to_paddr(dart, pte);
-	return apple_dart_fw_table_ram(dart, *phys);
+	return true;
+}
+
+static bool apple_dart_fw_table_decode(const struct apple_dart *dart,
+				      u64 pte, phys_addr_t *phys)
+{
+	return apple_dart_fw_table_pte(dart, pte, phys) &&
+	       apple_dart_fw_table_ram(dart, *phys);
+}
+
+/*
+ * A table page of firmware's four-level subtrees, which is mapped write-back:
+ * reserved RAM as for apple_dart_fw_table_ram(), or memory no resource
+ * claims. T6050's boot loader places these tables outside the memory node,
+ * so they are not RAM to Linux. An entry naming Linux's own RAM or a
+ * device's registers is refused, and its DVAs resolve nothing.
+ */
+static bool apple_dart_fw_tree_table(const struct apple_dart *dart,
+				     phys_addr_t phys)
+{
+	phys_addr_t end;
+
+	if (apple_dart_fw_table_ram(dart, phys))
+		return true;
+	return apple_dart_fw_table_page(dart, phys, &end) &&
+	       region_intersects(phys, dart->pgsize, IORESOURCE_MEM,
+				 IORES_DESC_NONE) == REGION_DISJOINT;
 }
 
 static bool apple_dart_fw_slot_owned(const struct apple_dart_fw_root *fw,
@@ -666,6 +946,24 @@ static bool apple_dart_fw_mapping_matches(phys_addr_t phys, int prot,
 	const int mask = IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE;
 
 	return phys == expected && (prot & mask) == (required & mask);
+}
+
+/*
+ * Whether the firmware leaf behind root @slot of a three-level stream already
+ * translates the page at @addr to @paddr with the protection Linux asks for.
+ */
+static bool apple_dart_fw_page_matches(const struct apple_dart *dart,
+				       const struct apple_dart_fw_root *fw,
+				       u64 slot, u64 addr, phys_addr_t paddr,
+				       int prot)
+{
+	u64 leaf = (addr / dart->pgsize) % (dart->pgsize / sizeof(u64));
+	phys_addr_t phys;
+	int fw_prot;
+
+	return apple_dart_fw_leaf_decode(READ_ONCE(fw->leaf[slot][leaf]), addr,
+					 &phys, &fw_prot) &&
+	       apple_dart_fw_mapping_matches(phys, fw_prot, paddr, prot);
 }
 
 /*
@@ -846,6 +1144,118 @@ apple_dart_snapshot_fw_root(struct apple_dart *dart, int sid, const u64 *live)
 	return fw;
 }
 
+static void apple_dart_free_fw_tree(struct apple_dart *dart,
+				    struct apple_dart_fw_tree *tree)
+{
+	size_t i, j, entries = dart->pgsize / sizeof(u64);
+
+	if (!tree)
+		return;
+	/* Any of the four arrays may be missing after a failed allocation. */
+	for (i = 0; i < entries; i++) {
+		if (tree->leaf && tree->leaf[i]) {
+			for (j = 0; j < entries; j++)
+				if (tree->leaf[i][j])
+					memunmap(tree->leaf[i][j]);
+			kfree(tree->leaf[i]);
+		}
+		if (tree->mid_entry)
+			kfree(tree->mid_entry[i]);
+		if (tree->mid && tree->mid[i])
+			memunmap(tree->mid[i]);
+	}
+	kfree(tree->leaf);
+	kfree(tree->mid_entry);
+	kfree(tree->mid);
+	kfree(tree->entry);
+	kfree(tree);
+}
+
+/*
+ * Record firmware's subtrees in the four-level root @live of @sid, so that
+ * firmware-placed buffers (an RTKit co-processor's shared segments, which
+ * it asks the AP to map at its own DVA) resolve through iova_to_phys. A
+ * table that cannot be mapped, or that apple_dart_fw_tree_table() refuses,
+ * is left out; its DVAs resolve nothing. A slot can map up to one leaf table
+ * per mid-level entry (2048 with 16K pages); firmware holds a few slots.
+ */
+static struct apple_dart_fw_tree *
+apple_dart_snapshot_fw_tree(struct apple_dart *dart, int sid, const u64 *live)
+{
+	size_t i, j, entries = dart->pgsize / sizeof(u64);
+	struct apple_dart_fw_tree *tree;
+
+	if (!dart->fw_tree || !dart->fw_mirror || dart->fw_handoff ||
+	    dart->hw->fmt != APPLE_DART2 ||
+	    !dart->hw->tcr_4level ||
+	    !(apple_dart_readl(dart, DART_TCR(dart, sid)) & dart->hw->tcr_4level))
+		return NULL;
+
+	tree = kzalloc(sizeof(*tree), GFP_KERNEL);
+	if (!tree)
+		return NULL;
+	tree->entry = kcalloc(entries, sizeof(*tree->entry), GFP_KERNEL);
+	tree->mid = kcalloc(entries, sizeof(*tree->mid), GFP_KERNEL);
+	tree->mid_entry = kcalloc(entries, sizeof(*tree->mid_entry), GFP_KERNEL);
+	tree->leaf = kcalloc(entries, sizeof(*tree->leaf), GFP_KERNEL);
+	if (!tree->entry || !tree->mid || !tree->mid_entry || !tree->leaf) {
+		apple_dart_free_fw_tree(dart, tree);
+		return NULL;
+	}
+
+	for (i = 0; i < entries; i++) {
+		u64 pte = READ_ONCE(live[i]);
+		phys_addr_t phys;
+
+		if (!apple_dart_fw_table_pte(dart, pte, &phys) ||
+		    !apple_dart_fw_tree_table(dart, phys))
+			continue;
+		tree->mid_entry[i] = kcalloc(entries, sizeof(u64), GFP_KERNEL);
+		tree->leaf[i] = kcalloc(entries, sizeof(u64 *), GFP_KERNEL);
+		tree->mid[i] = memremap(phys, dart->pgsize, MEMREMAP_WB);
+		if (!tree->mid_entry[i] || !tree->leaf[i] || !tree->mid[i])
+			continue;
+		tree->entry[i] = pte;
+		for (j = 0; j < entries; j++) {
+			u64 mid = READ_ONCE(tree->mid[i][j]);
+
+			if (!apple_dart_fw_table_pte(dart, mid, &phys) ||
+			    !apple_dart_fw_tree_table(dart, phys))
+				continue;
+			tree->leaf[i][j] = memremap(phys, dart->pgsize, MEMREMAP_WB);
+			if (tree->leaf[i][j])
+				tree->mid_entry[i][j] = mid;
+		}
+	}
+	return tree;
+}
+
+/* What firmware's recorded four-level subtree translates @addr to, or 0. */
+static phys_addr_t apple_dart_fw_tree_phys(const struct apple_dart *dart,
+					   const struct apple_dart_fw_tree *tree,
+					   const u64 *live, u64 addr, int *prot_out)
+{
+	u32 pgshift = ilog2(dart->pgsize);
+	u32 bits = ilog2(dart->pgsize / sizeof(u64));
+	u64 mask = BIT_ULL(bits) - 1;
+	u64 slot = addr >> (pgshift + 2 * bits);
+	u64 mid = (addr >> (pgshift + bits)) & mask;
+	u64 page = (addr >> pgshift) & mask;
+	phys_addr_t phys;
+	int prot;
+
+	if (!tree || !live || slot > mask || !tree->entry[slot] ||
+	    READ_ONCE(live[slot]) != tree->entry[slot] ||
+	    !tree->mid_entry[slot][mid] ||
+	    READ_ONCE(tree->mid[slot][mid]) != tree->mid_entry[slot][mid] ||
+	    !apple_dart_fw_leaf_decode(READ_ONCE(tree->leaf[slot][mid][page]),
+				       addr, &phys, &prot))
+		return 0;
+	if (prot_out)
+		*prot_out = prot;
+	return phys;
+}
+
 static int apple_dart_fw_invalidate(struct apple_dart_stream_map *stream_map,
 				    u64 lo, u64 hi);
 
@@ -856,6 +1266,7 @@ apple_dart_hw_map_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx)
 	int sid;
 
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
+		struct apple_dart_fw_tree *tree = NULL;
 		struct apple_dart_fw_root *fw;
 		unsigned long flags;
 		u32 ttbr;
@@ -902,48 +1313,94 @@ apple_dart_hw_map_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx)
 			devm_memunmap(dart->dev, l1_tbl);
 			return PTR_ERR(fw);
 		}
+		if (!idx)
+			tree = apple_dart_snapshot_fw_tree(dart, sid, l1_tbl);
 		spin_lock_irqsave(&dart->lock, flags);
 		dart->locked_owned[sid][idx] = owned;
 		dart->locked_ttbr[sid][idx] = l1_tbl;
 		dart->locked_fw[sid][idx] = fw;
+		if (!idx)
+			dart->locked_fw_tree[sid] = tree;
 		spin_unlock_irqrestore(&dart->lock, flags);
 	}
 
 	return 0;
 }
 
+/*
+ * Retire the locked roots @idx of @stream_map's streams. Returns the first
+ * error of the TLB invalidate that retiring needs, which is also remembered
+ * per stream for apple_dart_domain_free(): a consumer release or an attach
+ * rollback can retire the root before the domain is freed.
+ */
 static int
 apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx)
 {
 	struct apple_dart *dart = stream_map->dart;
-	int sid;
+	int sid, ret = 0;
 
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
 		u64 *live = dart->locked_ttbr[sid][idx];
 		u64 *owned = dart->locked_owned[sid][idx];
+		struct apple_dart_fw_tree *tree = NULL;
 		struct apple_dart_fw_root *fw;
 		unsigned long flags;
+		bool first = false;
+		int err = 0;
 
 		if (!live)
 			continue;
 		apple_dart_retire_root(live, owned, dart->pgsize / sizeof(*live));
-		if (dart->fw_mirror && dart->version >= 0x0202 && !idx) {
+		if ((dart->fw_mirror || dart->fw_handoff) &&
+		    dart->version >= 0x0202 && !idx) {
 			struct apple_dart_stream_map stream = { .dart = dart };
 
 			__set_bit(sid, stream.sidmap);
-			(void)apple_dart_fw_invalidate(&stream, 0, U64_MAX);
+			err = apple_dart_fw_invalidate(&stream, 0, U64_MAX);
+			ret = ret ?: err;
 		}
 		spin_lock_irqsave(&dart->lock, flags);
+		if (err && !dart->locked_retire_err[sid]) {
+			dart->locked_retire_err[sid] = err;
+			first = true;
+		}
 		fw = dart->locked_fw[sid][idx];
 		dart->locked_fw[sid][idx] = NULL;
 		dart->locked_ttbr[sid][idx] = NULL;
+		if (!idx) {
+			tree = dart->locked_fw_tree[sid];
+			dart->locked_fw_tree[sid] = NULL;
+		}
 		spin_unlock_irqrestore(&dart->lock, flags);
+		/* Once per stream: the error is never cleared. */
+		if (first)
+			dev_warn(dart->dev,
+				 "stream %d: TLB invalidate failed retiring its root (%d); keeping the page tables of its domains until reboot\n",
+				 sid, err);
 		apple_dart_free_fw_root(dart, fw);
+		apple_dart_free_fw_tree(dart, tree);
 		devm_memunmap(dart->dev, live);
 		devm_kfree(dart->dev, owned);
 		dart->locked_owned[sid][idx] = NULL;
 	}
-	return 0;
+	return ret;
+}
+
+/* The remembered retire-time invalidate error of @stream_map's streams, or 0. */
+static int apple_dart_retire_error(struct apple_dart_stream_map *stream_map)
+{
+	struct apple_dart *dart = stream_map->dart;
+	unsigned long flags;
+	int sid, ret = 0;
+
+	spin_lock_irqsave(&dart->lock, flags);
+	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
+		ret = dart->locked_retire_err[sid];
+		if (ret)
+			break;
+	}
+	spin_unlock_irqrestore(&dart->lock, flags);
+	return ret;
 }
 
 static int
@@ -1237,16 +1694,102 @@ apple_dart_t8020_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
 		stream_map, DART_T8020_STREAM_COMMAND_INVALIDATE);
 }
 
+/*
+ * Borrowed J713 display streams use the exact command the cleanroom DCP
+ * profile was qualified with: FLUSH_SID without the v2 or range flags, and
+ * only for SID23, strict SID0 or the private SID16 publisher. A refused or
+ * timed-out command fails the whole retained session.
+ */
+static int apple_dart_dcp_invalidate_tlb(struct apple_dart_stream_map *stream_map)
+{
+	struct apple_dart *dart = stream_map->dart;
+	const u32 command = DART_T8110_TLB_CMD_OP_FLUSH_SID;
+	unsigned long flags;
+	u32 status;
+	int sid, ret = 0;
+
+	spin_lock_irqsave(&dart->lock, flags);
+	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
+		struct apple_dart_dcp *borrowed = apple_dart_borrowed_sid(dart, sid);
+		u32 val = FIELD_PREP(DART_T8110_TLB_CMD_OP, command) |
+			  FIELD_PREP(DART_T8110_TLB_CMD_STREAM, sid);
+
+		if (!borrowed || (borrowed->sid == 16 &&
+				  !READ_ONCE(borrowed->shared_flushing)) ||
+		    !apple_dart_dcp_registers(borrowed)) {
+			ret = -EIO;
+			break;
+		}
+		ret = readl_poll_timeout_atomic(dart->regs + DART_T8110_TLB_CMD, status,
+						!(status & DART_T8110_TLB_CMD_BUSY), 1,
+						DART_STREAM_COMMAND_BUSY_TIMEOUT);
+		/* An external display DART also reports busy at 0x604 bit 0. */
+		if (!ret && dart->dispext)
+			ret = readl_poll_timeout_atomic(dart->regs + DART_T8110_TLB_BUSY2, status,
+							!(status & BIT(0)), 1,
+							DART_STREAM_COMMAND_BUSY_TIMEOUT);
+		if (ret)
+			break;
+		writel(val, dart->regs + DART_T8110_TLB_CMD);
+		ret = readl_poll_timeout_atomic(dart->regs + DART_T8110_TLB_CMD, status,
+						!(status & DART_T8110_TLB_CMD_BUSY), 1,
+						DART_STREAM_COMMAND_BUSY_TIMEOUT);
+		if (!ret && dart->dispext)
+			ret = readl_poll_timeout_atomic(dart->regs + DART_T8110_TLB_BUSY2, status,
+							!(status & BIT(0)), 1,
+							DART_STREAM_COMMAND_BUSY_TIMEOUT);
+		if (ret)
+			break;
+	}
+	spin_unlock_irqrestore(&dart->lock, flags);
+
+	if (ret) {
+		apple_dart_fail_borrowed(dart, "busy bit did not clear after TLB command %x for stream %d",
+					 command, sid);
+	}
+	return ret;
+}
+
+/*
+ * The IOMMU core's TLB command on a borrowed DART: on an external display
+ * DART only with its power confirmed (a use of its own); the borrowed
+ * streams' own operations run theirs inside their use, raw.
+ */
+static int apple_dart_dcp_invalidate_tlb_gated(struct apple_dart_stream_map *stream_map)
+{
+	int ret;
+
+	if (!apple_dart_dispext_get(stream_map->dart))
+		return -EAGAIN;
+	ret = apple_dart_dcp_invalidate_tlb(stream_map);
+	apple_dart_dispext_put(stream_map->dart);
+	return ret;
+}
+
 static int
 apple_dart_t8110_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
 {
-	if (stream_map->dart->fw_mirror && stream_map->dart->version >= 0x0202)
+	if (apple_dart_has_borrowed(stream_map->dart))
+		return apple_dart_dcp_invalidate_tlb_gated(stream_map);
+	/* Keep out of firmware-held slots; see apple_dart_fw_invalidate(). */
+	if ((stream_map->dart->fw_mirror || stream_map->dart->fw_handoff) &&
+	    stream_map->dart->version >= 0x0202)
 		return apple_dart_fw_invalidate(stream_map, 0, U64_MAX);
 	return apple_dart_t8110_hw_tlb_command_range(
 		stream_map, DART_T8110_TLB_CMD_OP_FLUSH_SID, false, 0, 0);
 }
 
 static const char *apple_dart_t8110_v2_fault_name(u32 exception);
+
+/*
+ * Exceptions can latch on any stream the hardware has. A tunnel DART runs with
+ * a fixed 64-stream topology, but a PCIe-C port also uses its reserved streams
+ * 253..255 (for example for MSIs), so scan all of them there.
+ */
+static unsigned int apple_dart_exception_sids(struct apple_dart *dart)
+{
+	return dart->tunneled ? DART_MAX_STREAMS : dart->num_streams;
+}
 
 static void apple_dart_drain_stale_exceptions(struct apple_dart *dart)
 {
@@ -1255,7 +1798,7 @@ static void apple_dart_drain_stale_exceptions(struct apple_dart *dart)
 	if (dart->hw->type != DART_T8110 || dart->version < 0x0202)
 		return;
 
-	for (i = 0; i < DIV_ROUND_UP(dart->num_streams, 32) && i < 8; i++) {
+	for (i = 0; i < DIV_ROUND_UP(apple_dart_exception_sids(dart), 32) && i < 8; i++) {
 		u32 pending = readl(dart->regs + DART_T8110_EXCEPTION(i));
 		unsigned long bits = pending;
 		unsigned int bit;
@@ -1268,7 +1811,7 @@ static void apple_dart_drain_stale_exceptions(struct apple_dart *dart)
 			u32 status;
 			u64 addr;
 
-			if (sid >= dart->num_streams)
+			if (sid >= apple_dart_exception_sids(dart))
 				break;
 
 			status = readl(dart->regs +
@@ -1310,6 +1853,8 @@ static int apple_dart_t8110_v2_unlock(struct apple_dart *dart)
 
 	KUNIT_STATIC_STUB_REDIRECT(apple_dart_t8110_v2_unlock, dart);
 
+	if (dart->managed_sids)
+		return -EPERM;
 	if (!(readl(dart->regs + DART_T8110_DIAG_LOCK) & DART_T8110_DIAG_LOCK_ON_ERR))
 		return 0;
 
@@ -1410,6 +1955,24 @@ static int apple_dart_hw_finish_reset(struct apple_dart *dart)
 	if (dart->hw->type == DART_T8110)
 		apple_dart_writel(dart, 0, DART_T8110_ERROR_MASK);
 
+	/*
+	 * A PCIe-C port issues its own writes, such as MSIs turned into
+	 * interrupt controller writes, on reserved streams outside the
+	 * translated ones. Those must bypass.
+	 */
+	if (dart->tunneled && dart->hw->type == DART_T8110) {
+		u32 sid;
+
+		of_property_for_each_u32(dart->dev->of_node, "apple,bypass-sids", sid) {
+			if (sid >= DART_MAX_STREAMS)
+				continue;
+			apple_dart_writel(dart, dart->hw->tcr_bypass,
+					  dart->hw->tcr + 4 * sid);
+			apple_dart_writel(dart, BIT(sid % 32),
+					  dart->hw->enable_streams + 4 * (sid / 32));
+		}
+	}
+
 	bitmap_set(stream_map.sidmap, 0, dart->num_streams);
 	ret = dart->hw->invalidate_tlb(&stream_map);
 	if (ret)
@@ -1418,11 +1981,216 @@ static int apple_dart_hw_finish_reset(struct apple_dart *dart)
 	return ret;
 }
 
+static bool apple_dart_managed_static_bypass(u32 tcr)
+{
+	/* T8132 does not retain the DAPF bypass request in the readable TCR. */
+	return (tcr & ~DART_T8110_TCR_BYPASS_DAPF) == DART_T8110_TCR_BYPASS_DART;
+}
+
+static ssize_t j713_radio_fault_state_show(struct device *dev,
+					 struct device_attribute *attr, char *buf)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+	unsigned long flags;
+	ssize_t len = 0;
+	unsigned int sid, word;
+
+	if (!device_is_bound(dev) || !dart || !READ_ONCE(dart->iommu.ready) ||
+	    !dart->managed_sids)
+		return -ENODEV;
+
+	/*
+	 * A live, passive snapshot can race hardware updates and IRQ acknowledgements.
+	 * Never acknowledge a latch, unmask errors, or change an owned/foreign stream.
+	 */
+	spin_lock_irqsave(&dart->managed_lock, flags);
+	len += sysfs_emit_at(buf, len, "version=%#x managed=%#x failed=%u\n",
+			     dart->version, dart->managed_sids, dart->managed_failed);
+	len += sysfs_emit_at(buf, len, "error_mask=%#x error=%#x\n",
+			     apple_dart_readl(dart, DART_T8110_ERROR_MASK),
+			     apple_dart_readl(dart, DART_T8110_ERROR));
+	for (word = 0; word < BITS_TO_U32(dart->num_streams); word++) {
+		u32 streams = apple_dart_readl(dart, DART_T8110_ERROR_STREAMS + 4 * word);
+		u32 exceptions = apple_dart_readl(dart, DART_T8110_EXCEPTION(word));
+
+		len += sysfs_emit_at(buf, len, "error_streams[%u]=%#x exceptions[%u]=%#x\n",
+				     word, streams, word, exceptions);
+	}
+	for (sid = 1; sid < 16; sid++) {
+		u32 status;
+		u64 addr;
+
+		if (!(dart->managed_sids & BIT(sid)))
+			continue;
+		status = apple_dart_readl(dart, DART_T8110_ERR_SID_STATUS(sid));
+		addr = apple_dart_readl(dart, DART_T8110_EXCEPTION_ADDR_LO(sid)) |
+		       (u64)apple_dart_readl(dart, DART_T8110_EXCEPTION_ADDR_HI(sid)) << 32;
+		len += sysfs_emit_at(buf, len, "sid%u status=%#x addr=%#llx\n", sid, status, addr);
+	}
+	spin_unlock_irqrestore(&dart->managed_lock, flags);
+	return len;
+}
+static DEVICE_ATTR_ADMIN_RO(j713_radio_fault_state);
+
+static struct attribute *apple_dart_managed_attrs[] = {
+	&dev_attr_j713_radio_fault_state.attr,
+	NULL,
+};
+
+static const struct attribute_group apple_dart_managed_group = {
+	.attrs = apple_dart_managed_attrs,
+};
+
+/* Ordinary-stream admission does not authorize a controller-wide reset. */
+static int apple_dart_managed_admit(struct apple_dart *dart, bool *init_bypass)
+{
+	unsigned int sid;
+	int idx;
+	bool initialize = false;
+	u32 reserved_tcr, protect, protect_lock, enabled, command, error, error_mask;
+
+	if (!dart->managed_sids) {
+		*init_bypass = false;
+		return 0;
+	}
+	if (dart->hw->type != DART_T8110 || dart->locked || dart->num_streams < 19 ||
+	    dart->version < 0x0202)
+		return -EINVAL;
+	protect = apple_dart_readl(dart, DART_T8110_PROTECT);
+	protect_lock = apple_dart_readl(dart, DART_T8110_PROTECT_LOCK);
+	enabled = apple_dart_readl(dart, DART_T8110_ENABLE_STREAMS);
+	command = apple_dart_readl(dart, DART_T8110_TLB_CMD);
+	error = apple_dart_readl(dart, DART_T8110_ERROR);
+	error_mask = apple_dart_readl(dart, DART_T8110_ERROR_MASK);
+	dev_dbg(dart->dev,
+		 "managed radio: PROTECT %#x LOCK %#x ENABLE %#x TLB %#x ERROR %#x MASK %#x\n",
+		 protect, protect_lock, enabled, command, error, error_mask);
+	/* Preserve global policy; owned-stream quarantine requires unmasked errors. */
+	if (error_mask) {
+		dev_err(dart->dev, "managed radio requires inherited unmasked errors (mask %#x)\n",
+			error_mask);
+		return -EBUSY;
+	}
+	/* LOCK freezes protection policy; ENABLE is not an allocation receipt. */
+	if ((protect & DART_T8110_PROTECT_TTBR_TCR) ||
+	    (command & DART_T8110_TLB_CMD_BUSY) ||
+	    (error & DART_T8110_ERROR_FLAG) || apple_dart_fault_pending(dart))
+		return -EBUSY;
+	for (idx = 0; idx < BITS_TO_U32(dart->num_streams); idx++) {
+		u32 errors = apple_dart_readl(dart, DART_T8110_ERROR_STREAMS + 4 * idx);
+
+		if (errors) {
+			dev_err(dart->dev, "inherited error-stream word%d %#x\n", idx, errors);
+			return -EBUSY;
+		}
+	}
+	/* A requester can reach an ordinary target through another stream. */
+	for (sid = 0; sid < (unsigned int)dart->num_streams; sid++) {
+		u32 tcr = apple_dart_readl(dart, DART_TCR(dart, sid));
+		u32 target = FIELD_GET(DART_T8110_TCR_REMAP, tcr);
+
+		if ((tcr & DART_T8110_TCR_REMAP_ENABLE) &&
+		    (dart->managed_sids & BIT(target))) {
+			dev_err(dart->dev, "inherited SID%u remaps into ordinary SID%u\n",
+				sid, target);
+			return -EBUSY;
+		}
+	}
+	/* ADT assigns SID16 a static bypass role, independently of radio data. */
+	reserved_tcr = apple_dart_readl(dart, DART_TCR(dart, 16));
+	if (!apple_dart_managed_static_bypass(reserved_tcr)) {
+		if (reserved_tcr != dart->hw->tcr_disabled || !dart->supports_bypass)
+			return -EBUSY;
+		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
+			if (apple_dart_readl(dart, DART_TTBR(dart, 16, idx)) &
+			    dart->hw->ttbr_valid)
+				return -EBUSY;
+		initialize = true;
+	}
+	for (sid = 1; sid < 16; sid++) {
+		u32 tcr;
+
+		if (!(dart->managed_sids & BIT(sid)))
+			continue;
+		tcr = apple_dart_readl(dart, DART_TCR(dart, sid));
+		if (tcr != dart->hw->tcr_disabled && tcr != DART_T8110_TCR_TRANSLATE_ENABLE) {
+			dev_err(dart->dev, "ordinary SID%u has an inherited active mode\n", sid);
+			return -EBUSY;
+		}
+		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
+			if (apple_dart_readl(dart, DART_TTBR(dart, sid, idx)) &
+			    dart->hw->ttbr_valid) {
+				dev_err(dart->dev, "ordinary SID%u still has a valid root\n", sid);
+				return -EBUSY;
+			}
+	}
+	*init_bypass = initialize;
+	return 0;
+}
+
+/* The host may start its cold link only before any owned root is published. */
+int apple_dart_radio_check_idle(struct device *dev)
+{
+	struct apple_dart *dart;
+	unsigned long flags;
+	bool init_bypass = false;
+	int ret;
+
+	device_lock(dev);
+	if (dev->driver != &apple_dart_driver.driver || !device_is_bound(dev)) {
+		ret = -EPROBE_DEFER;
+		goto out_unlock;
+	}
+	dart = dev_get_drvdata(dev);
+	if (!dart || !READ_ONCE(dart->iommu.ready)) {
+		ret = -EPROBE_DEFER;
+		goto out_unlock;
+	}
+	if (dart->managed_sids != (BIT(1) | BIT(2))) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+	spin_lock_irqsave(&dart->managed_lock, flags);
+	ret = dart->managed_failed || apple_dart_fault_pending(dart) ? -EIO :
+		apple_dart_managed_admit(dart, &init_bypass);
+	if (!ret && init_bypass)
+		ret = -EBUSY;
+	spin_unlock_irqrestore(&dart->managed_lock, flags);
+out_unlock:
+	device_unlock(dev);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_dart_radio_check_idle);
+
+static void apple_dart_managed_quarantine_locked(struct apple_dart *dart)
+{
+	struct apple_dart_stream_map stream = { .dart = dart };
+	unsigned int sid;
+
+	lockdep_assert_held(&dart->managed_lock);
+	WRITE_ONCE(dart->managed_failed, true);
+	for (sid = 1; sid < 16; sid++)
+		if (dart->managed_sids & BIT(sid))
+			__set_bit(sid, stream.sidmap);
+	apple_dart_hw_disable_dma(&stream);
+}
+
+static void apple_dart_managed_quarantine(struct apple_dart *dart)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dart->managed_lock, flags);
+	apple_dart_managed_quarantine_locked(dart);
+	spin_unlock_irqrestore(&dart->managed_lock, flags);
+}
+
 static int apple_dart_hw_reset(struct apple_dart *dart)
 {
 	struct apple_dart_stream_map stream_map;
 	int i;
 
+	if (dart->managed_sids || dart->cold_ane)
+		return -EBUSY;
 	stream_map.dart = dart;
 	bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
 	bitmap_set(stream_map.sidmap, 0, dart->num_streams);
@@ -1439,15 +2207,64 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	return apple_dart_hw_finish_reset(dart);
 }
 
+static int __apple_dart_dcp_domain_flush(struct apple_dart_domain *domain);
+
+/*
+ * Borrowed DCP domains have no io-pgtable; their flush ignores the range.
+ * On an external display DART only with its power confirmed: -EAGAIN
+ * (nothing retired) from sleep until its next confirmed power-up.
+ */
+static int apple_dart_dcp_domain_flush(struct apple_dart_domain *domain)
+{
+	struct apple_dart *dart = domain->dcp->dart;
+	int ret;
+
+	if (!apple_dart_dispext_get(dart))
+		return -EAGAIN;
+	ret = __apple_dart_dcp_domain_flush(domain);
+	apple_dart_dispext_put(dart);
+	return ret;
+}
+
+static int __apple_dart_dcp_domain_flush(struct apple_dart_domain *domain)
+{
+	struct apple_dart_dcp *dcp = domain->dcp;
+	struct apple_dart *dart = dcp->dart;
+	struct apple_dart_stream_map stream_map;
+	int ret;
+
+	/* Not as adopted: apple_dart_dcp_registers() retired it, saying why. */
+	if (!apple_dart_dcp_registers(dcp))
+		return -EIO;
+	/* SID0 generic DMA is strict: map sync and unmap use the real 0x100 flush. */
+	if (dcp->sid == 0)
+		return apple_dart_dcp_flush(dcp);
+	/* Only the private shared-buffer API can publish SID16 leaves. */
+	if (dcp->sid != 23)
+		return 0;
+	stream_map.dart = dart;
+	bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
+	set_bit(dcp->sid, stream_map.sidmap);
+	dma_wmb();
+	ret = apple_dart_dcp_invalidate_tlb(&stream_map);
+	if (ret)
+		apple_dart_dcp_fail(dcp, "domain flush failed: %d", ret);
+	return ret;
+}
+
 static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 					   bool range, u64 first, u64 last)
 {
 	struct apple_dart_atomic_stream_map *map;
 	struct apple_dart_stream_map stream;
-	struct io_pgtable_cfg *cfg = &io_pgtable_ops_to_pgtable(domain->pgtbl_ops)->cfg;
+	struct io_pgtable_cfg *cfg;
 	const u32 op = DART_T8110_TLB_CMD_OP_FLUSH_SID;
 	int i, j, ret, err = 0;
 	u64 start, end;
+
+	if (domain->dcp)
+		return apple_dart_dcp_domain_flush(domain);
+	cfg = &io_pgtable_ops_to_pgtable(domain->pgtbl_ops)->cfg;
 
 	/*
 	 * After an unmap, the caller frees the pages once this returns. Every
@@ -1485,6 +2302,8 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 								    start, end);
 		else
 			ret = stream.dart->hw->invalidate_tlb(&stream);
+		if (ret && stream.dart->managed_sids)
+			apple_dart_managed_quarantine(stream.dart);
 		pm_runtime_put(stream.dart->dev);
 		err = err ?: ret;
 	}
@@ -1535,6 +2354,15 @@ static bool apple_dart_domain_uses_fw(struct apple_dart_domain *domain, int i,
 /*
  * Hardware continues to use every firmware-owned slot. Its entire IOVA
  * span is excluded from Linux allocation, including currently unmapped holes.
+ *
+ * Linux may still repeat a page the firmware leaf already translates, with
+ * the same physical address and protection. That happens when one domain
+ * spans several DARTs and only some of them inherited a reserved region:
+ * the J700 display subsystem uses disp0 and dispext0, and only disp0 scans
+ * out the boot framebuffer. apple_dart_inherited_phys() cannot report the
+ * region as mapped for the whole domain, so the core maps it, and the copy
+ * must be accepted on disp0 while dispext0 gets it in a vacant slot.
+ * apple_dart_publish_root() never writes the firmware slot itself.
  */
 static int apple_dart_check_fw_map(struct apple_dart_domain *domain, u64 dva,
 				   phys_addr_t paddr, size_t size, int prot)
@@ -1556,6 +2384,7 @@ static int apple_dart_check_fw_map(struct apple_dart_domain *domain, u64 dva,
 			u64 addr = dva + off;
 
 			for (sid = 0; sid < dart->num_streams; sid++) {
+				const struct apple_dart_fw_root *fw;
 				bool four;
 				u64 idx, slot;
 				const u64 *live, *owned;
@@ -1563,12 +2392,6 @@ static int apple_dart_check_fw_map(struct apple_dart_domain *domain, u64 dva,
 				if (!apple_dart_domain_uses_fw(domain, i, map, sid))
 					continue;
 				if (!dart->fw_handoff) {
-					const struct apple_dart_fw_root *fw;
-					phys_addr_t phys;
-					u64 pte;
-					int fw_prot;
-					u64 leaf = (addr >> pgshift) & (entries - 1);
-
 					slot = (addr >> (pgshift + bits)) & (entries - 1);
 					idx = addr >> (pgshift + 2 * bits);
 					if (idx >= DART_MAX_TTBR)
@@ -1577,10 +2400,8 @@ static int apple_dart_check_fw_map(struct apple_dart_domain *domain, u64 dva,
 					live = dart->locked_ttbr[sid][idx];
 					if (!live || !apple_dart_fw_slot_owned(fw, live, slot))
 						continue;
-					pte = READ_ONCE(fw->leaf[slot][leaf]);
-					if (!apple_dart_fw_leaf_decode(pte, addr, &phys, &fw_prot) ||
-					    !apple_dart_fw_mapping_matches(phys, fw_prot,
-									   paddr + off, prot)) {
+					if (!apple_dart_fw_page_matches(dart, fw, slot, addr,
+									paddr + off, prot)) {
 						ret = -EBUSY;
 						goto unlock;
 					}
@@ -1595,8 +2416,17 @@ static int apple_dart_check_fw_map(struct apple_dart_domain *domain, u64 dva,
 					continue;
 				live = dart->locked_ttbr[sid][idx];
 				owned = dart->locked_owned[sid][idx];
-				/* All pages of an inherited slot remain firmware's. */
-				if (live && apple_dart_fw_slot_foreign(live, owned, slot)) {
+				if (!live || !apple_dart_fw_slot_foreign(live, owned, slot))
+					continue;
+				/*
+				 * All pages of an inherited slot remain firmware's;
+				 * only a page its firmware leaf already maps the
+				 * same way may be repeated.
+				 */
+				fw = dart->locked_fw[sid][idx];
+				if (four || !apple_dart_fw_slot_owned(fw, live, slot) ||
+				    !apple_dart_fw_page_matches(dart, fw, slot, addr,
+								paddr + off, prot)) {
 					ret = -EBUSY;
 					goto unlock;
 				}
@@ -1610,11 +2440,18 @@ static int apple_dart_check_fw_map(struct apple_dart_domain *domain, u64 dva,
 	return 0;
 }
 
+/*
+ * What firmware's own retained translations in @domain map @address to, or 0.
+ * With @prot_out, also the protection every stream grants (IOMMU_READ and
+ * IOMMU_WRITE as the leaves say).
+ */
 static phys_addr_t
-apple_dart_inherited_phys(struct apple_dart_domain *domain, dma_addr_t address)
+apple_dart_inherited_phys_prot(struct apple_dart_domain *domain, dma_addr_t address,
+			       int *prot_out)
 {
 	struct apple_dart_atomic_stream_map *map;
 	phys_addr_t result = 0;
+	int granted = IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE;
 	int i, sid;
 
 	for_each_stream_map(i, domain, map) {
@@ -1624,30 +2461,89 @@ apple_dart_inherited_phys(struct apple_dart_domain *domain, dma_addr_t address)
 		size_t page = (address / dart->pgsize) % entries;
 		size_t slot = address / dart->pgsize / entries;
 
-		if (!dart->locked || (!dart->fw_handoff && !dart->fw_mirror) || slot >= entries)
+		if (!dart->locked || (!dart->fw_handoff && !dart->fw_mirror))
 			return 0;
 		spin_lock_irqsave(&dart->lock, flags);
 		for (sid = 0; sid < dart->num_streams; sid++) {
+			const struct apple_dart_fw_tree *tree;
 			struct apple_dart_fw_root *fw;
-			phys_addr_t phys;
+			phys_addr_t phys = 0;
 			int prot;
 
 			if (!apple_dart_domain_uses_fw(domain, i, map, sid))
 				continue;
+			tree = dart->locked_fw_tree[sid];
 			fw = dart->locked_fw[sid][0];
-			if (!apple_dart_fw_slot_owned(fw, dart->locked_ttbr[sid][0], slot) ||
-			    !apple_dart_fw_leaf_decode(READ_ONCE(fw->leaf[slot][page]),
-						       address, &phys, &prot) ||
-			    (result && result != phys)) {
+			prot = 0;
+			if (tree)
+				phys = apple_dart_fw_tree_phys(dart, tree,
+							       dart->locked_ttbr[sid][0],
+							       address, &prot);
+			else if (slot >= entries ||
+				 !apple_dart_fw_slot_owned(fw, dart->locked_ttbr[sid][0], slot) ||
+				 !apple_dart_fw_leaf_decode(READ_ONCE(fw->leaf[slot][page]),
+							    address, &phys, &prot))
+				phys = 0;
+			if (!phys || (result && result != phys)) {
 				spin_unlock_irqrestore(&dart->lock, flags);
 				return 0;
 			}
 			result = phys;
+			granted &= prot;
 		}
 		spin_unlock_irqrestore(&dart->lock, flags);
 	}
+	if (prot_out)
+		*prot_out = result ? granted : 0;
 	return result;
 }
+
+static phys_addr_t
+apple_dart_inherited_phys(struct apple_dart_domain *domain, dma_addr_t address)
+{
+	return apple_dart_inherited_phys_prot(domain, address, NULL);
+}
+
+/*
+ * Resolves a DVA a co-processor's firmware names in a request of its own, for
+ * a host copy to or from that buffer. Only firmware's retained mappings count:
+ * a DVA Linux mapped itself (a framebuffer, an imported or DMA_TO_DEVICE
+ * buffer) is refused, so the host never writes what the device may only read.
+ * @write requires the leaf to grant writes. -EACCES when refused, -ENXIO when
+ * unmapped.
+ */
+int apple_dart_fw_remote(struct device *dev, dma_addr_t iova, bool write,
+			 phys_addr_t *phys)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
+	struct apple_dart_domain *dart_domain;
+	struct io_pgtable_ops *ops;
+	struct io_pgtable_cfg *cfg;
+	dma_addr_t address;
+	phys_addr_t result;
+	int prot;
+
+	if (!domain || domain->owner != &apple_dart_iommu_ops)
+		return -ENODEV;
+	dart_domain = to_dart_domain(domain);
+	ops = dart_domain->pgtbl_ops;
+	if (dart_domain->dcp || !ops)
+		return -ENODEV;
+	address = (iova + dart_domain->dma_offset) & dart_domain->mask;
+	if (ops->iova_to_phys(ops, address))
+		return -EACCES;
+	cfg = &io_pgtable_ops_to_pgtable(ops)->cfg;
+	if (cfg->apple_dart_cfg.n_levels != 3 && cfg->apple_dart_cfg.n_levels != 4)
+		return -ENXIO;
+	result = apple_dart_inherited_phys_prot(dart_domain, address, &prot);
+	if (!result)
+		return -ENXIO;
+	if (!(prot & IOMMU_READ) || (write && !(prot & IOMMU_WRITE)))
+		return -EACCES;
+	*phys = result;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_dart_fw_remote);
 
 static phys_addr_t apple_dart_iova_to_phys(struct iommu_domain *domain,
 					   dma_addr_t iova)
@@ -1658,6 +2554,8 @@ static phys_addr_t apple_dart_iova_to_phys(struct iommu_domain *domain,
 	phys_addr_t phys;
 	dma_addr_t address;
 
+	if (dart_domain->dcp)
+		return apple_dart_dcp_translate(dart_domain->dcp, iova);
 	if (!ops)
 		return 0;
 
@@ -1666,7 +2564,7 @@ static phys_addr_t apple_dart_iova_to_phys(struct iommu_domain *domain,
 	if (phys)
 		return phys;
 	cfg = &io_pgtable_ops_to_pgtable(ops)->cfg;
-	if (cfg->apple_dart_cfg.n_levels != 3)
+	if (cfg->apple_dart_cfg.n_levels != 3 && cfg->apple_dart_cfg.n_levels != 4)
 		return 0;
 	/* Existing firmware translations need no replacement software mapping. */
 	return apple_dart_inherited_phys(dart_domain, address);
@@ -1683,8 +2581,18 @@ static int apple_dart_map_pages(struct iommu_domain *domain, unsigned long iova,
 	u64 dva;
 	int ret;
 
+	if (dart_domain->dcp) {
+		/* No publication while iommu_device_register() can still roll back. */
+		if (!READ_ONCE(dart_domain->dcp->dart->iommu.ready))
+			return -EAGAIN;
+		return apple_dart_dcp_map(dart_domain->dcp, iova, paddr, pgsize,
+					  pgcount, prot, gfp, mapped);
+	}
 	if (!ops)
 		return -ENODEV;
+	if (dart_domain->stream_maps[0].dart &&
+	    READ_ONCE(dart_domain->stream_maps[0].dart->managed_failed))
+		return -EIO;
 
 	dva = (iova + dart_domain->dma_offset) & dart_domain->mask;
 	ret = apple_dart_check_fw_map(dart_domain, dva, paddr, pgsize * pgcount,
@@ -1704,13 +2612,15 @@ static size_t apple_dart_unmap_pages(struct iommu_domain *domain,
 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
 	struct io_pgtable_ops *ops = dart_domain->pgtbl_ops;
 
+	if (dart_domain->dcp)
+		return apple_dart_dcp_unmap(dart_domain->dcp, iova, pgsize, pgcount, gather);
 	return ops->unmap_pages(ops,
 				(iova + dart_domain->dma_offset) &
 				dart_domain->mask, pgsize, pgcount,
 				gather);
 }
 
-static void
+static int
 apple_dart_setup_translation(struct apple_dart_domain *domain,
 			     struct apple_dart_stream_map *stream_map)
 {
@@ -1719,10 +2629,22 @@ apple_dart_setup_translation(struct apple_dart_domain *domain,
 	struct io_pgtable_cfg *pgtbl_cfg =
 		&io_pgtable_ops_to_pgtable(domain->pgtbl_ops)->cfg;
 
-	/* enable all streams globally since TCR is used to control isolation */
-	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
-		apple_dart_writel(dart, U32_MAX,
-				   dart->hw->enable_streams + 4 * i);
+	if (dart->cold_ane) {
+		if (bitmap_weight(stream_map->sidmap, dart->num_streams) != 1 ||
+		    !test_bit(0, stream_map->sidmap))
+			return -EPERM;
+		apple_dart_writel(dart, apple_dart_readl(dart, dart->hw->enable_streams) | BIT(0),
+				  dart->hw->enable_streams);
+	} else if (dart->managed_sids) {
+		/* Admission owns only ordinary SIDs 1/2, both in the first word. */
+		apple_dart_writel(dart, stream_map->sidmap[0] & dart->managed_sids,
+				  dart->hw->enable_streams);
+	} else {
+		/* Other profiles use TCR to control isolation. */
+		for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
+			apple_dart_writel(dart, U32_MAX,
+					  dart->hw->enable_streams + 4 * i);
+	}
 
 	for (i = 0; i < pgtbl_cfg->apple_dart_cfg.n_ttbrs; ++i) {
 		u64 ttbr = virt_to_phys(pgtbl_cfg->apple_dart_cfg.ttbr[i]);
@@ -1733,7 +2655,7 @@ apple_dart_setup_translation(struct apple_dart_domain *domain,
 
 	apple_dart_hw_enable_translation(stream_map,
 					 pgtbl_cfg->apple_dart_cfg.n_levels);
-	stream_map->dart->hw->invalidate_tlb(stream_map);
+	return dart->hw->invalidate_tlb(stream_map);
 }
 
 /* Record the DVA window of @domain for invalidates of @stream_map's streams. */
@@ -1810,8 +2732,33 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 
 	mutex_lock(&dart_domain->init_lock);
 
-	if (dart_domain->finalized)
+	if (dart_domain->finalized) {
+		if (dart_domain->dcp && (apple_dart_borrowed_cfg(cfg) != dart_domain->dcp ||
+		    READ_ONCE(dart_domain->dcp->failed)))
+			ret = -EIO;
 		goto done;
+	}
+
+	/* A borrowed J713 display stream uses its live root, not an io-pgtable. */
+	if (apple_dart_has_borrowed(dart)) {
+		struct apple_dart_dcp *dcp = apple_dart_borrowed_cfg(cfg);
+
+		if (!dcp || cfg->stream_maps[1].dart || !dcp->owner || dcp->domain ||
+		    READ_ONCE(dcp->failed) ||
+		    bitmap_weight(cfg->stream_maps[0].sidmap, dart->num_streams) != 1 ||
+		    !test_bit(dcp->sid, cfg->stream_maps[0].sidmap)) {
+			ret = -EBUSY;
+			goto done;
+		}
+		dart_domain->dcp = dcp;
+		dcp->domain = dart_domain;
+		dart_domain->domain.pgsize_bitmap = SZ_16K;
+		dart_domain->domain.geometry.aperture_start = DCP_DART_ALIAS;
+		dart_domain->domain.geometry.aperture_end = DCP_DART_ALIAS + DCP_DART_APERTURE - 1;
+		dart_domain->domain.geometry.force_aperture = true;
+		dart_domain->finalized = true;
+		goto done;
+	}
 
 	/* Reserved mappings may be installed before any device is attached. */
 	for (i = 0; i < MAX_DARTS_PER_DEVICE; ++i) {
@@ -1955,6 +2902,7 @@ static int apple_dart_attach_dev_paging(struct iommu_domain *domain,
 	struct apple_dart_stream_map *stream_map;
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
+	bool streams_added = false;
 
 	for_each_stream_map(i, cfg, stream_map)
 		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
@@ -1963,14 +2911,35 @@ static int apple_dart_attach_dev_paging(struct iommu_domain *domain,
 	if (ret)
 		goto err;
 
+	/* Live root is already validated and borrowed; attach must not publish it. */
+	if (dart_domain->dcp)
+		goto err;
+
 	ret = apple_dart_domain_add_streams(dart_domain, cfg);
 	if (ret)
 		goto err;
+	streams_added = true;
 
 	for_each_stream_map(i, cfg, stream_map) {
-		if (!stream_map->dart->locked)
-			apple_dart_setup_translation(dart_domain, stream_map);
-		else {
+		if (stream_map->dart->managed_sids) {
+			struct apple_dart *dart = stream_map->dart;
+			unsigned long flags;
+
+			spin_lock_irqsave(&dart->managed_lock, flags);
+			if (dart->managed_failed)
+				ret = -EIO;
+			else
+				ret = apple_dart_setup_translation(dart_domain, stream_map);
+			if (ret)
+				apple_dart_managed_quarantine_locked(dart);
+			spin_unlock_irqrestore(&dart->managed_lock, flags);
+			if (ret)
+				goto err;
+		} else if (!stream_map->dart->locked) {
+			ret = apple_dart_setup_translation(dart_domain, stream_map);
+			if (ret)
+				goto err;
+		} else {
 			ret = apple_dart_setup_translation_locked(dart_domain, stream_map);
 			if (ret)
 				goto err;
@@ -1978,6 +2947,8 @@ static int apple_dart_attach_dev_paging(struct iommu_domain *domain,
 	}
 
 err:
+	if (ret && streams_added && cfg->stream_maps[0].dart->managed_sids)
+		apple_dart_mod_streams(dart_domain->stream_maps, cfg->stream_maps, false);
 	for_each_stream_map(i, cfg, stream_map)
 		pm_runtime_put(stream_map->dart->dev);
 	return ret;
@@ -1991,7 +2962,7 @@ static int apple_dart_attach_dev_identity(struct iommu_domain *domain,
 	struct apple_dart_stream_map *stream_map;
 	int i;
 
-	if (!cfg->supports_bypass)
+	if (!cfg->supports_bypass || cfg->stream_maps[0].dart->managed_sids)
 		return -EINVAL;
 
 	if (cfg->locked)
@@ -2001,7 +2972,8 @@ static int apple_dart_attach_dev_identity(struct iommu_domain *domain,
 		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
 
 	for_each_stream_map(i, cfg, stream_map)
-		apple_dart_hw_enable_bypass(stream_map);
+		if (!stream_map->dart->retained_mtp)
+			apple_dart_hw_enable_bypass(stream_map);
 
 	for_each_stream_map(i, cfg, stream_map)
 		pm_runtime_put(stream_map->dart->dev);
@@ -2057,6 +3029,21 @@ static struct iommu_device *apple_dart_probe_device(struct device *dev)
 	if (!dev_iommu_fwspec_get(dev) || !cfg)
 		return ERR_PTR(-ENODEV);
 
+	if (apple_dart_has_borrowed(cfg->stream_maps[0].dart)) {
+		struct apple_dart_dcp *borrowed = apple_dart_borrowed_cfg(cfg);
+		int ret = -EINVAL;
+
+		/* An external display DART's registers only inside a use. */
+		if (borrowed && !apple_dart_dispext_get(borrowed->dart)) {
+			ret = -EAGAIN;
+		} else if (borrowed) {
+			ret = apple_dart_dcp_validate(borrowed, dev);
+			apple_dart_dispext_put(borrowed->dart);
+		}
+		if (ret)
+			return ERR_PTR(ret);
+	}
+
 	for_each_stream_map(i, cfg, stream_map)
 		device_link_add(dev, stream_map->dart->dev,
 			DL_FLAG_PM_RUNTIME | DL_FLAG_AUTOREMOVE_SUPPLIER |
@@ -2072,7 +3059,8 @@ static void apple_dart_release_device(struct device *dev)
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 
 	for_each_stream_map(j, cfg, stream_map) {
-		if (!stream_map->dart->locked)
+		/* Borrowed display roots stay exactly as the DCP left them. */
+		if (!stream_map->dart->locked || apple_dart_has_borrowed(stream_map->dart))
 			continue;
 		ret = pm_runtime_resume_and_get(stream_map->dart->dev);
 		if (ret < 0) {
@@ -2131,9 +3119,21 @@ static void apple_dart_domain_free(struct iommu_domain *domain)
 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
 	struct apple_dart_atomic_stream_map *map;
 	struct apple_dart_stream_map stream;
-	int i, j, idx;
+	int i, j, idx, ret;
 
+	if (dart_domain->dcp) {
+		/* Registration rollback: no consumer could publish host DMA yet. */
+		if (!READ_ONCE(dart_domain->dcp->dart->iommu.ready)) {
+			dart_domain->dcp->domain = NULL;
+			kfree(dart_domain);
+			return;
+		}
+		dev_info(dart_domain->dcp->dart->dev, "Pinning DCP domain until reboot\n");
+		return;
+	}
 	for_each_stream_map(i, dart_domain, map) {
+		if (map->dart->managed_sids)
+			return;
 		if (!map->dart->locked)
 			continue;
 		stream.dart = map->dart;
@@ -2147,14 +3147,22 @@ static void apple_dart_domain_free(struct iommu_domain *domain)
 				"retaining page tables after power failure: %d\n", j);
 			return;
 		}
-		for (idx = 0; idx < stream.dart->hw->ttbr_count; idx++)
-			apple_dart_hw_unmap_locked_ttbr(&stream, idx);
+		ret = 0;
+		for (idx = 0; idx < stream.dart->hw->ttbr_count; idx++) {
+			j = apple_dart_hw_unmap_locked_ttbr(&stream, idx);
+			ret = ret ?: j;
+		}
 		j = stream.dart->hw->invalidate_tlb(&stream);
+		ret = ret ?: j;
 		pm_runtime_put(stream.dart->dev);
-		/* Do not free page tables that hardware may still cache. */
-		if (j) {
+		/*
+		 * Do not free page tables that hardware may still cache, also
+		 * when a consumer release or an attach rollback retired the root.
+		 */
+		ret = ret ?: apple_dart_retire_error(&stream);
+		if (ret) {
 			dev_err_ratelimited(stream.dart->dev,
-				"retaining page tables after TLB invalidation failure: %d\n", j);
+				"retaining page tables after TLB invalidation failure: %d\n", ret);
 			return;
 		}
 	}
@@ -2231,6 +3239,15 @@ static int apple_dart_of_xlate(struct device *dev,
 		return i;
 
 	sid = args->args[0];
+	if (dart->cold_ane && sid != 0)
+		return -EPERM;
+	if (dart->managed_sids &&
+	    (sid <= 0 || sid >= 16 || !(dart->managed_sids & BIT(sid))))
+		return -EINVAL;
+	if (apple_dart_has_borrowed(dart) &&
+	    (sid < 0 || sid >= dart->num_streams || !apple_dart_borrowed_sid(dart, sid) ||
+	     (cfg && cfg->stream_maps[0].dart)))
+		return -EINVAL;
 
 	if (!cfg) {
 		cfg = kzalloc_obj(*cfg);
@@ -2263,7 +3280,7 @@ static int apple_dart_of_xlate(struct device *dev,
 			return -EINVAL;
 	}
 
-	cfg->supports_bypass &= dart->supports_bypass;
+	cfg->supports_bypass &= dart->supports_bypass && !dart->managed_sids && !dart->cold_ane;
 	cfg->locked |= dart->locked;
 
 	for (i = 0; i < MAX_DARTS_PER_DEVICE; ++i) {
@@ -2282,6 +3299,245 @@ static int apple_dart_of_xlate(struct device *dev,
 
 	return -EINVAL;
 }
+
+#if IS_ENABLED(CONFIG_APPLE_DART_J713_DCP)
+/*
+ * The check, inside a use of the DART's registers (on an external display
+ * DART, apple_dart_dispext_get() by the caller).
+ */
+static int __apple_dart_dcp_check(struct device *dev)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
+	struct apple_dart_domain *dd;
+	struct apple_dart_dcp *dcp;
+	unsigned long flags;
+	bool drift = false;
+	int ret;
+
+	if (!domain || domain->owner != &apple_dart_iommu_ops || !iommu_is_dma_domain(domain))
+		return -ENODEV;
+	dd = to_dart_domain(domain);
+	if (!dd->dcp || dd->dcp->owner != dev || dd->dcp->domain != dd ||
+	    !READ_ONCE(dd->dcp->dart->iommu.ready))
+		return -ENODEV;
+	if (READ_ONCE(dd->dcp->failed))
+		return -EIO;
+	dcp = dd->dcp;
+	if (!apple_dart_dcp_registers(dcp))
+		goto failed;
+	spin_lock_irqsave(&dcp->lock, flags);
+	for (unsigned int i = 0; i < DCP_DART_ENTRIES; i++) {
+		if (READ_ONCE(dcp->root[i]) != READ_ONCE(dcp->entry[i])) {
+			drift = true;
+			break;
+		}
+		/* SID23 may update leaves under an inherited, stable root. Check
+		 * their physical ownership too, not just known firmware segments.
+		 */
+		if (dcp->sid == 23 && test_bit(i, dcp->foreign) && dcp->table[i])
+			for (unsigned int j = 0; j < DCP_DART_ENTRIES; j++)
+				if (!apple_dart_dcp_leaf_safe(dcp, READ_ONCE(dcp->table[i][j]))) {
+					drift = true;
+					break;
+				}
+		if (drift)
+			break;
+	}
+	spin_unlock_irqrestore(&dcp->lock, flags);
+	if (drift)
+		goto failed;
+	ret = apple_dart_dcp_validate(dcp, dev);
+	if (ret)
+		goto failed;
+	return 0;
+failed:
+	/* On an external display DART, both frontends: the DART is retired. */
+	if (dcp->dart->dispext)
+		apple_dart_fail_borrowed(dcp->dart, "check: %s", drift ? "a root or leaf changed" :
+					 "registers or ownership not as adopted");
+	else
+		apple_dart_dcp_fail(dcp, "check: %s", drift ? "a root or leaf changed" :
+				    "registers or ownership not as adopted");
+	return -EIO;
+}
+
+/*
+ * On an external display DART, only with its power confirmed (a use of its
+ * registers): -EAGAIN, nothing retired, from sleep until its firmware's next
+ * confirmed power-up.
+ */
+int apple_dart_dcp_check(struct device *dev)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
+	struct apple_dart *dart;
+	int ret;
+
+	if (!domain || domain->owner != &apple_dart_iommu_ops || !to_dart_domain(domain)->dcp)
+		return __apple_dart_dcp_check(dev);
+	dart = to_dart_domain(domain)->dcp->dart;
+	if (!apple_dart_dispext_get(dart))
+		return -EAGAIN;
+	ret = __apple_dart_dcp_check(dev);
+	apple_dart_dispext_put(dart);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_dart_dcp_check);
+
+int apple_dart_dcp_check_buffer(struct device *dev, dma_addr_t iova, size_t size)
+{
+	struct apple_dart_domain *dd;
+	struct apple_dart_dcp *dcp;
+	u64 end;
+	int ret = apple_dart_dcp_check(dev);
+
+	if (ret)
+		return ret;
+	if (size > SZ_16M || !dcp_dart_contains(DCP_DART_ALIAS,
+			DCP_DART_ALIAS + DCP_DART_APERTURE, iova, size))
+		return -EINVAL;
+	dd = to_dart_domain(iommu_get_domain_for_dev(dev));
+	dcp = dd->dcp;
+	if (dcp->sid != 23)
+		return -ENODEV;
+	end = iova + size;
+	for (u64 page = iova & ~(DCP_DART_PAGE - 1); page < end; page += DCP_DART_PAGE) {
+		unsigned int root = (page >> 25) & 2047;
+		unsigned int leaf = (page >> 14) & 2047;
+
+		/* A readable firmware TEXT mapping is never writable RTKit shared memory. */
+		if (!apple_dart_dcp_translate(dcp, page) || !test_bit(root, dcp->foreign) ||
+		    !dcp_dart_pte_full_rw(READ_ONCE(dcp->table[root][leaf]), true)) {
+			apple_dart_dcp_fail(dcp, "buffer at %llx is not writable shared memory",
+					    page);
+			return -EACCES;
+		}
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_dart_dcp_check_buffer);
+
+void *apple_dart_dcp_alloc(struct device *dev, size_t size, dma_addr_t *dva)
+{
+	struct apple_dart_dcp_allocation *allocation;
+	struct apple_dart_domain *dd;
+	struct apple_dart_dcp *dcp;
+	unsigned int root, count, allocated = 0;
+	bool coherent = dev_is_dma_coherent(dev);
+	int prot = IOMMU_READ | IOMMU_WRITE | (coherent ? IOMMU_CACHE : 0);
+	int ret = apple_dart_dcp_check(dev);
+	void *result;
+
+	if (ret)
+		return ERR_PTR(ret);
+	if (!size || size > SZ_16M)
+		return ERR_PTR(-EINVAL);
+	size = PAGE_ALIGN(size);
+	count = size >> PAGE_SHIFT;
+	dd = to_dart_domain(iommu_get_domain_for_dev(dev));
+	dcp = dd->dcp;
+	mutex_lock(&dcp->alloc_lock);
+	if (dcp->sid != 23) {
+		result = ERR_PTR(-ENODEV);
+		goto unlock;
+	}
+	if (READ_ONCE(dcp->failed) || dcp->allocated > SZ_64M - size) {
+		result = ERR_PTR(-ENOSPC);
+		goto unlock;
+	}
+	/* One empty 32-MiB slice per object. Never alias a foreign or previous object. */
+	for (root = 0; root < DCP_DART_ENTRIES; root++)
+		if (!test_bit(root, dcp->claimed) &&
+		    !dcp->entry[root] && !READ_ONCE(dcp->root[root]))
+			break;
+	if (root == DCP_DART_ENTRIES) {
+		result = ERR_PTR(-ENOSPC);
+		goto unlock;
+	}
+	set_bit(root, dcp->claimed); /* Includes failures before a root PTE appears. */
+	allocation = kzalloc(struct_size(allocation, pages, count), GFP_KERNEL);
+	if (!allocation) {
+		result = ERR_PTR(-ENOMEM);
+		goto unlock;
+	}
+	allocation->size = size;
+	allocation->dva = DCP_DART_ALIAS + root * DCP_DART_SLICE;
+	for (allocated = 0; allocated < count; allocated++) {
+		allocation->pages[allocated] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		if (!allocation->pages[allocated])
+			goto free_unpublished;
+		if (!coherent)
+			arch_dma_prep_coherent(allocation->pages[allocated], PAGE_SIZE);
+	}
+	allocation->cpu = dma_common_pages_remap(allocation->pages, size,
+						 dma_pgprot(dev, PAGE_KERNEL, 0),
+						 __builtin_return_address(0));
+	if (!allocation->cpu)
+		goto free_unpublished;
+	/* Own payload pages BEFORE the first PTE, including every rollback case. */
+	list_add_tail(&allocation->link, &dcp->allocations);
+	dcp->allocated += size;
+	for (unsigned int i = 0; i < count; i++) {
+		ret = iommu_map(&dd->domain, allocation->dva + i * PAGE_SIZE,
+				page_to_phys(allocation->pages[i]), PAGE_SIZE, prot, GFP_KERNEL);
+		if (ret)
+			goto pin_failure;
+	}
+	ret = apple_dart_dcp_check(dev);
+	if (ret)
+		goto pin_failure;
+	for (unsigned int i = 0; i < count; i++) {
+		if (apple_dart_dcp_translate(dcp, allocation->dva + i * PAGE_SIZE) !=
+		    page_to_phys(allocation->pages[i])) {
+			ret = -EIO;
+			goto pin_failure;
+		}
+	}
+	*dva = allocation->dva;
+	result = allocation->cpu;
+	goto unlock;
+pin_failure:
+	apple_dart_dcp_fail(dcp, "payload mapping failed: %d", ret);
+	dev_err(dev, "Retaining %zu payload bytes after DCP mapping failure %d\n", size, ret);
+	result = ERR_PTR(ret);
+	goto unlock;
+free_unpublished:
+	/* Safe only because no page address or PTE has been exposed yet. */
+	while (allocated)
+		__free_page(allocation->pages[--allocated]);
+	kfree(allocation);
+	result = ERR_PTR(-ENOMEM);
+unlock:
+	mutex_unlock(&dcp->alloc_lock);
+	return result;
+}
+EXPORT_SYMBOL_GPL(apple_dart_dcp_alloc);
+
+static int apple_dart_dcp_shared_flush(struct apple_dart_dcp *dcp)
+{
+	struct apple_dart_stream_map map = { .dart = dcp->dart };
+	int ret;
+
+	if (dcp->sid != 16 || !apple_dart_dcp_registers(dcp))
+		return -EIO;
+	/* An external display DART has no fault IRQ attached: look first. */
+	if (dcp->dart->dispext && apple_dart_fault_pending(dcp->dart)) {
+		apple_dart_fail_borrowed(dcp->dart, "a DART fault is pending (SID16 flush)");
+		return -EIO;
+	}
+	bitmap_zero(map.sidmap, DART_MAX_STREAMS);
+	set_bit(16, map.sidmap);
+	/* Generic SID16 flush is a no-op; authorize only this synchronous call. */
+	WRITE_ONCE(dcp->shared_flushing, true);
+	dma_wmb();
+	/* Raw: inside the caller's use of the DART (no gate taken again). */
+	ret = apple_dart_dcp_invalidate_tlb(&map);
+	WRITE_ONCE(dcp->shared_flushing, false);
+	return ret;
+}
+
+#include "apple-dart-dcp-shared.h"
+#include "apple-dart-dcp-scanout.h"
+#endif /* CONFIG_APPLE_DART_J713_DCP */
 
 static DEFINE_MUTEX(apple_dart_groups_lock);
 
@@ -2423,15 +3679,78 @@ static bool apple_dart_capable(struct device *dev, enum iommu_cap cap)
 	}
 }
 
+/*
+ * Media and ML engines (video decode and encode, neural engine, camera ISP)
+ * are run by their own coprocessor firmware, which can still have DMA in
+ * flight after the host driver has given up on a job: a timeout, a reset,
+ * a stream torn down mid-frame. With deferred flushing the DART keeps
+ * translating a freed buffer's addresses until the flush queue drains, so
+ * such a late write lands silently in pages that already went back to the
+ * allocator. Strict flushing makes it fault at the DART instead. These
+ * engines map their buffers once per stream or model, so the per-unmap
+ * invalidate is not on any hot path.
+ *
+ * The client is identified by its device tree compatible, "apple,<soc>-avd"
+ * and so on, so every SoC generation is covered without a per-SoC table.
+ */
+static const char * const apple_dart_strict_engines[] = {
+	"avd", "ave", "ane", "isp",
+};
+
+static bool apple_dart_compat_is_strict_engine(const char *compat)
+{
+	const char *engine;
+	unsigned int i;
+
+	if (!str_has_prefix(compat, "apple,"))
+		return false;
+	engine = strrchr(compat, '-');
+	engine = engine ? engine + 1 : compat + strlen("apple,");
+	for (i = 0; i < ARRAY_SIZE(apple_dart_strict_engines); i++)
+		if (!strcmp(engine, apple_dart_strict_engines[i]))
+			return true;
+	return false;
+}
+
+static bool apple_dart_master_needs_strict(struct device *dev)
+{
+	struct property *prop;
+	const char *compat;
+
+	if (!dev->of_node)
+		return false;
+	of_property_for_each_string(dev->of_node, "compatible", prop, compat)
+		if (apple_dart_compat_is_strict_engine(compat))
+			return true;
+	return false;
+}
+
 static int apple_dart_def_domain_type(struct device *dev)
 {
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 
+	/* Retained radio and borrowed display streams require strict DMA. */
+	if (cfg->stream_maps[0].dart->managed_sids ||
+	    apple_dart_has_borrowed(cfg->stream_maps[0].dart))
+		return IOMMU_DOMAIN_DMA;
+	if (cfg->stream_maps[0].dart->retained_mtp)
+		return IOMMU_DOMAIN_IDENTITY;
 	if (cfg->stream_maps[0].dart->pgsize > PAGE_SIZE)
+		return IOMMU_DOMAIN_IDENTITY;
+	/*
+	 * Tunneled PCIe is untrusted, and the PCIe-C DART bypasses only its
+	 * reserved streams: translate everything behind a USB4 port.
+	 */
+	if (cfg->stream_maps[0].dart->tunneled)
+		return IOMMU_DOMAIN_DMA;
+	if (dev_is_pci(dev) && of_machine_is_compatible("apple,j713") &&
+	    cfg->supports_bypass && !cfg->locked)
 		return IOMMU_DOMAIN_IDENTITY;
 	if (!cfg->supports_bypass)
 		return IOMMU_DOMAIN_DMA;
 	if (cfg->locked)
+		return IOMMU_DOMAIN_DMA;
+	if (apple_dart_master_needs_strict(dev))
 		return IOMMU_DOMAIN_DMA;
 
 	return 0;
@@ -2480,7 +3799,12 @@ static void apple_dart_get_fw_resv_regions(struct device *dev,
 		struct apple_dart *dart = stream->dart;
 		size_t entries = dart->pgsize / sizeof(u64);
 
-		if (!dart->fw_handoff || entries > DART_MAX_ROOT_ENTRIES)
+		/*
+		 * Only the handoff and fw_tree reserve anything: leave the other
+		 * fw_mirror DARTs (T6041, T8140, T8142) untouched, TCR reads included.
+		 */
+		if ((!dart->fw_handoff && !dart->fw_tree) ||
+		    entries > DART_MAX_ROOT_ENTRIES)
 			continue;
 		for_each_set_bit(sid, stream->sidmap, dart->num_streams) {
 			for (idx = 0; idx < dart->hw->ttbr_count; idx++) {
@@ -2504,6 +3828,13 @@ static void apple_dart_get_fw_resv_regions(struct device *dev,
 						__set_bit(slot, slots);
 				spin_unlock_irqrestore(&dart->lock, flags);
 
+				/*
+				 * A three-level fw_mirror slot may repeat firmware's
+				 * pages (apple_dart_check_fw_map()); a four-level one
+				 * is firmware's alone, so keep the allocator out of it.
+				 */
+				if (!dart->fw_handoff && !(four && dart->fw_tree))
+					continue;
 				if (!four && check_add_overflow(window,
 					((u64)idx << (ilog2(dart->pgsize) + 2 * ilog2(entries))),
 					&window))
@@ -2530,7 +3861,17 @@ static void apple_dart_get_fw_resv_regions(struct device *dev,
 static void apple_dart_get_resv_regions(struct device *dev,
 					struct list_head *head)
 {
+	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 	struct iommu_resv_region *region;
+
+	if (cfg && apple_dart_has_borrowed(cfg->stream_maps[0].dart)) {
+		struct apple_dart_dcp *borrowed = apple_dart_borrowed_cfg(cfg);
+
+		/* Already reconciled against live leaves; never request reconstruction. */
+		if (borrowed)
+			apple_dart_dcp_reserve(borrowed, head);
+		return;
+	}
 
 	if (IS_ENABLED(CONFIG_PCIE_APPLE) && dev_is_pci(dev)) {
 		int prot = IOMMU_WRITE | IOMMU_NOEXEC | IOMMU_MMIO;
@@ -2701,6 +4042,11 @@ static const char *apple_dart_t8110_v2_fault_name(u32 exception)
 	return "unknown";
 }
 
+static void apple_dart_quarantine_borrowed(struct apple_dart *dart, const char *why)
+{
+	apple_dart_fail_borrowed(dart, "%s", why);
+}
+
 static bool apple_dart_t8110_v2_block_pending(u16 version, u32 block_error)
 {
 	return version >= 0x0203 &&
@@ -2711,7 +4057,7 @@ static irqreturn_t apple_dart_t8110_v2_irq(int irq, void *dev)
 {
 	struct apple_dart *dart = dev;
 	irqreturn_t ret = IRQ_NONE;
-	unsigned int words = DIV_ROUND_UP(dart->num_streams, 32);
+	unsigned int words = DIV_ROUND_UP(apple_dart_exception_sids(dart), 32);
 	unsigned int i;
 	u32 block_error;
 
@@ -2728,13 +4074,16 @@ static irqreturn_t apple_dart_t8110_v2_irq(int irq, void *dev)
 
 		if (!pending)
 			continue;
+		if (dart->managed_sids)
+			apple_dart_managed_quarantine(dart);
+		apple_dart_quarantine_borrowed(dart, "a stream exception is pending");
 
 		for_each_set_bit(bit, &bits, 32) {
 			unsigned int sid = i * 32 + bit;
 			u32 status;
 			u64 addr;
 
-			if (sid >= dart->num_streams)
+			if (sid >= apple_dart_exception_sids(dart))
 				break;
 
 			status = readl(dart->regs +
@@ -2770,6 +4119,9 @@ static irqreturn_t apple_dart_t8110_v2_irq(int irq, void *dev)
 	if (dart->version >= 0x0203) {
 		block_error = readl(dart->regs + DART_T8110_BLOCK_ERROR);
 		if (apple_dart_t8110_v2_block_pending(dart->version, block_error)) {
+			if (dart->managed_sids)
+				apple_dart_managed_quarantine(dart);
+			apple_dart_quarantine_borrowed(dart, "a block error is pending");
 			dev_err_ratelimited(dart->dev,
 					    "block exception: status:0x%08x\n",
 					    block_error);
@@ -2778,18 +4130,92 @@ static irqreturn_t apple_dart_t8110_v2_irq(int irq, void *dev)
 			ret = IRQ_HANDLED;
 		}
 	}
-	if (ret == IRQ_HANDLED)
+	/* Retained radio and borrowed display streams stay quarantined. */
+	if (ret == IRQ_HANDLED && !dart->managed_sids && !apple_dart_has_borrowed(dart))
 		apple_dart_t8110_v2_unlock(dart);
 
 	return ret;
+}
+
+/*
+ * Borrowed J713 display DARTs share one IRQ. Any fault quarantines the
+ * retained session. Linux is the IRQ handler for the entire block, including
+ * inherited streams: acknowledge their diagnostic latch without changing any
+ * translation or disabling the shared level-triggered interrupt.
+ */
+static irqreturn_t apple_dart_dcp_irq(struct apple_dart *dart)
+{
+	const char *fault_name = NULL;
+	u32 error = readl(dart->regs + DART_T8110_ERROR);
+	u32 error_code = FIELD_GET(DART_T8110_ERROR_CODE, error);
+	u32 addr_lo = readl(dart->regs + DART_T8110_ERROR_ADDR_LO);
+	u32 addr_hi = readl(dart->regs + DART_T8110_ERROR_ADDR_HI);
+	u64 addr = addr_lo | (((u64)addr_hi) << 32);
+	u8 stream_idx = FIELD_GET(DART_T8110_ERROR_STREAM, error);
+
+	if (!(error & DART_T8110_ERROR_FLAG))
+		return IRQ_NONE;
+	/* Quarantine the session, but never disable the shared display IRQ. */
+	apple_dart_fail_borrowed(dart, "DART error %08x", error);
+	if (!apple_dart_borrowed_sid(dart, stream_idx)) {
+		dev_err_ratelimited(dart->dev,
+			"Unowned display fault: status=%08x SID%u at %llx; retained state pinned\n",
+			error, stream_idx, addr);
+		/* No other Linux handler owns this DART's inherited stream. */
+		writel(error, dart->regs + DART_T8110_ERROR);
+		if (stream_idx < 32)
+			writel(BIT(stream_idx), dart->regs + DART_T8110_ERROR_STREAMS);
+		return IRQ_HANDLED;
+	}
+
+	if (error_code == DART_T8110_ERROR_READ_FAULT)
+		fault_name = "READ FAULT";
+	else if (error_code == DART_T8110_ERROR_WRITE_FAULT)
+		fault_name = "WRITE FAULT";
+	else if (error_code == DART_T8110_ERROR_NO_PTE)
+		fault_name = "NO PTE FOR IOVA";
+	else if (error_code == DART_T8110_ERROR_NO_PMD)
+		fault_name = "NO PMD FOR IOVA";
+	else if (error_code == DART_T8110_ERROR_NO_PGD)
+		fault_name = "NO PGD FOR IOVA";
+	else if (error_code == DART_T8110_ERROR_NO_TTBR)
+		fault_name = "NO TTBR FOR IOVA";
+	else
+		fault_name = "unknown";
+
+	dev_err_ratelimited(dart->dev,
+		"translation fault: status:0x%x stream:%d code:0x%x (%s) at 0x%llx",
+		error, stream_idx, error_code, fault_name, addr);
+
+	writel(error, dart->regs + DART_T8110_ERROR);
+	writel(BIT(stream_idx), dart->regs + DART_T8110_ERROR_STREAMS);
+	return IRQ_HANDLED;
+}
+
+/* Read-only admission: do not clear a pending inherited fault before ownership. */
+static bool apple_dart_fault_pending(struct apple_dart *dart)
+{
+	if (dart->version >= 0x0202) {
+		for (unsigned int i = 0; i < DIV_ROUND_UP(dart->num_streams, 32); i++)
+			if (readl(dart->regs + DART_T8110_EXCEPTION(i)))
+				return true;
+		return dart->version >= 0x0203 &&
+			apple_dart_t8110_v2_block_pending(dart->version,
+				readl(dart->regs + DART_T8110_BLOCK_ERROR));
+	}
+	return (readl(dart->regs + DART_T8110_ERROR) & DART_T8110_ERROR_FLAG) ||
+		readl(dart->regs + DART_T8110_ERROR_STREAMS);
 }
 
 static irqreturn_t apple_dart_t8110_irq(int irq, void *dev)
 {
 	struct apple_dart *dart = dev;
 
+	/* Borrowed T8132 is v2.2 too: use its per-SID exception ABI. */
 	if (dart->version >= 0x0202)
 		return apple_dart_t8110_v2_irq(irq, dev);
+	if (apple_dart_has_borrowed(dart))
+		return apple_dart_dcp_irq(dart);
 
 	return apple_dart_t8110_legacy_irq(irq, dev);
 }
@@ -2812,6 +4238,20 @@ static irqreturn_t apple_dart_irq(int irq, void *dev)
 static bool apple_dart_is_locked(struct apple_dart *dart)
 {
 	return !!(apple_dart_readl(dart, dart->hw->lock) & dart->hw->lock_bit);
+}
+
+static bool apple_dart_streams_bypassed(struct apple_dart *dart)
+{
+	unsigned int sid;
+
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		if ((apple_dart_readl(dart, DART_TCR(dart, sid)) &
+		     (DART_T8110_TCR_BYPASS_DART | DART_T8110_TCR_TRANSLATE_ENABLE)) !=
+		    DART_T8110_TCR_BYPASS_DART ||
+		    (apple_dart_readl(dart, DART_TTBR(dart, sid, 0)) & dart->hw->ttbr_valid))
+			return false;
+	}
+	return true;
 }
 
 static void apple_dart_iounmap_np(void *data)
@@ -2850,6 +4290,74 @@ apple_dart_platform_ioremap_np_resource(struct platform_device *pdev,
 	return regs;
 }
 
+static DEFINE_MUTEX(apple_dart_display_irq_lock);
+static struct apple_dart *apple_dart_display_irq_peers[2];
+static int apple_dart_display_shared_irq = -1;
+
+static irqreturn_t apple_dart_display_pair_irq(int irq, void *data)
+{
+	irqreturn_t result = IRQ_NONE;
+
+	/* Both admitted suppliers are retained. Removal frees/synchronizes this
+	 * action before changing either pointer; the handler takes no pair mutex.
+	 */
+	for (unsigned int i = 0; i < ARRAY_SIZE(apple_dart_display_irq_peers); i++)
+		if (apple_dart_irq(irq, apple_dart_display_irq_peers[i]) == IRQ_HANDLED)
+			result = IRQ_HANDLED;
+	return result;
+}
+
+static int apple_dart_display_irq_request(struct apple_dart *dart)
+{
+	unsigned int peer = dart->dcp ? 1 : 0;
+	int ret;
+
+	guard(mutex)(&apple_dart_display_irq_lock);
+	if (apple_dart_display_irq_peers[peer])
+		return -EBUSY;
+	apple_dart_display_irq_peers[peer] = dart;
+	if (!apple_dart_display_irq_peers[!peer])
+		return 0; /* Never enable this level IRQ for just one admitted block. */
+	if (dart->irq != apple_dart_display_irq_peers[!peer]->irq ||
+	    apple_dart_fault_pending(dart) ||
+	    apple_dart_fault_pending(apple_dart_display_irq_peers[!peer])) {
+		ret = -EIO;
+		goto err;
+	}
+	ret = request_irq(dart->irq, apple_dart_display_pair_irq, IRQF_SHARED,
+			 "apple-dart display fault handlers", apple_dart_display_irq_peers);
+	if (ret)
+		goto err;
+	apple_dart_display_shared_irq = dart->irq;
+	return 0;
+err:
+	apple_dart_display_irq_peers[peer] = NULL;
+	return ret;
+}
+
+static void apple_dart_free_irq(struct apple_dart *dart)
+{
+	if (dart->irq < 0)
+		return;
+	if (!dart->preserve_display) {
+		free_irq(dart->irq, dart);
+		return;
+	}
+	guard(mutex)(&apple_dart_display_irq_lock);
+	if (apple_dart_display_shared_irq >= 0) {
+		/* Neither peer may publish DMA after losing shared fault observation. */
+		for (unsigned int i = 0; i < ARRAY_SIZE(apple_dart_display_irq_peers); i++)
+			if (apple_dart_display_irq_peers[i])
+				apple_dart_quarantine_borrowed(apple_dart_display_irq_peers[i],
+							       "the shared fault IRQ went");
+		free_irq(apple_dart_display_shared_irq, apple_dart_display_irq_peers);
+		apple_dart_display_shared_irq = -1;
+	}
+	for (unsigned int i = 0; i < ARRAY_SIZE(apple_dart_display_irq_peers); i++)
+		if (apple_dart_display_irq_peers[i] == dart)
+			apple_dart_display_irq_peers[i] = NULL;
+}
+
 static int apple_dart_probe(struct platform_device *pdev)
 {
 	int ret, sid;
@@ -2862,16 +4370,125 @@ static int apple_dart_probe(struct platform_device *pdev)
 	bool tunneled = dev->of_node->parent &&
 			 of_node_name_prefix(dev->of_node->parent,
 					     "usb4-pcie-tunnel-");
+	bool j713_display, j713_dcpext, j713_dispext, j713_radio;
 
-	dart = devm_kzalloc(dev, sizeof(*dart), GFP_KERNEL);
+	/*
+	 * The J713 internal display DARTs are live: DCP firmware (SID23) and
+	 * the scanout/PIODMA frontend (SID0/SID16) keep using them. Leave both
+	 * untouched until userspace, with its watchdog armed, opts in.
+	 */
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	j713_display = res && !tunneled && of_machine_is_compatible("apple,j713") &&
+		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
+		(res->start == 0x30a300000ULL || res->start == 0x30a340000ULL);
+	/* The external DCP firmware DARTs (SID23) of dcpext0 and dcpext1. */
+	j713_dcpext = res && !tunneled && of_machine_is_compatible("apple,j713") &&
+		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
+		(res->start == 0x286340000ULL || res->start == 0x48a340000ULL);
+	/* The external display DARTs (SID0/SID16) of dispext0 and dispext1. */
+	j713_dispext = res && !tunneled && of_machine_is_compatible("apple,j713") &&
+		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
+		(res->start == 0x286300000ULL || res->start == 0x48a300000ULL);
+	/* The J713 radio DART's fault interrupt is not described by its loader. */
+	j713_radio = res && !tunneled && of_machine_is_compatible("apple,j713") &&
+		of_machine_is_compatible("apple,t8132") &&
+		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
+		res->start == 0x490000000ULL;
+	if (j713_display && !IS_ENABLED(CONFIG_APPLE_DART_J713_DCP))
+		return dev_err_probe(dev, -EOPNOTSUPP,
+				     "retained J713 display requires CONFIG_APPLE_DART_J713_DCP=y\n");
+	if (j713_display &&
+	    ((res->start == 0x30a300000ULL && !READ_ONCE(apple_dart_frontend_enabled)) ||
+	     (res->start == 0x30a340000ULL && !READ_ONCE(apple_dart_dcp_enabled)))) {
+		dev_info(dev, "Leaving inherited display DART untouched; explicit guarded probe required\n");
+		return -ENODEV;
+	}
+	if (j713_dcpext) {
+		/* Its block is powered only if the loader handed the DCP over. */
+		struct device_node *owner =
+			of_find_node_by_path(res->start == 0x48a340000ULL ? "dcpext1" : "dcpext0");
+		u32 ready = 0;
+		bool handed_over = owner &&
+			!of_property_read_u32(owner, "apple,t8132-dcpext-firmware-ready", &ready) &&
+			ready == 1;
+
+		of_node_put(owner);
+		if (!IS_ENABLED(CONFIG_APPLE_DART_J713_DCP) || !handed_over) {
+			dev_info(dev, "Leaving inherited external display DART untouched\n");
+			return -ENODEV;
+		}
+	}
+	if (j713_dispext) {
+		/*
+		 * Its block shares the DCP's CPU domain, powered only if the
+		 * loader handed the DCP over.
+		 */
+		struct device_node *owner =
+			of_find_node_by_path(res->start == 0x48a300000ULL ? "dcpext1" : "dcpext0");
+		u32 ready = 0;
+		bool handed_over = owner &&
+			!of_property_read_u32(owner, "apple,t8132-dcpext-firmware-ready", &ready) &&
+			ready == 1;
+
+		struct platform_device *owner_dev = owner ? of_find_device_by_node(owner) : NULL;
+		/*
+		 * Probed at boot in the loader's state. Not once the dcpext's
+		 * driver has its session: its firmware may have the DART off.
+		 */
+		bool session = owner_dev && device_is_bound(&owner_dev->dev);
+
+		if (owner_dev)
+			put_device(&owner_dev->dev);
+		of_node_put(owner);
+		if (session) {
+			dev_info(dev, "External DCP session already running: display DART left untouched\n");
+			return -ENODEV;
+		}
+		if (!IS_ENABLED(CONFIG_APPLE_DART_J713_DCP) || !handed_over) {
+			dev_info(dev, "Leaving inherited external display DART untouched\n");
+			return -ENODEV;
+		}
+	}
+
+	dart = kzalloc(sizeof(*dart), GFP_KERNEL);
 	if (!dart)
 		return -ENOMEM;
+	ret = devm_add_action_or_reset(dev, apple_dart_release, dart);
+	if (ret)
+		return ret;
 
 	dart->dev = dev;
 	dart->hw = of_device_get_match_data(dev);
 	dart->tunneled = tunneled;
+	dart->cold_ane = of_device_is_compatible(dev->of_node, "apple,t8140-ane-dart");
+	if (dart->cold_ane && !IS_BUILTIN(CONFIG_APPLE_DART))
+		return -EOPNOTSUPP;
 	dart->per_stream = of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
 			   of_device_is_compatible(dev->of_node, "apple,t8142-dart");
+	if (of_property_present(dev->of_node, "apple,managed-sids")) {
+		u32 ids[2];
+
+		if (!IS_BUILTIN(CONFIG_APPLE_DART))
+			return dev_err_probe(dev, -EOPNOTSUPP,
+					     "managed radio requires built-in DART support\n");
+		if (!j713_radio ||
+		    of_property_count_u32_elems(dev->of_node, "apple,managed-sids") != 2 ||
+		    of_property_read_u32_array(dev->of_node, "apple,managed-sids", ids, 2) ||
+		    ids[0] != 1 || ids[1] != 2)
+			return -EINVAL;
+		dart->managed_sids = BIT(1) | BIT(2);
+	}
+	spin_lock_init(&dart->managed_lock);
+	dart->preserve_display = j713_display || j713_dcpext || j713_dispext;
+	dart->dispext = j713_dispext;
+	spin_lock_init(&dart->dispext_pm_lock);
+	init_waitqueue_head(&dart->dispext_wq);
+	if (j713_dcpext)
+		dart->dcp_instance = &dcp_adt_external[res->start == 0x48a340000ULL];
+	else if (j713_dispext)
+		dart->dcp_instance = &dcp_adt_external[res->start == 0x48a300000ULL];
+	else if (j713_display)
+		dart->dcp_instance = &dcp_adt_internal;
 	if (tunneled) {
 		pd_np = of_parse_phandle(dev->of_node, "power-domains", 0);
 		if (pd_np) {
@@ -2895,6 +4512,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 	if (tunneled)
 		dart->regs = apple_dart_platform_ioremap_np_resource(pdev, 0,
 							      &res);
+	else if (dart->managed_sids || dart->preserve_display || dart->cold_ane)
+		dart->regs = apple_dart_retained_ioremap(dart, res);
 	else
 		dart->regs = devm_platform_get_and_ioremap_resource(pdev, 0,
 							     &res);
@@ -2926,14 +4545,36 @@ static int apple_dart_probe(struct platform_device *pdev)
 		}
 	}
 
-	dart->irq = platform_get_irq(pdev, 0);
-	if (dart->irq < 0)
-		return -ENODEV;
+	if (j713_dcpext || j713_dispext) {
+		/*
+		 * Its fault IRQ is shared with the external display DART, which is
+		 * not admitted: never enable that level IRQ for one block alone.
+		 */
+		dart->irq = -1;
+	} else if (dart->preserve_display || j713_radio) {
+		dart->irq = platform_get_irq_optional(pdev, 0);
+		if (dart->irq == -ENXIO)
+			dart->irq = -1;
+		else if (dart->irq < 0)
+			return dart->irq;
+	} else {
+		dart->irq = platform_get_irq(pdev, 0);
+		if (dart->irq < 0)
+			return -ENODEV;
+	}
+
+	if (dart->managed_sids && dart->irq < 0)
+		return dev_err_probe(dev, -ENODEV, "managed radio requires a fault IRQ\n");
 
 	ret = devm_clk_bulk_get_all(dev, &dart->clks);
 	if (ret < 0)
 		return ret;
 	dart->num_clks = ret;
+	if (dart->managed_sids && dart->num_clks)
+		return -EINVAL;
+	/* This inherited profile has no managed clocks; do not acquire new ones. */
+	if (dart->preserve_display && dart->num_clks)
+		return -ENODEV;
 
 	ret = clk_bulk_prepare_enable(dart->num_clks, dart->clks);
 	if (ret)
@@ -2969,6 +4610,9 @@ static int apple_dart_probe(struct platform_device *pdev)
 			dart->oas = DART_PCIEC_ADDR_WIDTH;
 			dart->num_streams = DART_PCIEC_STREAMS;
 			dart->four_level = true;
+			/* T8132 PCIe-C DARTs keep per-stream exception records. */
+			if (of_device_is_compatible(dev->of_node, "apple,t8132-dart"))
+				dart->version = 0x0202;
 		} else {
 			dart->pgsize = 1 << DART_PCIEC_PAGE_SHIFT;
 			dart->supports_bypass = false;
@@ -3088,6 +4732,19 @@ params_done:
 		goto err_clk_disable;
 	}
 
+	/*
+	 * v2.2 moved the exception bitmap to 0x4000 and the per-stream
+	 * exception records to 0x8000. A node whose reg stops short of them
+	 * would fault on the first exception read during reset.
+	 */
+	if (dart->hw->type == DART_T8110 && dart->version >= 0x0202 &&
+	    resource_size(res) < DART_T8110_ERR_SID(dart->num_streams)) {
+		ret = dev_err_probe(dev, -EINVAL,
+				    "MMIO region %pR too small for v2.2 exception records (need %#x); fix the DT reg\n",
+				    res, DART_T8110_ERR_SID(dart->num_streams));
+		goto err_clk_disable;
+	}
+
 	ret = apple_dart_read_remaps(dart);
 	if (ret)
 		goto err_clk_disable;
@@ -3099,34 +4756,184 @@ params_done:
 		dart->locked = apple_dart_is_locked(dart);
 	/* Reserved table-page lifetime requires the matched three-level loader. */
 	dart->fw_handoff = apple_dart_fw_handoff_enabled(dart);
-	/* Preserve our retained-root path when no reserved-table handoff exists. */
+	/*
+	 * Preserve our retained-root path when no reserved-table handoff exists.
+	 * T6050's boot loader leaves every display DART locked on four-level
+	 * roots of its own (dart-dcpextN SID 23, dart-dispextN SIDs 0 and 16).
+	 */
 	dart->fw_mirror = dart->locked && !dart->fw_handoff &&
-		(of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
+		(of_device_is_compatible(dev->of_node, "apple,t6041-dart") ||
+		 of_device_is_compatible(dev->of_node, "apple,t6050-dart") ||
+		 of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
 		 of_device_is_compatible(dev->of_node, "apple,t8142-dart"));
-	if (!dart->locked) {
+	/*
+	 * J614s may arrive with the MTP live after the boot keyboard used it.
+	 * Do not reset its DART unless there is no advertised handoff.
+	 */
+	if (of_machine_is_compatible("apple,j614s") &&
+	    res->start == 0x514800000ULL) {
+		struct device_node *mtp, *iommu;
+		const char *handoff;
+		bool live, advertised;
+
+		mtp = of_find_node_by_path("/mtp@514600000");
+		iommu = mtp ? of_parse_phandle(mtp, "iommus", 0) : NULL;
+		advertised = mtp && of_find_property(mtp, "apple,rtkit-handoff", NULL);
+		live = advertised && of_device_is_compatible(mtp, "apple,t6041-mtp") &&
+		       !of_property_read_string(mtp, "apple,rtkit-handoff", &handoff) &&
+		       !strcmp(handoff, "mtp-live-v1");
+		if (advertised && (!live || iommu != dev->of_node || dart->hw->type != DART_T8110 ||
+				   dart->locked || tunneled || !dart->supports_bypass ||
+				   !apple_dart_streams_bypassed(dart))) {
+			of_node_put(iommu);
+			of_node_put(mtp);
+			dev_err(dev, "Refusing invalid J614s live MTP DART handoff\n");
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		if (live) {
+			dart->retained_mtp = true;
+			dev_info(dev, "Retaining the live J614s MTP bypass\n");
+		}
+		of_node_put(iommu);
+		of_node_put(mtp);
+	}
+	dart->fw_tree = dart->fw_mirror &&
+		of_device_is_compatible(dev->of_node, "apple,t6050-dart");
+	if (of_machine_is_compatible("apple,j713") &&
+	    of_machine_is_compatible("apple,t8132") &&
+	    res->start == 0x394800000ULL && dart->hw->type == DART_T8110 &&
+	    !dart->locked && !tunneled && dart->supports_bypass &&
+	    apple_dart_streams_bypassed(dart)) {
+		dart->retained_mtp = true;
+		dev_info(dev, "Retaining the live J713 MTP bypass\n");
+	}
+	if (dart->preserve_display) {
+		if (dart->hw->type != DART_T8110 || !bitmap_empty(dart->remapped, DART_MAX_STREAMS)) {
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		dev_info(dev, "J713 display DART version %04x, locked %d\n",
+			 dart->version, dart->locked);
+		ret = res->start == 0x30a340000ULL || j713_dcpext ?
+			apple_dart_dcp_prepare(dart) :
+			dart->dispext ? apple_dart_dispext_prepare(dart) :
+			apple_dart_frontend_prepare(dart);
+		if (ret)
+			goto err_clk_disable;
+	}
+	if (dart->cold_ane) {
+		/* No reset, TCR/TTBR clear, global enable, remap or IRQ ACK.
+		 * Cold acquisition is checked by the staged ANE backend before
+		 * it attaches a private SID0 domain. Even bypass SIDs stay intact.
+		 */
+		if (dart->locked || dart->version != 0x203 || dart->num_streams != 16 ||
+		    !bitmap_empty(dart->remapped, DART_MAX_STREAMS)) {
+			ret = -EPERM;
+			goto err_clk_disable;
+		}
+		dart->irq = -1;
+		dart->retained = true;
+		get_device(dev);
+		dev_info(dev, "cold ANE DART: inherited streams preserved; SID0 only\n");
+	} else if (dart->managed_sids) {
+		bool init_bypass = false;
+
+		ret = apple_dart_fault_pending(dart) ? -EBUSY :
+			apple_dart_managed_admit(dart, &init_bypass);
+		if (ret)
+			goto err_clk_disable;
+		/* Acquire the takeover guard before the first managed register write. */
+		ret = apple_dart_retain_radio(dart);
+		if (ret)
+			goto err_clk_disable;
+		if (init_bypass) {
+			struct apple_dart_stream_map stream = { .dart = dart };
+			u32 bypass_tcr;
+
+			__set_bit(16, stream.sidmap);
+			apple_dart_hw_enable_bypass(&stream);
+			bypass_tcr = apple_dart_readl(dart, DART_TCR(dart, 16));
+			if (!apple_dart_managed_static_bypass(bypass_tcr)) {
+				ret = dev_err_probe(dev, -EIO,
+						    "static SID16 bypass readback failed\n");
+				goto err_clk_disable;
+			}
+			apple_dart_writel(dart, BIT(16), dart->hw->enable_streams);
+		}
+		/* ENABLE is write-one-to-set; no foreign stream changes state. */
+		apple_dart_writel(dart, dart->managed_sids, dart->hw->enable_streams);
+	} else if (!dart->locked && !dart->retained_mtp && !dart->preserve_display) {
 		ret = apple_dart_hw_reset(dart);
 		if (ret)
 			goto err_clk_disable;
 	}
 
-	if (dart->locked)
+	/* Borrowed display state: never acknowledge someone else's fault. */
+	if (dart->locked && !dart->preserve_display)
 		apple_dart_drain_stale_exceptions(dart);
 
-	ret = request_irq(dart->irq, apple_dart_irq, IRQF_SHARED,
-			  "apple-dart fault handler", dart);
-	if (ret)
+	/* Refuse an already pending inherited fault before joining the shared IRQ. */
+	if (dart->preserve_display &&
+	    (apple_dart_fault_pending(dart) ||
+	     readl(dart->regs + DART_T8110_ERROR_MASK))) {
+		ret = dev_err_probe(dev, -EIO,
+				    "pending or masked display DART faults; no IRQ attachment\n");
 		goto err_clk_disable;
+	}
+
+	if (dart->irq >= 0) {
+		ret = dart->preserve_display ? apple_dart_display_irq_request(dart) :
+			request_irq(dart->irq, apple_dart_irq, IRQF_SHARED,
+				    "apple-dart fault handler", dart);
+		if (ret)
+			goto err_clk_disable;
+	}
 
 	ret = iommu_device_sysfs_add(&dart->iommu, dev, NULL, "apple-dart.%s",
 				     dev_name(&pdev->dev));
 	if (ret)
 		goto err_free_irq;
+	if (dart->managed_sids) {
+		ret = devm_device_add_group(dev, &apple_dart_managed_group);
+		if (ret)
+			goto err_sysfs_remove;
+	}
+	/* An external display DART's state is not read from sysfs. */
+	if (dart->frontend[0] && !dart->dispext) {
+		ret = devm_device_add_group(dev, &apple_dart_frontend_group);
+		if (ret)
+			goto err_sysfs_remove;
+	}
 
+#if IS_ENABLED(CONFIG_APPLE_DART_J713_DCP)
+	if (apple_dart_has_borrowed(dart)) {
+		/* iommu_device_register() may attach consumers and publish host
+		 * tables. From this point neither successful nor failed removal
+		 * returns ownership of any hardware-visible memory.
+		 */
+		/* Pin the guard and immutable reason before the generic API can
+		 * retain their addresses. No successful acquisition is released:
+		 * the display has no proven DMA-stop/reset boundary before reboot.
+		 */
+		__module_get(THIS_MODULE);
+		ret = kexec_block(&apple_dart_display_kexec);
+		if (ret) {
+			module_put(THIS_MODULE);
+			goto err_sysfs_remove;
+		}
+		get_device(dev);
+		WRITE_ONCE(dart->retained, true);
+	}
+#endif
 	ret = iommu_device_register(&dart->iommu, &apple_dart_iommu_ops, dev);
 	if (ret)
 		goto err_sysfs_remove;
 
-	pm_runtime_put(dev);
+	/* Retain supplier references; generic suspend/resume is not applicable. */
+	if (!dart->retained_mtp && !dart->managed_sids && !dart->cold_ane &&
+	    !apple_dart_has_borrowed(dart))
+		pm_runtime_put(dev);
 
 	dev_dbg(
 		&pdev->dev,
@@ -3136,11 +4943,24 @@ params_done:
 	return 0;
 
 err_sysfs_remove:
+	/* Failed registration can already have published retained DMA state. */
+	if (dart->retained) {
+		if (dart->managed_sids)
+			apple_dart_managed_quarantine(dart);
+		apple_dart_quarantine_borrowed(dart, "registration failed");
+	}
 	iommu_device_sysfs_remove(&dart->iommu);
 err_free_irq:
-	free_irq(dart->irq, dart);
+	if (dart->irq >= 0)
+		apple_dart_free_irq(dart);
 err_clk_disable:
-	pm_runtime_put(dev);
+	if (dart->managed_sids && dart->retained && !READ_ONCE(dart->managed_failed))
+		apple_dart_managed_quarantine(dart);
+	/* Do not schedule suspend on failed radio or display adoption. */
+	if (dart->retained || dart->preserve_display)
+		pm_runtime_put_noidle(dev);
+	else
+		pm_runtime_put(dev);
 	clk_bulk_disable_unprepare(dart->num_clks, dart->clks);
 
 	return ret;
@@ -3248,20 +5068,63 @@ static void apple_dart_remove(struct platform_device *pdev)
 {
 	struct apple_dart *dart = platform_get_drvdata(pdev);
 
+	if (dart->cold_ane) {
+		dev_warn(&pdev->dev, "cold ANE DART retained until reset\n");
+		return;
+	}
+	if (dart->managed_sids) {
+		apple_dart_managed_quarantine(dart);
+		if (dart->irq >= 0)
+			apple_dart_free_irq(dart);
+		iommu_device_unregister(&dart->iommu);
+		iommu_device_sysfs_remove(&dart->iommu);
+		return;
+	}
+	if (apple_dart_has_borrowed(dart)) {
+		/* Unbind is suppressed and the module is pinned. If the device
+		 * itself is removed, detach callbacks before devres runs, while
+		 * retaining all state a domain or running firmware can reach.
+		 */
+		apple_dart_fail_borrowed(dart, "the DART device is removed");
+		if (dart->irq >= 0)
+			apple_dart_free_irq(dart);
+		iommu_device_unregister(&dart->iommu);
+		iommu_device_sysfs_remove(&dart->iommu);
+		dev_warn(&pdev->dev, "display DART removed; live state retained until hardware reset\n");
+		return;
+	}
+
 	/*
 	 * Cable removal gates the port clock before this device is removed.
 	 * A command issued then never completes. The next probe resets the
 	 * block after that clock is running again.
 	 */
-	if (!dart->locked && !READ_ONCE(dart->commands_gated))
+	if (!dart->locked && !dart->retained_mtp &&
+	    !READ_ONCE(dart->commands_gated))
 		apple_dart_hw_reset(dart);
 
-	free_irq(dart->irq, dart);
+	if (dart->irq >= 0)
+		apple_dart_free_irq(dart);
 
 	iommu_device_unregister(&dart->iommu);
 	iommu_device_sysfs_remove(&dart->iommu);
 
 	clk_bulk_disable_unprepare(dart->num_clks, dart->clks);
+}
+
+static void apple_dart_shutdown(struct platform_device *pdev)
+{
+	struct apple_dart *dart = platform_get_drvdata(pdev);
+
+	if (dart->managed_sids)
+		apple_dart_managed_quarantine(dart);
+	if (!apple_dart_has_borrowed(dart))
+		return;
+	/* Stop host publication; firmware mappings and backing stay intact
+	 * until the platform reset. The retained kexec guard prevents a new
+	 * kernel from reusing any of this memory without that reset.
+	 */
+	apple_dart_fail_borrowed(dart, "shutdown");
 }
 
 static const struct apple_dart_hw apple_dart_hw_t8103 = {
@@ -3372,21 +5235,9 @@ static const struct apple_dart_hw apple_dart_hw_t8110 = {
 	.ttbr_count = 1,
 };
 
-static __maybe_unused int apple_dart_suspend(struct device *dev)
+static void apple_dart_save_state(struct apple_dart *dart)
 {
-	struct apple_dart *dart = dev_get_drvdata(dev);
 	unsigned int sid, idx;
-
-	dart->tunnel_state_restored = false;
-	if (READ_ONCE(dart->commands_gated))
-		return 0;
-	/* The tunneled DART has no state to save when its domain stays on. */
-	if (dart->power_retained)
-		return 0;
-
-	/* Locked DARTs can't be restored so skip saving their registers. */
-	if (dart->locked)
-		return 0;
 
 	for (sid = 0; sid < dart->num_streams; sid++) {
 		dart->save_tcr[sid] = apple_dart_readl(dart,
@@ -3396,7 +5247,56 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 				apple_dart_readl(dart,
 						 DART_TTBR(dart, sid, idx));
 	}
+}
 
+static __maybe_unused int apple_dart_suspend(struct device *dev)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+
+	dart->tunnel_state_restored = false;
+	if (READ_ONCE(dart->commands_gated))
+		return 0;
+	/*
+	 * The cold ANE DARTs belong to the ANE backend, which refuses system
+	 * sleep up front while it runs the firmware. Otherwise they hold
+	 * nothing to keep: neither save nor reset them.
+	 */
+	if (dart->cold_ane)
+		return 0;
+	/*
+	 * An adopted external display DART may be off while its display is: no
+	 * register is read for sleep, and none until its firmware powers it up
+	 * again.
+	 */
+	if (dart->dispext) {
+		if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
+			return -EBUSY;
+		if (apple_dart_has_borrowed(dart))
+			apple_dart_dispext_invalidate(dart, true);
+		return 0;
+	}
+	/*
+	 * Retained radio and display DMA has no suspend boundary of its own.
+	 * Suspend-to-idle leaves it running in place: these DARTs have no
+	 * power domain here, and the DCP keeps the display domains on. The
+	 * registers are saved only for resume to check.
+	 */
+	if (dart->managed_sids || dart->preserve_display || apple_dart_has_borrowed(dart)) {
+		if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
+			return -EBUSY;
+		apple_dart_save_state(dart);
+		dart->s2idle_kept = true;
+		return 0;
+	}
+	/* The tunneled DART has no state to save when its domain stays on. */
+	if (dart->power_retained || dart->retained_mtp)
+		return 0;
+
+	/* Locked DARTs can't be restored so skip saving their registers. */
+	if (dart->locked)
+		return 0;
+
+	apple_dart_save_state(dart);
 	return 0;
 }
 
@@ -3460,11 +5360,53 @@ static int apple_dart_invalidate_each_stream(struct apple_dart *dart)
 	return 0;
 }
 
+/*
+ * Resume of a DART whose live DMA stayed in place through suspend-to-idle. It
+ * cannot be restored from the saved copy. If the translations changed, the
+ * consumers' DMA is no longer what they set up: refuse their further use
+ * through the same paths as a translation fault before failing resume, since
+ * a resume error does not stop the PM core from resuming them.
+ */
+static int apple_dart_resume_retained(struct apple_dart *dart)
+{
+	if (!dart->s2idle_kept)
+		return -EBUSY;
+	dart->s2idle_kept = false;
+	if (apple_dart_state_retained(dart))
+		return 0;
+
+	dev_err(dart->dev, "retained DMA state lost in suspend-to-idle\n");
+	if (dart->managed_sids)
+		apple_dart_managed_quarantine(dart);
+	apple_dart_quarantine_borrowed(dart, "retained DMA state lost in suspend-to-idle");
+	return -EIO;
+}
+
 static __maybe_unused int apple_dart_resume(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	unsigned int sid, idx;
 	int ret;
+
+	/* No reset or restore: see apple_dart_suspend(). */
+	if (dart->cold_ane)
+		return 0;
+	/*
+	 * An adopted external display DART may be off now, its display with it,
+	 * and nothing confirms otherwise: no register of it is read or written
+	 * (apple_dart_dispext_unconfirmed()) until its firmware powers it up
+	 * again; the state check then (apple_dart_dcp_dispext_state()) runs
+	 * first: kept, it goes on; lost, it is retired, saying so.
+	 */
+	if (dart->dispext) {
+		if (apple_dart_has_borrowed(dart)) {
+			apple_dart_dispext_invalidate(dart, false);
+			dev_dbg(dev, "external display DART unconfirmed after sleep\n");
+		}
+		return 0;
+	}
+	if (dart->managed_sids || dart->preserve_display || apple_dart_has_borrowed(dart))
+		return apple_dart_resume_retained(dart);
 
 	/* PCIe-C restored these mappings before starting its downstream link. */
 	if (dart->tunnel_state_restored) {
@@ -3477,7 +5419,7 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	 * state. Resetting one here is unnecessary; DART access must remain
 	 * ordered after PCIe-C port resume.
 	 */
-	if (dart->power_retained || READ_ONCE(dart->commands_gated))
+	if (dart->power_retained || dart->retained_mtp || READ_ONCE(dart->commands_gated))
 		return 0;
 
 	/* Locked DARTs can't be restored, and they should not need it */
@@ -3532,10 +5474,118 @@ static const struct of_device_id apple_dart_of_match[] = {
 	{ .compatible = "apple,t8103-dart", .data = &apple_dart_hw_t8103 },
 	{ .compatible = "apple,t8103-usb4-dart", .data = &apple_dart_hw_t8103_usb4 },
 	{ .compatible = "apple,t8110-dart", .data = &apple_dart_hw_t8110 },
+	{ .compatible = "apple,t8132-dart", .data = &apple_dart_hw_t8110 },
 	{ .compatible = "apple,t6000-dart", .data = &apple_dart_hw_t6000 },
 	{},
 };
 MODULE_DEVICE_TABLE(of, apple_dart_of_match);
+
+#if IS_ENABLED(CONFIG_APPLE_DART_J713_DCP)
+/*
+ * J713 external DCP: whether an adopted external display DART kept its
+ * state, its power on (the caller's to know): the TTBR/TCR lock (PROTECT
+ * and PROTECT_LOCK bit 0) as adopted, and the adopted streams' TCR and TTBR
+ * as adopted. Register reads only. Kept: no longer unverified after sleep.
+ * Lost (it is not rebuilt): every borrowed stream is retired, saying why.
+ * @when names the occasion for the log.
+ */
+static int apple_dart_dispext_verify(struct apple_dart *dart, const char *when)
+{
+	bool kept = true, was, current_gen = false;
+	unsigned long flags;
+	u32 protect, lock;
+	u64 gen;
+
+	/*
+	 * A use of its registers of its own, of the generation it starts in:
+	 * not while asleep (between suspend and resume nothing confirms its
+	 * power), and an invalidation meanwhile waits for it to end.
+	 */
+	spin_lock_irqsave(&dart->dispext_pm_lock, flags);
+	if (dart->dispext_sleeping) {
+		spin_unlock_irqrestore(&dart->dispext_pm_lock, flags);
+		dev_dbg(dart->dev, "external display DART %s during sleep: not checked\n", when);
+		return -EAGAIN;
+	}
+	gen = dart->dispext_gen;
+	was = dart->dispext_unverified;
+	dart->dispext_users++;
+	spin_unlock_irqrestore(&dart->dispext_pm_lock, flags);
+
+	protect = readl(dart->regs + DART_T8110_PROTECT);
+	lock = readl(dart->regs + DART_T8110_PROTECT_LOCK);
+	for (unsigned int i = 0; i < ARRAY_SIZE(dart->frontend); i++) {
+		struct apple_dart_dcp *dcp = dart->frontend[i];
+		u32 tcr, ttbr;
+
+		if (!dcp)
+			continue;
+		tcr = readl(dart->regs + DART_TCR(dart, dcp->sid));
+		ttbr = readl(dart->regs + DART_TTBR(dart, dcp->sid, 0));
+		kept &= tcr == DART_T8110_TCR_TRANSLATE_ENABLE && ttbr == dcp->ttbr;
+		dev_dbg(dart->dev, "external display DART %s: SID%u TCR %08x TTBR0 %08x (adopted %08x)\n",
+			when, dcp->sid, tcr, ttbr, dcp->ttbr);
+	}
+	/* The lock as adopted: set then, it must still be set. */
+	kept &= (protect & lock & DART_T8110_PROTECT_TTBR_TCR) ==
+		(dart->dispext_protect & dart->dispext_lock & DART_T8110_PROTECT_TTBR_TCR);
+
+	spin_lock_irqsave(&dart->dispext_pm_lock, flags);
+	/* Only a check of the current generation confirms: a sleep since voids it. */
+	current_gen = gen == dart->dispext_gen;
+	if (kept && current_gen)
+		dart->dispext_unverified = false;
+	if (!--dart->dispext_users)
+		wake_up_all(&dart->dispext_wq);
+	spin_unlock_irqrestore(&dart->dispext_pm_lock, flags);
+
+	dev_dbg(dart->dev, "external display DART %s: protect %08x lock %08x (adopted %08x/%08x): state %s%s%s\n",
+		when, protect, lock, dart->dispext_protect, dart->dispext_lock,
+		kept ? "kept" : "lost",
+		was ? " (unconfirmed since sleep until now)" : "",
+		kept && !current_gen ? "; a sleep came meanwhile: not confirmed" : "");
+	if (!kept) {
+		apple_dart_quarantine_borrowed(dart, "state lost (TTBR, TCR or the lock not as adopted)");
+		return -EIO;
+	}
+	return current_gen ? 0 : -EAGAIN;
+}
+
+/*
+ * J713 external DCP: after its firmware switched the display DART on again,
+ * check that the DART kept its state: the TTBR/TCR lock (PROTECT and
+ * PROTECT_LOCK bit 0) still set, and the adopted streams' TCR and TTBR as
+ * adopted. Register reads only. A lost state is not rebuilt: the borrowed
+ * streams are retired. @consumer is the dcpext's piodma node; -ENODEV if
+ * its DART is not an adopted external display DART.
+ */
+int apple_dart_dcp_dispext_state(struct device_node *consumer)
+{
+	struct of_phandle_args spec;
+	struct platform_device *pdev;
+	struct apple_dart *dart;
+	int ret = -ENODEV;
+
+	if (!consumer ||
+	    of_parse_phandle_with_args(consumer, "iommus", "#iommu-cells", 0, &spec))
+		return -ENODEV;
+	pdev = of_find_device_by_node(spec.np);
+	of_node_put(spec.np);
+	if (!pdev)
+		return -ENODEV;
+	/* Only a bound, adopted one: a failed probe leaves no live state. */
+	if (!device_is_bound(&pdev->dev) || pdev->dev.driver != &apple_dart_driver.driver)
+		goto out;
+	dart = platform_get_drvdata(pdev);
+	if (!dart || !dart->dispext || !dart->frontend[1])
+		goto out;
+	ret = apple_dart_dispext_verify(dart, "after power-up");
+out:
+	put_device(&pdev->dev);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_dart_dcp_dispext_state);
+#endif
 
 static struct platform_driver apple_dart_driver = {
 	.driver	= {
@@ -3546,6 +5596,7 @@ static struct platform_driver apple_dart_driver = {
 	},
 	.probe	= apple_dart_probe,
 	.remove = apple_dart_remove,
+	.shutdown = apple_dart_shutdown,
 };
 
 module_platform_driver(apple_dart_driver);
