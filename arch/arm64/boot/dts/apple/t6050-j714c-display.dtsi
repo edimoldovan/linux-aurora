@@ -28,29 +28,29 @@
 };
 
 &{/reserved-memory} {
-	/* iop-dcp-nub segment-ranges: phys, size, and the DART address (remap). */
+	/*
+	 * iop-dcp-nub segment-ranges (phys, size): reserved RAM. The DCP's DART is locked on
+	 * the firmware's four-level root, whose slot 16 maps these at their remap DVAs; Linux
+	 * resolves them through those tables and never maps into that slot.
+	 */
 	dcp_fw_text: asc-firmware@1000031c000 {
 		compatible = "apple,asc-mem";
 		reg = <0x100 0x0031c000 0x0 0x9a4000>;
-		iommu-addresses = <&dcp 0x100 0x07ccc000 0x0 0x9a4000>;
 		no-map;
 	};
 	dcp_fw_data: asc-firmware@11fd21ac000 {
 		compatible = "apple,asc-mem";
 		reg = <0x11f 0xd21ac000 0x0 0xb04000>;
-		iommu-addresses = <&dcp 0x100 0x08670000 0x0 0xb04000>;
 		no-map;
 	};
 	dcp_fw_shared: asc-firmware@11fd218c000 {
 		compatible = "apple,asc-mem";
 		reg = <0x11f 0xd218c000 0x0 0x20000>;
-		iommu-addresses = <&dcp 0x100 0x09174000 0x0 0x20000>;
 		no-map;
 	};
 	dcp_fw_shared_rw: asc-firmware@11fd2cb0000 {
 		compatible = "apple,asc-mem";
 		reg = <0x11f 0xd2cb0000 0x0 0x8000>;
-		iommu-addresses = <&dcp 0x100 0x09194000 0x0 0x8000>;
 		no-map;
 	};
 	/*
@@ -66,32 +66,27 @@
 	dcp_fw_5: asc-firmware@11fd8cd8000 {
 		compatible = "apple,asc-mem";
 		reg = <0x11f 0xd8cd8000 0x0 0xc00000>;
-		iommu-addresses = <&dcp 0x100 0x014d0000 0x0 0xc00000>;
 		no-map;
 	};
 	dcp_fw_6: asc-firmware@11fd8978000 {
 		compatible = "apple,asc-mem";
 		reg = <0x11f 0xd8978000 0x0 0x360000>;
-		iommu-addresses = <&dcp 0x100 0x020fc000 0x0 0x360000>;
 		no-map;
 	};
 	dcp_fw_7: asc-firmware@11fd88b8000 {
 		compatible = "apple,asc-mem";
 		reg = <0x11f 0xd88b8000 0x0 0xc0000>;
-		iommu-addresses = <&dcp 0x100 0x0245c000 0x0 0xc0000>;
 		no-map;
 	};
 	/* Starts at the framebuffer iBoot scans out of (m1n1: FDT: framebuffer@11fd310c000). */
 	dcp_fw_8: asc-firmware@11fd310c000 {
 		compatible = "apple,asc-mem";
 		reg = <0x11f 0xd310c000 0x0 0x57ac000>;
-		iommu-addresses = <&dcp 0x100 0x0251c000 0x0 0x57ac000>;
 		no-map;
 	};
 	dcp_fw_9: asc-firmware@11fd3104000 {
 		compatible = "apple,asc-mem";
 		reg = <0x11f 0xd3104000 0x0 0x4000>;
-		iommu-addresses = <&dcp 0x100 0x07cc8000 0x0 0x4000>;
 		no-map;
 	};
 };
@@ -119,23 +114,23 @@
 		power-domains = <&ps_disp_cpu>;
 	};
 
-	/* ADT dart-disp0: sid 0 (display) and 16 (piodma), window at 1 TiB as on J813. */
+	/* ADT dart-disp0: sid 0 (display) and 16 (piodma); Linux's window 1-2 TiB (DCP DMA is 41 bits) */
 	disp0_dart: iommu@48a300000 {
 		compatible = "apple,t6050-dart", "apple,t8142-dart", "apple,t8110-dart";
 		reg = <0x4 0x8a300000 0x0 0xc000>;
 		interrupts = <AIC_IRQ 990 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		apple,dma-range = <0x100 0x0 0x100 0x0>;
 		power-domains = <&ps_disp_cpu>;
 	};
 
-	/* ADT dart-dcp: sid 23, the same window. */
+	/* ADT dart-dcp: sid 23, the same window; the firmware's slot 16 (1 TiB + 64 GiB) is kept */
 	dcp_dart: iommu@48a340000 {
 		compatible = "apple,t6050-dart", "apple,t8142-dart", "apple,t8110-dart";
 		reg = <0x4 0x8a340000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 990 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		apple,dma-range = <0x100 0x0 0x100 0x0>;
 		power-domains = <&ps_disp_cpu>;
 	};
 
