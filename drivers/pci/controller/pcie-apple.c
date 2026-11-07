@@ -4443,8 +4443,14 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
 
-	if (pcie->hw->adopt_link)
-		return -EBUSY;
+	/*
+	 * Linux cannot retrain an adopted link: keep its power domain on
+	 * through suspend-to-idle and leave the link exactly as it is.
+	 */
+	if (pcie->hw->adopt_link) {
+		device_set_awake_path(dev);
+		return 0;
+	}
 	if (!pcie->hw->tunneled)
 		return 0;
 	pcie->reset_on_resume = false;
