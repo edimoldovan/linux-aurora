@@ -352,6 +352,24 @@
 };
 
 /*
+ * iBoot leaves the N1 port's gates in automatic power management with the
+ * target on and the block gated (APCIE_SYS_GP and APHY_GP_AUS5 actual 0,
+ * APCIE_PHY_SW actual 4). The kernel trains the port, so these gates stay
+ * at the requested state.
+ */
+&ps_apcie_sys_gp {
+	apple,no-auto-pm;
+};
+
+&ps_apcie_phy_sw {
+	apple,no-auto-pm;
+};
+
+&ps_aphy_gp_aus5 {
+	apple,no-auto-pm;
+};
+
+/*
  * The N1 (Wi-Fi and Bluetooth) on apcie0 port 0, as aurora-silicon's t6050-j716c.dts names it;
  * the J714c has the same port, registers and pins (ADT 2026-11-05). iBoot leaves the port
  * untrained and the N1 off (SMC GPIO gP13 low, PERST# GPIO 80 low); the kernel trains it.
