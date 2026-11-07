@@ -95,6 +95,33 @@ static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 #endif
 	}
 
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+	/*
+	 * Firmware 27.3's swap record is 0x830 bytes: 0x40 more before swap_id,
+	 * which moves to 0xd8, the rest of the firmware-27.0 record after it,
+	 * and the kernel's fields from 0x720, of which the firmware reads the
+	 * mask of the mapped surfaces at 0x728.  The surfaces and the rest of
+	 * the request follow the record.
+	 */
+	if (dcp->hw.fw_27_3 && data == &dcp->present_v27) {
+		const u8 *v = data;
+		u8 *w = dcp->present_27_3;
+		u32 enabled = get_unaligned_le32(v + offsetof(struct dcp_swap_v27,
+							      swap_enabled));
+
+		memset(w, 0, 0x830);
+		memcpy(w, v, 0x98);
+		memcpy(w + 0xd8, v + 0x98, sizeof(struct dcp_swap_v27) - 0x98);
+		put_unaligned_le32(enabled & 0xf, w + 0x728);
+		memcpy(w + 0x830, v + sizeof(struct dcp_swap_v27),
+		       sizeof(struct dcp_swap_submit_req_v27) -
+		       sizeof(struct dcp_swap_v27));
+		dcp_push(dcp, oob, &dcp_methods[dcpep_swap_submit],
+			 sizeof(dcp->present_27_3),
+			 sizeof(struct dcp_swap_submit_resp_h17p), w, cb, cookie);
+		return;
+	}
+#endif
 	dcp_push(dcp, oob, &dcp_methods[dcpep_swap_submit],
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 		 sizeof(struct dcp_swap_submit_req_v27),

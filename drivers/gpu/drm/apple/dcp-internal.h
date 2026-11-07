@@ -370,6 +370,8 @@ struct apple_dcp {
 	u32 iomfb_boolean_property_count;
 	u32 external_pipes_v27, external_displays_v27, external_suppression_v27;
 	struct dcp_swap_submit_req_v27 present_v27;
+	/* The present request as firmware 27.3 takes it, see dcp_swap_submit() */
+	u8 present_27_3[0x1144];
 	/* Both paired wire records belong to the primary endpoint lock. */
 	struct dcp_swap_submit_req_v27 peer_present_v27;
 
