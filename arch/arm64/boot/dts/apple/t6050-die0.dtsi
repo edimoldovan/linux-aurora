@@ -379,6 +379,8 @@
 		#iommu-cells = <1>;
 		/* iBoot leaves its block gated; it is read at probe */
 		power-domains = <&ps_apcie_sys_gp>;
+		/* Its registers answer only once the root complex is up */
+		apple,manual-availability;
 		status = "disabled";
 	};
 
