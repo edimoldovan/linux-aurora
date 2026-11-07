@@ -667,6 +667,8 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 		return dcp->dcpavservep;
 	if (dcp->dptxep && endpoint == dcp->dptxep->endpoint)
 		return dcp->dptxep;
+	if (endpoint >= 0x20 && endpoint < 0x40 && dcp->plain_afk[endpoint - 0x20])
+		return dcp->plain_afk[endpoint - 0x20];
 	switch (endpoint) {
 	case AV_ENDPOINT:
 		return dcp->avep;
@@ -2449,6 +2451,43 @@ unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev)
 	return dcp->iomfb_surfaces;
 }
 
+/*
+ * Firmware 27.3 expects the endpoints macOS starts on the internal display
+ * processor: disp0, the DPTX controller and port, and AFK endpoints for
+ * services Linux does not use.
+ */
+static void dcp_start_fw_27_3_endpoints(struct apple_dcp *dcp)
+{
+	static const struct apple_epic_service_ops no_services[] = { {} };
+	static const u8 plain[] = { 0x21, 0x22, 0x25, 0x28, 0x29, 0x2a, 0x2b, 0x31 };
+	struct apple_dcp_afkep *ep;
+	int k, ret;
+
+	ret = ibootep_init(dcp);
+	if (ret)
+		dev_warn(dcp->dev, "disp0 endpoint: %d\n", ret);
+	ret = dptx_controller_init(dcp);
+	if (ret)
+		dev_warn(dcp->dev, "DPTX controller endpoint: %d\n", ret);
+	ret = dptxep_init(dcp);
+	if (ret)
+		dev_warn(dcp->dev, "DPTX endpoint: %d\n", ret);
+
+	for (k = 0; k < ARRAY_SIZE(plain); k++) {
+		if (dcp_afkep(dcp, plain[k]))
+			continue;
+		ep = afk_init(dcp, plain[k], no_services);
+		if (IS_ERR_OR_NULL(ep)) {
+			dev_warn(dcp->dev, "endpoint %#x: %ld\n", plain[k], PTR_ERR(ep));
+			continue;
+		}
+		dcp->plain_afk[plain[k] - 0x20] = ep;
+		ret = afk_start(ep);
+		if (ret)
+			dev_warn(dcp->dev, "endpoint %#x start: %d\n", plain[k], ret);
+	}
+}
+
 int dcp_start(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -2547,6 +2586,8 @@ int dcp_start(struct platform_device *pdev)
 	} else if (dcp->phy) {
 		dev_warn(dcp->dev, "OS firmware incompatible with dptxport EP\n");
 	}
+	if (dcp->hw.fw_27_3)
+		dcp_start_fw_27_3_endpoints(dcp);
 	ret = iomfb_start_rtkit(dcp);
 	if (ret) {
 		dev_err(dcp->dev, "Failed to start IOMFB endpoint: %d\n", ret);

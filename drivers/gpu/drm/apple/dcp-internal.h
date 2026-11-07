@@ -529,6 +529,8 @@ struct apple_dcp {
 	struct dcp_panel panel;
 
 	struct apple_dcp_afkep *systemep;
+	/* Endpoints started for the firmware only, by endpoint - 0x20 */
+	struct apple_dcp_afkep *plain_afk[0x20];
 	struct completion systemep_done;
 
 	struct apple_dcp_afkep *ibootep;
