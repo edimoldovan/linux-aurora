@@ -1741,6 +1741,26 @@ const POWER_CONFIG_HEAD_WORDS: Words = &[
     (0x1c98, 0xff7fff7f, 74),
 ];
 
+/// The die temperature limiter, relative to its place in the tail: G17P 0x550, and 0x34
+/// bytes later on g17c (secondary firmware: the limiter at PowerConfig + 0x231c).
+const LIMITER_WORDS: Words = &[
+    (0x0, TEMP_SENSOR_MASK as u32, 1),
+    (0x8, TEMP_RELEASE, 1),
+    (0x10, 4, 1),
+    (0x24, 0x3f800000, 1),
+    (0x2c, TEMP_KI, 1),
+    (0x38, 0x47800000, 1),
+    (0x3c, TEMP_KP, 1),
+    (0x48, 0x28, 1),
+    (0x4c, 0x3e8, 2),
+    (0x5c, TEMP_TARGET, 1),
+    (0x90, 0x3e8, 1),
+];
+/// Tail offset of [`LIMITER_WORDS`] for G17P.
+const LIMITER_G17P: usize = 0x550;
+/// Tail offset of [`LIMITER_WORDS`] for g17c.
+const LIMITER_G17C: usize = 0x584;
+
 const POWER_CONFIG_TAIL_WORDS: Words = &[
     (0x0, 0xff7fff7f, 181),
     (0x2d4, 0x7fff7f, 1),
@@ -1753,17 +1773,6 @@ const POWER_CONFIG_TAIL_WORDS: Words = &[
     (0x504, 0x3e8, 1),
     (0x50c, 0x3f4ccccd, 1),
     (0x510, 0x3e4ccccd, 1),
-    (0x550, TEMP_SENSOR_MASK as u32, 1),
-    (0x558, TEMP_RELEASE, 1),
-    (0x560, 4, 1),
-    (0x574, 0x3f800000, 1),
-    (0x57c, TEMP_KI, 1),
-    (0x588, 0x47800000, 1),
-    (0x58c, TEMP_KP, 1),
-    (0x598, 0x28, 1),
-    (0x59c, 0x3e8, 2),
-    (0x5ac, TEMP_TARGET, 1),
-    (0x5e0, 0x3e8, 1),
     (0x7fc, 0x42000006, 1),
     (0xa10, 0xb8520000, 1),
     (0xa14, 0x3f7e, 1),
@@ -1992,8 +2001,15 @@ pub(crate) struct PowerConfigTail(pub(crate) [u8; 0x1000]);
 unsafe impl Zeroable for PowerConfigTail {}
 
 impl PowerConfigTail {
-    fn init(&mut self) {
+    fn init(&mut self, limiter: usize) {
         fill_words(&mut self.0, POWER_CONFIG_TAIL_WORDS);
+        put_words(&mut self.0[limiter..], LIMITER_WORDS);
+        if limiter == LIMITER_G17C {
+            // The g17c secondary reads PowerConfig+0x2d78 (tail 0xfb8) next to the 110 C
+            // target at a kick (trace 0x20e); macOS has 11200 there (112.00 C), where the
+            // G17P tail has 65536.0.
+            put_words(&mut self.0, &[(0xfb8, 11_200, 1)]);
+        }
     }
 }
 
@@ -2036,7 +2052,13 @@ impl PowerConfig {
     /// Initializes the power configuration.
     pub(crate) fn init(&mut self) {
         self.head.init();
-        self.tail.init();
+        self.tail.init(LIMITER_G17P);
+    }
+
+    /// Initializes the g17c power configuration.
+    pub(crate) fn init_g17c(&mut self) {
+        self.head.init();
+        self.tail.init(LIMITER_G17C);
     }
 }
 

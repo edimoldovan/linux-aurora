@@ -1054,7 +1054,10 @@ impl InitData {
             )?;
         self.object_mut(self.bundle)?
             .initialize::<abi::PowerConfig>(abi::bundle::POWER_CONFIG, |power| {
-                power.init();
+                match cfg.abi {
+                    Abi::G17p => power.init(),
+                    Abi::G17c => power.init_g17c(),
+                }
                 Ok(())
             })?;
         let secondary_status = base
