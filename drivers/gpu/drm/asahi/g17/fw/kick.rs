@@ -519,6 +519,7 @@ impl KickRegistration {
     /// AGXG17X: 0x0020_0800_0002_1008 | qid << 44 (the G17P form was
     /// 0x0000_0400_0002_1008 | qid << 43).
     const CONFIG_TAG: u64 = 0x0020_0800_0002_1008;
+    const ADD_KICKS_TAG: u64 = 0x0020_0800_0002_1018;
     const QID_SHIFT: u32 = 44;
     const ADDRESS_MASK: u64 = 0x0000_07ff_ffff_ffe0;
 
@@ -552,6 +553,15 @@ impl KickRegistration {
 
     pub(crate) fn writes(&self) -> &[(usize, u64)] {
         &self.writes
+    }
+
+    /// AGXG17X KSMKickQueue::addKicks: `count` new entries on queue `qid`,
+    /// through the same port as the configuration.
+    pub(crate) fn add_kicks(qid: u8, count: u64) -> [(usize, u64); 2] {
+        [
+            (Self::TAG_PORT, Self::ADD_KICKS_TAG | (u64::from(qid) << Self::QID_SHIFT)),
+            (Self::DATA_PORT, count),
+        ]
     }
 }
 

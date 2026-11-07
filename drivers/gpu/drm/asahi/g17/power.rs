@@ -76,8 +76,9 @@ pub(super) trait Control {
 
 fn wait<C: Control>(control: &C, target: u32, require_powered: bool) -> kernel::error::Result {
     use kernel::prelude::*;
-    const RETIRE_POLLS: usize = 20;
-    const POWER_POLLS: usize = 250;
+    // TEMP (T6050 kick bring-up): 200 ms and 1 s (were 20 and 250).
+    const RETIRE_POLLS: usize = 200;
+    const POWER_POLLS: usize = 1000;
     let mut retired = false;
     for elapsed in 0..RETIRE_POLLS + POWER_POLLS {
         if control.crashed() {

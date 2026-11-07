@@ -1109,6 +1109,12 @@ impl InitData {
                 aux.init(secondary_status);
                 Ok(())
             })?;
+        if matches!(cfg.abi, Abi::G17c) {
+            // TEMP (T6050 kick bring-up): the g17c secondary runs its per-kick power block
+            // (trace 0x209 at gfx1 0x14a34) only if PowerConfig+0x449c (= AUX+0x16dc) != 0.
+            self.object_mut(self.bundle)?
+                .write(abi::bundle::AUX + 0x16dc, 1u32)?;
+        }
         self.object_mut(self.bundle)?
             .initialize::<abi::PowerConfigHead>(abi::bundle::POWER_CONFIG_COPY, |power| {
                 power.init();

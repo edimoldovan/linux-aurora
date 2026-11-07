@@ -779,7 +779,10 @@ impl G17Resources {
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let sgx = (&*sgx).as_view();
         let val = sgx.try_read32(G17_GATING_CONTROL)?;
-        sgx.try_write32(val & !G17_GATING_DISABLE, G17_GATING_CONTROL)
+        // TEMP (T6050 kick bring-up): keep dynamic gating disabled (bit 2 held) for the whole
+        // run, so no block is gated while the firmware powers up, checks or dispatches.
+        let _ = G17_GATING_DISABLE;
+        sgx.try_write32(val | G17_GATING_HOLD, G17_GATING_CONTROL)
     }
 
 }

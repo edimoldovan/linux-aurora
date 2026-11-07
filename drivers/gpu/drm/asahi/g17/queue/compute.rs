@@ -1357,6 +1357,25 @@ impl Queue {
     }
 
     /// Exact host identity remains valid even when several commands share an ioctl ID.
+    /// The hardware registration a queue needs before its first kick (AGXG17X
+    /// KSMKickQueue::configureHardware also installs compute queues), or `None` once installed.
+    pub(crate) fn hardware_registration(
+        &self,
+        priority: u8,
+    ) -> Option<Result<crate::g17::fw::kick::KickRegistration>> {
+        // TEMP (T6050 kick bring-up): the firmware registers the queue itself from the config
+        // item (trace 0x40), as the T8140 path relies on; no host registration.
+        let _ = priority;
+        (false && !self.installed).then(|| {
+            crate::g17::fw::kick::KickRegistration::new(
+                self.qid(),
+                self.kick.low_va(),
+                DataMaster::Compute,
+                priority,
+            )
+        })
+    }
+
     pub(crate) fn owns_packet(&self, packet: &Arc<Packet>) -> bool {
         self.active
             .iter()
@@ -1606,6 +1625,8 @@ pub(crate) trait Host {
     fn publish_outer(&mut self, priority: u8, slot: &crate::g17::fw::channels::WorkSlot)
         -> Result;
     fn notify(&mut self, message: u64) -> Result;
+    /// Tells the KSM about the one new entry on `qid` (AGXG17X addKicks).
+    fn add_kicks(&mut self, qid: u8, priority: u8) -> Result;
     fn note_submission(&mut self) -> Result;
 }
 
@@ -1710,7 +1731,10 @@ impl Queue {
             qid,
             timestamp: kick_timestamp,
             parent: kick_parent,
-            implicit_parent: true,
+            // TEMP (T6050 kick bring-up): AGXG17X lists the parent on every kick, relative to
+            // a queue base we do not seed; a first-kick parent of stamp 0 may never count as
+            // done. Back to the T8140 behaviour for this test.
+            implicit_parent: self.kick.has_previous(),
             barriers: dependencies,
             descriptor_va: descriptor_high,
             queue_va: self.graph.graph.gpu_va(),
@@ -1906,6 +1930,9 @@ impl Queue {
             }
             fence(Ordering::SeqCst);
             host.notify((0x83 << 48) | 0x10)?;
+            // TEMP (T6050 kick bring-up): the primary re-registers the queue when it consumes
+            // the config item (clear, then set valid); add the kick only after that.
+            host.add_kicks(qid, policy.priority())?;
             host.note_submission()
         })();
         if let Err(error) = result {

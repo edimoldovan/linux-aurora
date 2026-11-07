@@ -1147,7 +1147,48 @@ impl Gpu {
             .init(session.init.root_va(Role::Secondary)?)?;
         session.primary.notify(MSG_POWER_ON_DONE)?;
         session.secondary.notify(MSG_POWER_ON_DONE)?;
-        Self::wait_for_opening(dev, &session.init, &session.primary, &session.secondary)?;
+        let opened =
+            Self::wait_for_opening(dev, &session.init, &session.primary, &session.secondary);
+        // TEMP (T6050 kick bring-up)
+        pr_info!(
+            "G17 TEMP hw data 0x27b0.. after opening ({:?}) {:08x?}\n",
+            opened,
+            session.init.temp_hw_data_tail()
+        );
+        session.init.temp_dump_secondary_inputs("after opening");
+        // TEMP (T6050 kick bring-up): the primary arms the KSM interrupt (sgx+0x10a08,
+        // 0x211b0 = 3, and 0x21230 = 1 for bit 21) at power-up only if its u64 at fw VA
+        // 0x10a538 is non-zero; nothing we know sets it. Its DATA segment is at phys
+        // 0x1_0002_7ac000 (iova 0x50000, ADT segment-ranges), so the word is at
+        // phys 0x1_0002_866538. Set bit 21 (the KSM ring event) before the first kick.
+        {
+            const PHYS: u64 = 0x1_0002_7ac000 + (0x10a538 - 0x50000);
+            let page = PHYS & !0x3fff;
+            // SAFETY: firmware DATA RAM handed over by the boot loader; one aligned u64 in
+            // the mapped 16 KiB page is accessed, and the mapping is dropped right after.
+            unsafe {
+                let raw = kernel::bindings::memremap(
+                    page,
+                    0x4000,
+                    kernel::bindings::MEMREMAP_WB as _,
+                );
+                if raw.is_null() {
+                    pr_info!("G17 TEMP ksm irq mask: memremap failed\n");
+                } else {
+                    let word = raw.cast::<u8>().add((PHYS - page) as usize).cast::<u64>();
+                    let before = word.read_volatile();
+                    word.write_volatile(before | 1 << 21);
+                    core::sync::atomic::fence(Ordering::SeqCst);
+                    pr_info!(
+                        "G17 TEMP ksm irq mask fw 0x10a538: {:#x} -> {:#x}\n",
+                        before,
+                        word.read_volatile()
+                    );
+                    kernel::bindings::memunmap(raw);
+                }
+            }
+        }
+        opened?;
         session
             .uat
             .activate_render_context(&session._render_global)?;

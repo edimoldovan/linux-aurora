@@ -333,6 +333,10 @@ impl Queue {
     pub(crate) fn timestamp(&self) -> KickTimestamp {
         self.timestamp
     }
+    /// The queue has kicked since creation or recovery.
+    pub(crate) fn has_previous(&self) -> bool {
+        self.previous.is_some()
+    }
     pub(crate) fn parent(&self) -> KickTimestamp {
         self.previous.unwrap_or_else(|| match self.id.engine {
             DataMaster::Compute => KickTimestamp::ZERO,

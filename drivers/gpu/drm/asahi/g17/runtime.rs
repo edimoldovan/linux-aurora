@@ -843,6 +843,7 @@ struct ComputeHost<'a> {
     effort: &'a mut super::power::Effort,
     qids: &'a mut kick::QueueIds,
     accounting: &'a mut qos::Accounting,
+    regs: &'a crate::regs::G17Resources,
     generation: u64,
 }
 impl compute::Host for ComputeHost<'_> {
@@ -885,6 +886,34 @@ impl compute::Host for ComputeHost<'_> {
     fn notify(&mut self, message: u64) -> Result {
         self.primary.notify(message)
     }
+    fn add_kicks(&mut self, qid: u8, priority: u8) -> Result {
+        use kernel::time::{delay::fsleep, Delta};
+        // TEMP (T6050 kick bring-up): wait up to 100 ms for the primary to consume the slot.
+        let mut waited = 0;
+        while waited < 100 {
+            match self.init.work_cursors(priority, DataMaster::Compute) {
+                Ok([consumer, _, producer]) if consumer == producer => break,
+                _ => {}
+            }
+            fsleep(Delta::from_millis(1));
+            waited += 1;
+        }
+        // TEMP (T6050 kick bring-up): the firmware adds the kick itself from the announce
+        // item (trace 0x41), so the host write is left out; only the KSM state is logged.
+        pr_info!("G17 TEMP addKicks skipped after {} ms of slot wait\n", waited);
+        // TEMP (T6050 kick bring-up)
+        self.regs.temp_ksm_window("after kick");
+        // TEMP (T6050 kick bring-up): force the event flags the kick may wait on.
+        self.regs.temp_ksm_set_flags();
+        fsleep(Delta::from_millis(5));
+        self.regs.temp_ksm_window("after flags");
+        pr_info!(
+            "G17 TEMP addKicks qid {} KSM 21038/40/1c8/1d0/21168 {:x?}\n",
+            qid,
+            self.regs.temp_ksm()
+        );
+        Ok(())
+    }
     fn note_submission(&mut self) -> Result {
         self.effort.submit();
         super::Firmware::apply_shared_effort(self.init, self.effort, super::power::FULL_EFFORT)
@@ -910,11 +939,60 @@ impl super::Firmware {
         {
             return Err(EAGAIN);
         }
+        let registration = self
+            .queues
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .find(|queue| queue.owner() == Some(owner))
+            .ok_or(EIO)?
+            .hardware_registration(packet.context.policy().priority())
+            .transpose()?;
         super::channel::temp_mark_kick();
         // Hold the GPU powered (KeepPowered) across compute kicks: the firmware's KSM
         // scheduling pause is acknowledged only while the GPU is held on.
         if let Err(error) = self.acquire_registration_power() {
             pr_warn!("G17 compute power hold failed: {:?}\n", error);
+        }
+        let result =
+            self.publish_compute_registered(owner, packet, dependencies, deferred, registration);
+        // TEMP (T6050 kick bring-up): empty the trace rings so the records after the kick fit.
+        self.temp_drain_traces();
+        pr_info!(
+            "G17 TEMP Region C 0xe0.. after kick {:08x?}\n",
+            self.init.temp_region_c_words()
+        );
+        result
+    }
+
+    fn publish_compute_registered(
+        &mut self,
+        owner: u64,
+        packet: Arc<super::job::Packet>,
+        dependencies: &[super::fw::kick::KickDependency],
+        deferred: &mut DeferredBatch,
+        registration: Option<super::fw::kick::KickRegistration>,
+    ) -> Result {
+        use kernel::time::{delay::fsleep, Delta};
+        let mut pre_installed = false;
+        if let Some(registration) = &registration {
+            // TEMP (T6050 kick bring-up): the compute queue registration writes.
+            pr_info!("G17 TEMP compute registration {:x?}\n", registration.writes());
+            let mut installed = false;
+            for _ in 0..3 {
+                if self.bridge.regs.install_kick_queues(registration.writes())? {
+                    installed = true;
+                    break;
+                }
+            }
+            pre_installed = installed;
+            pr_info!(
+                "G17 TEMP compute registration installed {} (0xe01000 = {:#x}) KSM 21038/40/1c8/1d0/21168 {:x?}\n",
+                installed,
+                self.bridge.regs.temp_core_power(),
+                self.bridge.regs.temp_ksm()
+            );
         }
         let queues = &mut self.queues;
         let queue = queues
@@ -930,17 +1008,29 @@ impl super::Firmware {
             effort: &mut self.effort,
             qids: &mut queues.qids,
             accounting: &mut queues.accounting,
+            regs: &self.bridge.regs,
             generation: self.recovery.generation(),
         };
         let result = queue.publish(packet, dependencies, &mut host, &mut |event| {
             deferred.push(event)
         });
-        // TEMP (T6050 kick bring-up): empty the trace rings so the records after the kick fit.
-        self.temp_drain_traces();
-        pr_info!(
-            "G17 TEMP Region C 0xe0.. after kick {:08x?}\n",
-            self.init.temp_region_c_words()
-        );
+        // TEMP (T6050 kick bring-up): the kick powers the GPU up; retry the registration then,
+        // logging every change of the raw witness for up to 1 s.
+        if let (Ok(()), Some(registration), false) = (&result, &registration, pre_installed) {
+            let mut last = u32::MAX;
+            for tick in 0..1000 {
+                let raw = self.bridge.regs.temp_core_power();
+                if raw != last {
+                    pr_info!("G17 TEMP after kick +{} ms 0xe01000 = {:#x}\n", tick, raw);
+                    last = raw;
+                }
+                if self.bridge.regs.install_kick_queues(registration.writes())? {
+                    pr_info!("G17 TEMP compute registration installed after kick at +{} ms\n", tick);
+                    break;
+                }
+                fsleep(Delta::from_millis(1));
+            }
+        }
         result
     }
 }

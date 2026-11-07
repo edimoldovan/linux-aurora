@@ -1170,6 +1170,11 @@ impl<const SLOTS: usize, const CHIP_HI: usize, const GAP_A: usize, const GAP_B: 
         self.unk_ed8 = 0x10;
         self.unk_ee0 = [1; 3];
         self.unk_f04 = 0x1f;
+        if Self::G17C {
+            // TEMP (T6050 kick bring-up): hw data 0x1024 (macOS: [accel+0x106b0]) selects the
+            // primary's interrupt mask; 2 adds bit 34 (0x0e0e_0062_0038 instead of 0x0e0a_...).
+            self.unk_f08[..4].copy_from_slice(&2u32.to_le_bytes());
+        }
         self.unk_f24 = 4;
         self.unk_f34 = 1;
         self.unk_f38 = 1;
@@ -1207,6 +1212,12 @@ impl<const SLOTS: usize, const CHIP_HI: usize, const GAP_A: usize, const GAP_B: 
         self.unk_2550 = 7;
         self.unk_2554 = 7;
         self.unk_2568 = 5;
+        if Self::G17C {
+            // TEMP (T6050 kick bring-up): AGXG17X writes the 128-bit GPU core mask at 0x267c
+            // ([accel+0x478]) and its popcount at 0x268c. T6050: 40 cores (0xffffffff, 0xff).
+            self.unk_2558[..8].copy_from_slice(&0xff_ffff_ffffu64.to_le_bytes());
+            self.unk_2568 = 40;
+        }
         self.unk_2570 = 1;
 
         self.unk_258e = WORK_CHANNELS as u16;
