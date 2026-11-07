@@ -219,6 +219,8 @@ struct apple_dcp_hw_data {
 	 * own clock rather than the AP's counter: leave the swap timestamps zero.
 	 */
 	bool swap_no_timestamps;
+	/* Use the full panel height, the notch rows included. */
+	bool show_notch;
 };
 
 enum dcp_test_point {

@@ -3760,6 +3760,8 @@ static bool dcp_external_is_idle(struct apple_dcp *dcp)
  */
 static bool dcp_show_notch(struct apple_dcp *dcp)
 {
+	if (dcp->hw.show_notch)
+		return true;
 	if (dcp->fw_compat != DCP_FIRMWARE_V_14_7 &&
 	    dcp->fw_compat != DCP_FIRMWARE_V_26_6)
 		return show_notch;
@@ -5250,6 +5252,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6050 = {
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
 	.fw_27_3 = true,
 	.swap_no_timestamps = true,
+	.show_notch = true,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6050_dcpext = {
