@@ -25,13 +25,30 @@
 };
 
 &soc {
-	/* Port 1's Type-C controller only (ADT hpm1, left-front), polled. */
+	/*
+	 * The Type-C controllers, polled: ports 0 and 1 (ADT hpm0 left-back,
+	 * hpm1 left-front) on nub-spmi-a0, port 2 (hpm2, right) on nub-spmi-a1.
+	 */
 	nub_spmi_a0: spmi@28a188000 {
 		compatible = "apple,t6050-spmi", "apple,t8142-spmi";
 		reg = <0x2 0x8a188000 0x0 0x4000>;
 		#address-cells = <2>;
 		#size-cells = <0>;
 		power-domains = <&ps_nub_spmi_a0>;
+
+		hpm0: usb-pd@c {
+			compatible = "apple,sn201202x";
+			reg = <0xc SPMI_USID>;
+			/* ADT target-type "J714c": first four characters reversed */
+			apple,unlock-key = "417J";
+
+			connector {
+				compatible = "usb-c-connector";
+				label = "USB-C port 0";
+				power-role = "dual";
+				data-role = "host";
+			};
+		};
 
 		hpm1: usb-pd@a {
 			compatible = "apple,sn201202x";
@@ -42,6 +59,28 @@
 			connector {
 				compatible = "usb-c-connector";
 				label = "USB-C port 1";
+				power-role = "dual";
+				data-role = "host";
+			};
+		};
+	};
+
+	nub_spmi_a1: spmi@28a1a8000 {
+		compatible = "apple,t6050-spmi", "apple,t8142-spmi";
+		reg = <0x2 0x8a1a8000 0x0 0x4000>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		power-domains = <&ps_nub_spmi_a1>;
+
+		hpm2: usb-pd@c {
+			compatible = "apple,sn201202x";
+			reg = <0xc SPMI_USID>;
+			/* ADT target-type "J714c": first four characters reversed */
+			apple,unlock-key = "417J";
+
+			connector {
+				compatible = "usb-c-connector";
+				label = "USB-C port 2";
 				power-role = "dual";
 				data-role = "host";
 			};
