@@ -44,6 +44,7 @@ config PHY_APPLE_DPTX
 config PHY_APPLE_T6050_USB2
 	tristate "Apple T6050 Type-C port USB 2.0 host PHY"
 	depends on (ARM64 && ARCH_APPLE) || COMPILE_TEST
+	depends on USB_ROLE_SWITCH || !USB_ROLE_SWITCH
 	select GENERIC_PHY
 	select APPLE_TUNABLE
 	help

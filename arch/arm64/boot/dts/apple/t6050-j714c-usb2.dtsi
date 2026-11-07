@@ -47,6 +47,19 @@
 				label = "USB-C port 0";
 				power-role = "dual";
 				data-role = "host";
+
+				/* attach and detach reach the USB 2.0 PHY */
+				ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					port@0 {
+						reg = <0>;
+						typec0_hs: endpoint {
+							remote-endpoint = <&usb2phy_0_role>;
+						};
+					};
+				};
 			};
 		};
 
@@ -83,6 +96,19 @@
 				label = "USB-C port 2";
 				power-role = "dual";
 				data-role = "host";
+
+				/* attach and detach reach the USB 2.0 PHY */
+				ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					port@0 {
+						reg = <0>;
+						typec2_hs: endpoint {
+							remote-endpoint = <&usb2phy_2_role>;
+						};
+					};
+				};
 			};
 		};
 	};
@@ -94,6 +120,13 @@
 		reg-names = "usb2phy", "pipehandler", "core";
 		#phy-cells = <0>;
 		power-domains = <&ps_atc0_usb>;
+		usb-role-switch;
+
+		port {
+			usb2phy_0_role: endpoint {
+				remote-endpoint = <&typec0_hs>;
+			};
+		};
 	};
 
 	dwc3_0: usb@2a2280000 {
@@ -391,6 +424,13 @@
 		reg-names = "usb2phy", "pipehandler", "core";
 		#phy-cells = <0>;
 		power-domains = <&ps_atc2_usb>;
+		usb-role-switch;
+
+		port {
+			usb2phy_2_role: endpoint {
+				remote-endpoint = <&typec2_hs>;
+			};
+		};
 	};
 
 	dwc3_2: usb@382280000 {

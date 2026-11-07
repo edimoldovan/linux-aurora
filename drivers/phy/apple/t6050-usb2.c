@@ -32,6 +32,7 @@
 #include <linux/platform_device.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/string.h>
+#include <linux/usb/role.h>
 #include <linux/usb/tipd.h>
 #include <linux/workqueue.h>
 
@@ -224,6 +225,12 @@ struct t6050_usb2 {
 	/* USB 2.0 only: re-arm the usb2phy after its device left */
 	struct delayed_work rearm_work;
 	bool had_device;
+
+	/* USB 2.0 only: the Type-C controller's attach and detach */
+	struct usb_role_switch *role_sw;
+	enum usb_role role;
+	bool detached;
+	bool initialized;
 };
 
 static void t6050_usb2_mask(void __iomem *reg, u32 clear, u32 set)
@@ -828,23 +835,87 @@ static void t6050_usb3_inherited(struct t6050_usb2 *p)
  * back; the dwc3 core and xHCI are not touched.
  */
 #define T6050_REARM_PERIOD	(3 * HZ)
+#define T6050_DETACH_DELAY	(HZ / 2)
+
+static void t6050_usb2_phy_rerun(struct t6050_usb2 *p)
+{
+	writel(USB2PHY_CTL_RESET | USB2PHY_CTL_PORT_RESET, p->usb2phy + USB2PHY_CTL);
+	udelay(100);
+	t6050_usb2_mask(p->usb2phy + USB2PHY_CTL, USB2PHY_CTL_RESET, 0);
+	t6050_usb2_mask(p->usb2phy + USB2PHY_CTL, USB2PHY_CTL_PORT_RESET, 0);
+	writel(USB2PHY_MISCTUNE_DEFAULT, p->usb2phy + USB2PHY_MISCTUNE);
+	writel(USB2PHY_USBCTL_RUN, p->usb2phy + USB2PHY_USBCTL);
+	writel(USB2PHY_SIG_DEFAULT | USB2PHY_SIG_HOST, p->usb2phy + USB2PHY_SIG);
+}
 
 static void t6050_usb2_rearm(struct work_struct *work)
 {
 	struct t6050_usb2 *p = container_of(to_delayed_work(work), struct t6050_usb2, rearm_work);
+	u32 portsc = readl(p->core + XHCI_PORTSC1);
+	/* A NONE that tipd followed with HOST again (resume, DP mode) is no detach. */
+	bool detached = xchg(&p->detached, false) && READ_ONCE(p->role) == USB_ROLE_NONE;
 
-	if (readl(p->core + XHCI_PORTSC1) & XHCI_PORTSC_CCS) {
+	if ((portsc & XHCI_PORTSC_CCS) && detached) {
+		t6050_usb2_phy_rerun(p);
+		msleep(50);
+		dev_info(p->dev, "Type-C detach while connected: usb2phy run again, PORTSC %#x -> %#x\n",
+			 portsc, readl(p->core + XHCI_PORTSC1));
+		p->had_device = true;
+	} else if (portsc & XHCI_PORTSC_CCS) {
 		p->had_device = true;
 	} else if (p->had_device) {
-		writel(USB2PHY_CTL_RESET | USB2PHY_CTL_PORT_RESET, p->usb2phy + USB2PHY_CTL);
-		udelay(100);
-		t6050_usb2_mask(p->usb2phy + USB2PHY_CTL, USB2PHY_CTL_RESET, 0);
-		t6050_usb2_mask(p->usb2phy + USB2PHY_CTL, USB2PHY_CTL_PORT_RESET, 0);
-		writel(USB2PHY_MISCTUNE_DEFAULT, p->usb2phy + USB2PHY_MISCTUNE);
-		writel(USB2PHY_USBCTL_RUN, p->usb2phy + USB2PHY_USBCTL);
-		writel(USB2PHY_SIG_DEFAULT | USB2PHY_SIG_HOST, p->usb2phy + USB2PHY_SIG);
+		t6050_usb2_phy_rerun(p);
 	}
 	schedule_delayed_work(&p->rearm_work, T6050_REARM_PERIOD);
+}
+
+/*
+ * The Type-C controller reports attach and detach through this role switch, as
+ * tipd does for dwc3 on the other Apple machines. A device plugged in at
+ * power-on can stay connected in the xHCI after it left (J714c port 0, after
+ * a minute or two); running the usb2phy again then lets the xHCI see the
+ * disconnect.
+ */
+static int t6050_usb2_role_set(struct usb_role_switch *sw, enum usb_role role)
+{
+	struct t6050_usb2 *p = usb_role_switch_get_drvdata(sw);
+
+	WRITE_ONCE(p->role, role);
+	if (role != USB_ROLE_NONE) {
+		WRITE_ONCE(p->detached, false);
+	} else if (READ_ONCE(p->initialized)) {
+		/* tipd may set HOST again in the same pass; the work checks the role */
+		WRITE_ONCE(p->detached, true);
+		mod_delayed_work(system_wq, &p->rearm_work, T6050_DETACH_DELAY);
+	}
+	return 0;
+}
+
+static enum usb_role t6050_usb2_role_get(struct usb_role_switch *sw)
+{
+	struct t6050_usb2 *p = usb_role_switch_get_drvdata(sw);
+
+	return p->role;
+}
+
+static void t6050_usb2_role_unregister(void *data)
+{
+	usb_role_switch_unregister(data);
+}
+
+static int t6050_usb2_role_register(struct t6050_usb2 *p)
+{
+	struct usb_role_switch_desc desc = {
+		.fwnode = dev_fwnode(p->dev),
+		.set = t6050_usb2_role_set,
+		.get = t6050_usb2_role_get,
+		.driver_data = p,
+	};
+
+	p->role_sw = usb_role_switch_register(p->dev, &desc);
+	if (IS_ERR(p->role_sw))
+		return dev_err_probe(p->dev, PTR_ERR(p->role_sw), "role switch\n");
+	return devm_add_action_or_reset(p->dev, t6050_usb2_role_unregister, p->role_sw);
 }
 
 static int t6050_usb2_init(struct phy *phy)
@@ -881,6 +952,7 @@ static int t6050_usb2_init(struct phy *phy)
 	dev_info(p->dev, "USB 2.0 host mode, PORTSC %#x after %u flip(s)\n", portsc,
 		 min_t(unsigned int, attempt + 1, ARRAY_SIZE(wait_ms)));
 	p->had_device = portsc & XHCI_PORTSC_CCS;
+	WRITE_ONCE(p->initialized, true);
 	mod_delayed_work(system_wq, &p->rearm_work, T6050_REARM_PERIOD);
 	return 0;
 }
@@ -985,6 +1057,13 @@ static int t6050_usb2_probe(struct platform_device *pdev)
 	if (platform_get_resource_byname(pdev, IORESOURCE_MEM, "atc-power")) {
 		int ret = t6050_usb3_probe(pdev, p);
 
+		if (ret)
+			return ret;
+	}
+
+	if (IS_ENABLED(CONFIG_USB_ROLE_SWITCH) && !p->ss &&
+	    device_property_present(dev, "usb-role-switch")) {
+		ret = t6050_usb2_role_register(p);
 		if (ret)
 			return ret;
 	}
