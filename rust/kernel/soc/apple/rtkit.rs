@@ -311,6 +311,14 @@ impl<T: Operations> RtKit<T> {
         to_result(unsafe { bindings::apple_rtkit_boot(self.rtk) })
     }
 
+    /// Boots the RTKit coprocessor with the AP powered before the IOP's power
+    /// acknowledgment, for firmware that waits for it. Unlike wake_early_ap,
+    /// sends no pre-HELLO power-state command (first cold boot, not resume).
+    pub fn boot_early_ap(self: Pin<&mut Self>) -> Result {
+        // SAFETY: `rtk` is valid per the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_boot_early_ap(self.rtk) })
+    }
+
     /// Starts a non-system endpoint.
     pub fn start_endpoint(self: Pin<&mut Self>, endpoint: u8) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.

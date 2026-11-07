@@ -776,6 +776,67 @@ static const struct apple_pmp_start_ops apple_pmp_start_hw_ops = {
 	.bound = apple_pmp_start_bound,
 };
 
+/*
+ * TEMP (GPU bring-up): T6050's afr/cs/gfx power states (PMGR 0x2300e80100/108/110)
+ * and the PTD every 2 s for 3 minutes from "PMP ready", across the GPU's probe,
+ * its vote and a job.
+ */
+static struct apple_pmp_report *apple_pmp_ps_rep;
+static unsigned int apple_pmp_ps_left;
+/* TEMP: the PTD read aperture (the 16 KiB the GPU maps) at "PMP ready", diffed each sample. */
+#define APPLE_PMP_PTD_SNAP_WORDS (0x4000 / 4)
+static u32 *apple_pmp_ptd_snap;
+
+static void apple_pmp_ptd_diff(struct apple_pmp_report *rep)
+{
+	unsigned int i, shown = 0;
+	u32 now;
+
+	if (!apple_pmp_ptd_snap) {
+		apple_pmp_ptd_snap = kmalloc_array(APPLE_PMP_PTD_SNAP_WORDS, 4, GFP_KERNEL);
+		if (!apple_pmp_ptd_snap)
+			return;
+		for (i = 0; i < APPLE_PMP_PTD_SNAP_WORDS; i++)
+			apple_pmp_ptd_snap[i] = readl(rep->base + 4 * i);
+		dev_info(rep->dev, "TEMP PTD snapshot taken\n");
+		return;
+	}
+	for (i = 0; i < APPLE_PMP_PTD_SNAP_WORDS; i++) {
+		now = readl(rep->base + 4 * i);
+		/* Skip the two ranges that change on every sample (gpu13). */
+		if (now == apple_pmp_ptd_snap[i] || (4 * i >= 0x900 && 4 * i < 0xa80) ||
+		    (4 * i >= 0x25a8 && 4 * i < 0x2610))
+			continue;
+		if (shown++ < 256)
+			dev_info(rep->dev, "TEMP PTD +%#06x %#010x -> %#010x\n", 4 * i,
+				 apple_pmp_ptd_snap[i], now);
+		apple_pmp_ptd_snap[i] = now;
+	}
+	if (shown)
+		dev_info(rep->dev, "TEMP PTD %u words changed\n", shown);
+}
+
+static void apple_pmp_ps_sample(struct work_struct *work);
+static DECLARE_DELAYED_WORK(apple_pmp_ps_work, apple_pmp_ps_sample);
+
+static void apple_pmp_ps_sample(struct work_struct *work)
+{
+	struct apple_pmp_report *rep = apple_pmp_ps_rep;
+	void __iomem *ps = ioremap(0x2300e80100, 0x18);
+
+	apple_pmp_ptd_diff(rep);
+
+	dev_info(rep->dev, "TEMP PS afr %#x cs %#x gfx %#x; PTD status %#llx request %#llx ack %#llx\n",
+		 ps ? readl(ps) : 0, ps ? readl(ps + 0x8) : 0, ps ? readl(ps + 0x10) : 0,
+		 readq(rep->base + rep->offsets->status),
+		 readq(rep->base + rep->offsets->tgt_read),
+		 readq(rep->base + rep->offsets->actual));
+	if (ps)
+		iounmap(ps);
+	if (--apple_pmp_ps_left)
+		schedule_delayed_work(&apple_pmp_ps_work, 2 * HZ);
+}
+
 static void apple_pmp_start_work(struct work_struct *work)
 {
 	struct apple_pmp_start *st = container_of(work, struct apple_pmp_start, work);
@@ -852,6 +913,14 @@ static void apple_pmp_start_work(struct work_struct *work)
 	if (status != PMP_REPORT_READY) {
 		dev_err(rep->dev, "PMP started but not ready: PTD status %#llx request %#llx\n",
 			status, request);
+		/* TEMP (PMP bring-up): does the PTD report ready later? */
+		deadline = jiffies + msecs_to_jiffies(10000);
+		while (readq(rep->base + rep->offsets->status) != PMP_REPORT_READY &&
+		       time_before(jiffies, deadline))
+			msleep(50);
+		dev_crit(rep->dev, "TEMP: PTD status %#llx ack %#llx up to 10 s later\n",
+			 readq(rep->base + rep->offsets->status),
+			 readq(rep->base + rep->offsets->actual));
 		ret = -ETIMEDOUT;
 	} else if ((ack & st->startup_ack) != st->startup_ack) {
 		dev_err(rep->dev, "PMP ready but did not acknowledge %#llx: request %#llx ack %#llx\n",
@@ -861,6 +930,11 @@ static void apple_pmp_start_work(struct work_struct *work)
 		dev_info(rep->dev, "PMP ready: PTD status %#llx request %#llx ack %#llx\n",
 			 status, request, ack);
 		ret = 0;
+		if (rep->offsets->start_at_probe) {
+			apple_pmp_ps_rep = rep;
+			apple_pmp_ps_left = 90;
+			schedule_delayed_work(&apple_pmp_ps_work, 0);
+		}
 	}
 	apple_pmp_start_finish(st, ret);
 }
@@ -1329,6 +1403,8 @@ static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, boo
 {
 	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
 	struct apple_pmp_report *rep;
+	struct device *log_dev = NULL;
+	u64 status = 0, request = 0, ack = 0;
 	int ret = -ENODEV;
 
 	if (READ_ONCE(ent->removed))
@@ -1338,10 +1414,28 @@ static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, boo
 	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
 		if (rep->dev->of_node == ent->report_node) {
 			ret = apple_pmp_report_set_state(rep, ent->id, enable, ent->no_ack);
+			if (rep->start && !of_property_read_bool(ent->node, "apple,always-on")) {
+				log_dev = rep->dev;
+				status = readq(rep->base + rep->offsets->status);
+				request = readq(rep->base + rep->offsets->tgt_read);
+				ack = readq(rep->base + rep->offsets->actual);
+			}
 			break;
 		}
 	}
 	rcu_read_unlock();
+
+	/* TEMP (GPU bring-up): each consumer-driven PTD request, with T6050's afr,
+	 * cs and gfx power states (PMGR 0x2300e80100/108/110). */
+	if (log_dev) {
+		void __iomem *ps = ioremap(0x2300e80100, 0x18);
+
+		dev_info(log_dev, "%s %s: %d; PTD status %#llx request %#llx ack %#llx; PS afr %#x cs %#x gfx %#x\n",
+			 genpd->name, enable ? "on" : "off", ret, status, request, ack,
+			 ps ? readl(ps) : 0, ps ? readl(ps + 0x8) : 0, ps ? readl(ps + 0x10) : 0);
+		if (ps)
+			iounmap(ps);
+	}
 	return ret;
 }
 

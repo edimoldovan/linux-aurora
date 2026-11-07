@@ -6,10 +6,13 @@
 
 #include "rtkit-internal.h"
 
+#include <linux/iommu.h>
 #include <linux/jiffies.h>
 #include <linux/of.h>
 #include <linux/overflow.h>
+#include <linux/sched/clock.h>
 #include <linux/sizes.h>
+#include <linux/vmalloc.h>
 
 enum {
 	APPLE_RTKIT_PWR_STATE_OFF = 0x00, /* power off, cannot be restarted */
@@ -416,6 +419,10 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 	*buffer = request;
 
 reply:
+	/* TEMP diagnostic (pmp bring-up): confirm the IOVA handed to the firmware
+	 * lands in the device's apple,dma-range window, not the low 4 GiB. */
+	dev_info(rtk->dev, "RTKit: buffer ep 0x%02x size 0x%zx at iova %pad\n",
+		 ep, buffer->size, &buffer->iova);
 	if (!buffer->is_mapped) {
 		/* oslog uses different fields and needs a shifted IOVA instead of size */
 		if (ep == APPLE_RTKIT_EP_OSLOG) {
@@ -952,6 +959,15 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	if (READ_ONCE(rtk->shutting_down))
 		return;
 
+	/* TEMP diagnostic (PMP handshake): management and ep7 messages only; the
+	 * ep 0x20 exchange is thousands of messages and the console slowed it. */
+	if ((of_device_is_compatible(rtk->dev->of_node, "apple,t6000-pmp-v2") &&
+	     (ep == APPLE_RTKIT_EP_MGMT || ep == 7)) ||
+	    /* TEMP (T6050 kick bring-up): the GPU's firmware and doorbell endpoints. */
+	    (of_device_is_compatible(rtk->dev->of_node, "apple,agx-t6050") && ep >= 0x20))
+		dev_info(rtk->dev, "DIAG rx ep 0x%02x msg 0x%016llx t %llu\n",
+			 ep, msg.msg0, local_clock());
+
 	/*
 	 * The message was read from a MMIO FIFO and we have to make
 	 * sure all reads from buffers sent with that message happen
@@ -1008,6 +1024,13 @@ int apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 message,
 		.msg0 = message,
 		.msg1 = ep,
 	};
+
+	/* TEMP diagnostic (PMP handshake): management and ep7 messages only. */
+	if ((of_device_is_compatible(rtk->dev->of_node, "apple,t6000-pmp-v2") &&
+	     (ep == APPLE_RTKIT_EP_MGMT || ep == 7)) ||
+	    (of_device_is_compatible(rtk->dev->of_node, "apple,agx-t6050") && ep >= 0x20))
+		dev_info(rtk->dev, "DIAG tx ep 0x%02x msg 0x%016llx t %llu\n",
+			 ep, message, local_clock());
 
 	if (rtk->crashed) {
 		dev_warn(rtk->dev,
@@ -1417,6 +1440,149 @@ static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
 	return 0;
 }
 
+/*
+ * TEMP (PMP bring-up): firmware VA -> SRAM copy (VA 0x1000000 = SRAM +0), and
+ * the stalled firmware's power state machine, endpoint objects and threads,
+ * logged at KERN_CRIT (journald syncs at once) so the journal has them when
+ * the boot never reaches SSH. Offsets are those of the T6050 image
+ * RTKit_armv8_chinook_Oz_flto-3514.60.8.
+ */
+static u64 apple_rtkit_pmp_rd(const u8 *s, size_t size, u64 va, int n)
+{
+	u64 v = 0, off = va - 0x1000000;
+
+	if (va >= 0x1000000 && off + n <= size)
+		memcpy(&v, s + off, n);
+	return v;
+}
+
+static void apple_rtkit_pmp_dump(const u8 *s, size_t size, const char *what, u64 va, u64 len)
+{
+	char prefix[48];
+	u64 off = va - 0x1000000;
+
+	if (va < 0x1000000 || off >= size)
+		return;
+	snprintf(prefix, sizeof(prefix), "PMP fw %s %llx+", what, va);
+	print_hex_dump(KERN_CRIT, prefix, DUMP_PREFIX_OFFSET, 16, 8, s + off,
+		       min_t(u64, len, size - off), false);
+}
+
+static void apple_rtkit_pmp_decode(struct apple_rtkit *rtk, const u8 *s, size_t size)
+{
+	const u64 sm = 0x1078908;
+	u64 arr = apple_rtkit_pmp_rd(s, size, sm + 32, 8);
+	u64 cap = apple_rtkit_pmp_rd(s, size, sm + 56, 8);
+	u64 tab = apple_rtkit_pmp_rd(s, size, 0x10f0918, 8);
+	u32 slots = apple_rtkit_pmp_rd(s, size, 0x10f0920, 4);
+	u64 pt = apple_rtkit_pmp_rd(s, size, 0x10f0578, 8);
+	u64 o, t, ctx, fp, np, ra[8];
+	char name[17];
+	u32 i, k;
+
+	/* Raw: power state machine (+ current thread at 0x1078900), callback list,
+	 * and the "power" thread's saved registers and stack. */
+	apple_rtkit_pmp_dump(s, size, "sm", 0x1078900, 0x80);
+	apple_rtkit_pmp_dump(s, size, "cbs", arr, 16 * min_t(u64, cap, 16));
+	ctx = apple_rtkit_pmp_rd(s, size, pt + 72, 8);
+	apple_rtkit_pmp_dump(s, size, "power ctx", ctx, 0x110);
+	apple_rtkit_pmp_dump(s, size, "power stack", apple_rtkit_pmp_rd(s, size, ctx + 0xf8, 8),
+			     0x200);
+
+	dev_crit(rtk->dev,
+		 "DIAG fw power: current %#llx target %#llx to %#llx flags %#llx cb idx %#llx count %#llx cap %#llx\n",
+		 apple_rtkit_pmp_rd(s, size, sm + 16, 4), apple_rtkit_pmp_rd(s, size, sm + 20, 4),
+		 apple_rtkit_pmp_rd(s, size, sm + 24, 4), apple_rtkit_pmp_rd(s, size, sm + 116, 4),
+		 apple_rtkit_pmp_rd(s, size, sm + 40, 8), apple_rtkit_pmp_rd(s, size, sm + 48, 8), cap);
+	for (i = 0; i < min_t(u64, cap, 16); i++)
+		if (apple_rtkit_pmp_rd(s, size, arr + 16 * i, 8))
+			dev_crit(rtk->dev, "DIAG fw power cb[%u] fn %#llx arg %#llx\n", i,
+				 apple_rtkit_pmp_rd(s, size, arr + 16 * i, 8),
+				 apple_rtkit_pmp_rd(s, size, arr + 16 * i + 8, 8));
+
+	o = apple_rtkit_pmp_rd(s, size, 0x1079208, 8);
+	for (k = 0; o && k < 16; k++, o = apple_rtkit_pmp_rd(s, size, o + 0x60, 8))
+		dev_crit(rtk->dev, "DIAG fw ep obj %#llx id %llu state %#llx power %#llx flags %#llx\n",
+			 o, apple_rtkit_pmp_rd(s, size, o + 4, 4), apple_rtkit_pmp_rd(s, size, o, 4),
+			 apple_rtkit_pmp_rd(s, size, o + 20, 4), apple_rtkit_pmp_rd(s, size, o + 84, 4));
+
+	dev_crit(rtk->dev, "DIAG fw threads: table %#llx slots %u current %#llx power %#llx\n", tab,
+		 slots, apple_rtkit_pmp_rd(s, size, 0x1078900, 8), pt);
+	for (i = 0; i < min(slots, 32u); i++) {
+		t = apple_rtkit_pmp_rd(s, size, tab + 8 * i, 8);
+		if (!t)
+			continue;
+		np = apple_rtkit_pmp_rd(s, size, t + 32, 8);
+		for (k = 0; k < 16; k++) {
+			name[k] = apple_rtkit_pmp_rd(s, size, np + k, 1);
+			if (!name[k])
+				break;
+		}
+		name[k] = 0;
+		/* Saved context: x29 +0xe8, x30 +0xf0, sp +0xf8, pc +0x100 */
+		ctx = apple_rtkit_pmp_rd(s, size, t + 72, 8);
+		fp = apple_rtkit_pmp_rd(s, size, ctx + 0xe8, 8);
+		for (k = 0; k < ARRAY_SIZE(ra); k++) {
+			ra[k] = fp ? apple_rtkit_pmp_rd(s, size, fp + 8, 8) : 0;
+			fp = fp ? apple_rtkit_pmp_rd(s, size, fp, 8) : 0;
+		}
+		dev_crit(rtk->dev,
+			 "DIAG fw thread[%u] %s t %#llx pc %#llx lr %#llx sp %#llx frames %llx %llx %llx %llx %llx %llx %llx %llx\n",
+			 i, name, t, apple_rtkit_pmp_rd(s, size, ctx + 0x100, 8),
+			 apple_rtkit_pmp_rd(s, size, ctx + 0xf0, 8),
+			 apple_rtkit_pmp_rd(s, size, ctx + 0xf8, 8),
+			 ra[0], ra[1], ra[2], ra[3], ra[4], ra[5], ra[6], ra[7]);
+	}
+}
+
+static ssize_t apple_rtkit_pmp_sram_read(struct file *file, struct kobject *kobj,
+					 const struct bin_attribute *attr, char *buf,
+					 loff_t off, size_t count)
+{
+	return memory_read_from_buffer(buf, count, &off, attr->private, attr->size);
+}
+
+/*
+ * TEMP (PMP bring-up): copy the stalled PMP's SRAM image (+0..+0xf1000, the
+ * RTSZ extent: __TEXT and __DATA) into a world-readable sysfs file on the pmp
+ * device (sram_poststall; it outlives the failed probe), decode it into the
+ * log, and record whether its CPU still runs. Aligned 32-bit reads only: the
+ * SRAM is device memory.
+ */
+static void apple_rtkit_pmp_snapshot(struct apple_rtkit *rtk)
+{
+	static struct bin_attribute attr;
+	const size_t size = 0xf1000;
+	void __iomem *sram, *asc;
+	u32 *buf;
+	size_t i;
+
+	asc = ioremap(0x284e00044, 4);
+	if (asc) {
+		dev_crit(rtk->dev, "DIAG post-stall: ASC_CPU_CONTROL=%#010x\n", readl(asc));
+		iounmap(asc);
+	}
+	if (attr.private)
+		return;
+	sram = ioremap(0x284500000, size);
+	buf = sram ? vmalloc(size) : NULL;
+	if (buf) {
+		for (i = 0; i < size / 4; i++)
+			buf[i] = readl(sram + i * 4);
+		sysfs_bin_attr_init(&attr);
+		attr.attr.name = "sram_poststall";
+		attr.attr.mode = 0444;
+		attr.size = size;
+		attr.private = buf;
+		attr.read = apple_rtkit_pmp_sram_read;
+		dev_crit(rtk->dev, "DIAG post-stall: SRAM +0..%#zx in sysfs sram_poststall (%d)\n",
+			 size, device_create_bin_file(rtk->dev, &attr));
+		apple_rtkit_pmp_decode(rtk, (const u8 *)buf, size);
+	}
+	if (sram)
+		iounmap(sram);
+}
+
 static int apple_rtkit_boot_common(struct apple_rtkit *rtk, bool early_ap_power)
 {
 	int ret;
@@ -1445,9 +1611,44 @@ static int apple_rtkit_boot_common(struct apple_rtkit *rtk, bool early_ap_power)
 	}
 
 	dev_dbg(rtk->dev, "RTKit: waiting for IOP power state ACK\n");
-	ret = apple_rtkit_wait(rtk, &rtk->iop_pwr_ack_completion);
+	/* TEMP (PMP bring-up): macOS's PMP logs its first message ~1.9 s after the
+	 * wake; give the PMP's IOP-ON acknowledgement 10 s instead of 1 s. */
+	if (of_device_is_compatible(rtk->dev->of_node, "apple,t6000-pmp-v2")) {
+		long t = wait_for_completion_interruptible_timeout(&rtk->iop_pwr_ack_completion,
+								   msecs_to_jiffies(10000));
+
+		ret = t < 0 ? t : t ? 0 : -ETIME;
+	} else {
+		ret = apple_rtkit_wait(rtk, &rtk->iop_pwr_ack_completion);
+	}
 	if (ret) {
 		dev_err(rtk->dev, "RTKit: IOP power acknowledgment failed: %d\n", ret);
+		/* TEMP diagnostic (PMP bring-up): the firmware stalls silently before the
+		 * IOP ON transition. Check whether iBoot's inherited __ETEXT mapping
+		 * (IOVA 0x10000000000) survived domain attach -- with a known-mapped
+		 * buffer IOVA as a control -- and dump what the firmware left behind. */
+		{
+			struct iommu_domain *d = iommu_get_domain_for_dev(rtk->dev);
+
+			if (d) {
+				phys_addr_t pe0 = iommu_iova_to_phys(d, 0x10000000000ULL);
+				phys_addr_t pe1 = iommu_iova_to_phys(d, 0x10000011000ULL);
+				phys_addr_t pcl = rtk->crashlog_buffer.iova ?
+					iommu_iova_to_phys(d, rtk->crashlog_buffer.iova) : 0;
+
+				dev_info(rtk->dev,
+					 "DIAG __ETEXT 0x10000000000->%pa +0x11000->%pa ; crashlog %pad->%pa\n",
+					 &pe0, &pe1, &rtk->crashlog_buffer.iova, &pcl);
+			}
+			if (rtk->crashlog_buffer.buffer)
+				print_hex_dump(KERN_INFO, "PMP crashlog ", DUMP_PREFIX_OFFSET,
+					       16, 4, rtk->crashlog_buffer.buffer, 0x200, false);
+			if (rtk->ioreport_buffer.buffer)
+				print_hex_dump(KERN_INFO, "PMP ioreport ", DUMP_PREFIX_OFFSET,
+					       16, 4, rtk->ioreport_buffer.buffer, 0x200, false);
+			if (of_device_is_compatible(rtk->dev->of_node, "apple,t6000-pmp-v2"))
+				apple_rtkit_pmp_snapshot(rtk);
+		}
 		return ret;
 	}
 

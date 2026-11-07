@@ -3457,6 +3457,8 @@ static int __genpd_dev_pm_attach(struct device *dev, struct device *base_dev,
 	}
 
 	if (ret) {
+		/* TEMP (T6050 GPU bring-up): say why the attach defers. */
+		dev_info(dev, "TEMP: powering PM domain %s failed: %d\n", pd->name, ret);
 		/* Drop the default performance state */
 		if (dev_gpd_data(dev)->default_pstate) {
 			dev_pm_genpd_set_performance_state(dev, 0);

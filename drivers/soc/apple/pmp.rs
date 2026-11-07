@@ -341,7 +341,8 @@ impl PmpData {
             } else {
                 // Not every boot loader provides every tunable the firmware
                 // asks for, and the firmware starts without them.
-                dev_dbg!(self.dev, "unknown property {:?}", name_str);
+                // TEMP (T6050 GPU bring-up): list what the firmware asks for and lacks.
+                dev_info!(self.dev, "PMP property missing: {:?}\n", name_str);
             }
         }
         state.ioreg_entries.push(size, GFP_KERNEL)?;
@@ -550,6 +551,13 @@ impl platform::Driver for PmpDriver {
         let asc_req = pdev.io_request_by_name(c"asc").ok_or(EINVAL)?;
         let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?;
         let asc_mmio = asc_mmio.as_view().relaxed();
+        // TEMP diag (PMP warm/cold-start): is iBoot's PMP CPU still running when
+        // Linux arrives, before we set CPU_RUN? (ASC_CPU_CONTROL @ 0x44, bit 4 = cpu_run)
+        {
+            let cc = asc_mmio.read32(0x44);
+            dev_info!(dev, "DIAG pre-start: ASC_CPU_CONTROL(0x44)={:#010x} cpu_run={}\n",
+                      cc, (cc >> 4) & 1);
+        }
         let data = PmpData::new(pdev)?;
         let node = dev.fwnode().ok_or(EIO)?;
         let dvid = node
