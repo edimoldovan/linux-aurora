@@ -69,6 +69,9 @@ struct apple_rtkit {
 	struct apple_rtkit_shmem kdebug_buffer0;
 	struct apple_rtkit_shmem kdebug_buffer1;
 
+	/* The T6050 PMP's CoreAnalytics buffer (non-standard system endpoint 7). */
+	struct apple_rtkit_shmem ep7_buffer;
+
 	struct apple_rtkit_shmem syslog_buffer;
 	char *syslog_msg_buffer;
 	size_t syslog_n_entries;
