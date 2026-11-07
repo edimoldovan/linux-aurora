@@ -377,6 +377,8 @@
 		reg = <0x4 0x10000000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 1524 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		/* iBoot leaves its block gated; it is read at probe */
+		power-domains = <&ps_apcie_sys_gp>;
 		status = "disabled";
 	};
 
