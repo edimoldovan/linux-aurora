@@ -1893,6 +1893,14 @@ static void dcp_on_set_power_state(struct apple_dcp *dcp, void *out, void *cooki
 		.unklong = 1,
 	};
 
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	/*
+	 * setPowerState(state, b1, b2, &out, b5, b6) as macOS 27.3's api power
+	 * path calls it with a client: b1 and b5 set, b2 and b6 clear.
+	 */
+	if (dcp->hw.fw_27_3)
+		req.unkint = 0x00010001;
+#endif
 	dcp_set_power_state(dcp, DCP_POWER_OOB, &req, dcp_on_final, cookie);
 }
 
