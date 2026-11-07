@@ -100,8 +100,9 @@ static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 	 * Firmware 27.3's swap record is 0x830 bytes: 0x40 more before swap_id,
 	 * which moves to 0xd8, the rest of the firmware-27.0 record after it,
 	 * and the kernel's fields from 0x720, of which the firmware reads the
-	 * mask of the mapped surfaces at 0x728.  The surfaces and the rest of
-	 * the request follow the record.
+	 * mask of the mapped surfaces at 0x728.  The brightness block moves
+	 * 0x60, to 0x3b4: the firmware reads its own fields at 0x394..0x3b3.
+	 * The surfaces and the rest of the request follow the record.
 	 */
 	if (dcp->hw.fw_27_3 && data == &dcp->present_v27) {
 		const u8 *v = data;
@@ -111,7 +112,11 @@ static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 
 		memset(w, 0, 0x830);
 		memcpy(w, v, 0x98);
-		memcpy(w + 0xd8, v + 0x98, sizeof(struct dcp_swap_v27) - 0x98);
+		memcpy(w + 0xd8, v + 0x98,
+		       offsetof(struct dcp_swap_v27, brightness_update) - 0x98);
+		memcpy(w + 0x3b4, v + offsetof(struct dcp_swap_v27, brightness_update),
+		       offsetof(struct dcp_swap_v27, reserved_366) -
+		       offsetof(struct dcp_swap_v27, brightness_update));
 		put_unaligned_le32(enabled & 0xf, w + 0x728);
 		memcpy(w + 0x830, v + sizeof(struct dcp_swap_v27),
 		       sizeof(struct dcp_swap_submit_req_v27) -
