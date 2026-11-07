@@ -88,6 +88,13 @@ properties:
       handoff. Linux retains occupied root slots and excludes their entire
       IOVA spans from allocation. This does not assert immutable descendants.
 
+  apple,manual-availability:
+    type: boolean
+    description: >
+      The DART's registers answer only once its client, a PCIe root complex,
+      is up. The client's driver makes the DART available after bringing the
+      root complex up, and the DART probes then.
+
   apple,tunable:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
     items:
