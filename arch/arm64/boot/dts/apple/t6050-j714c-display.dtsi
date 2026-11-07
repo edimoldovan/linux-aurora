@@ -53,10 +53,14 @@
 		iommu-addresses = <&dcp 0x100 0x09194000 0x0 0x8000>;
 		no-map;
 	};
+	/*
+	 * The OS log (segment flags 0xa) runs at its physical address, not through
+	 * the DCP's DART: reserved, no DART mapping, as m1n1 marks it on T6030.
+	 */
 	dcp_fw_oslog: asc-firmware@10005cd4000 {
 		compatible = "apple,asc-mem";
 		reg = <0x100 0x05cd4000 0x0 0x28000>;
-		iommu-addresses = <&dcp 0x100 0x05cd4000 0x0 0x28000>;
+		apple,dcp-os-log;
 		no-map;
 	};
 	dcp_fw_5: asc-firmware@11fd8cd8000 {
