@@ -21,6 +21,7 @@
 #include <linux/bitfield.h>
 #include <linux/bits.h>
 #include <linux/delay.h>
+#include <linux/devm-helpers.h>
 #include <linux/io.h>
 #include <linux/io-64-nonatomic-lo-hi.h>
 #include <linux/iopoll.h>
@@ -219,6 +220,10 @@ struct t6050_usb2 {
 	void __iomem *pmgr_mxw;
 	struct t6050_tunable host_tun[ARRAY_SIZE(t6050_host_tunables)];
 	struct t6050_tunable phy_tun[ARRAY_SIZE(t6050_phy_tunables)];
+
+	/* USB 2.0 only: re-arm the usb2phy after its device left */
+	struct delayed_work rearm_work;
+	bool had_device;
 };
 
 static void t6050_usb2_mask(void __iomem *reg, u32 clear, u32 set)
@@ -816,6 +821,32 @@ static void t6050_usb3_inherited(struct t6050_usb2 *p)
 		 readl(p->core + XHCI_PORTSC2));
 }
 
+/*
+ * On J714c a USB 2.0-only port detects no new device once its device has left
+ * (the adapter in port 0 never re-enumerated on a replug). Running the usb2phy
+ * again (reset, tunes, run, host bits) while the port is empty brings detection
+ * back; the dwc3 core and xHCI are not touched.
+ */
+#define T6050_REARM_PERIOD	(3 * HZ)
+
+static void t6050_usb2_rearm(struct work_struct *work)
+{
+	struct t6050_usb2 *p = container_of(to_delayed_work(work), struct t6050_usb2, rearm_work);
+
+	if (readl(p->core + XHCI_PORTSC1) & XHCI_PORTSC_CCS) {
+		p->had_device = true;
+	} else if (p->had_device) {
+		writel(USB2PHY_CTL_RESET | USB2PHY_CTL_PORT_RESET, p->usb2phy + USB2PHY_CTL);
+		udelay(100);
+		t6050_usb2_mask(p->usb2phy + USB2PHY_CTL, USB2PHY_CTL_RESET, 0);
+		t6050_usb2_mask(p->usb2phy + USB2PHY_CTL, USB2PHY_CTL_PORT_RESET, 0);
+		writel(USB2PHY_MISCTUNE_DEFAULT, p->usb2phy + USB2PHY_MISCTUNE);
+		writel(USB2PHY_USBCTL_RUN, p->usb2phy + USB2PHY_USBCTL);
+		writel(USB2PHY_SIG_DEFAULT | USB2PHY_SIG_HOST, p->usb2phy + USB2PHY_SIG);
+	}
+	schedule_delayed_work(&p->rearm_work, T6050_REARM_PERIOD);
+}
+
 static int t6050_usb2_init(struct phy *phy)
 {
 	struct t6050_usb2 *p = phy_get_drvdata(phy);
@@ -849,6 +880,8 @@ static int t6050_usb2_init(struct phy *phy)
 
 	dev_info(p->dev, "USB 2.0 host mode, PORTSC %#x after %u flip(s)\n", portsc,
 		 min_t(unsigned int, attempt + 1, ARRAY_SIZE(wait_ms)));
+	p->had_device = portsc & XHCI_PORTSC_CCS;
+	mod_delayed_work(system_wq, &p->rearm_work, T6050_REARM_PERIOD);
 	return 0;
 }
 
@@ -929,11 +962,15 @@ static int t6050_usb2_probe(struct platform_device *pdev)
 	struct phy_provider *provider;
 	struct t6050_usb2 *p;
 	struct phy *phy;
+	int ret;
 
 	p = devm_kzalloc(dev, sizeof(*p), GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
 	p->dev = dev;
+	ret = devm_delayed_work_autocancel(dev, &p->rearm_work, t6050_usb2_rearm);
+	if (ret)
+		return ret;
 
 	p->usb2phy = t6050_usb2_map(pdev, "usb2phy");
 	if (IS_ERR(p->usb2phy))
