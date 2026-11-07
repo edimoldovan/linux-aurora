@@ -1030,6 +1030,12 @@ impl InitData {
                     |hw| hw.init(&hw_args),
                 )?,
         }
+        // TEMP (T6050 kick bring-up)
+        pr_info!(
+            "G17 TEMP hw data qos_va {:#x}; 0x27b0.. after init {:08x?}\n",
+            hw_args.qos_va,
+            self.temp_hw_data_tail()
+        );
         self.object_mut(self.region_c)?
             .initialize::<abi::RegionC>(0, |region| {
                 region.init();
@@ -1037,8 +1043,15 @@ impl InitData {
             })?;
         self.object_mut(self.cluster)?
             .write(abi::private::PRIMARY_STATUS_A, abi::StatusBlock::new())?;
+        // TEMP (T6050 kick bring-up): status A word 0 is the primary's trace class mask, read
+        // once at boot; bit 0 enables the kick-path records (0x57, 0x47, 0x43, 0x4b).
+        self.object_mut(self.cluster)?
+            .write(abi::private::PRIMARY_STATUS_A, 0x7ffu32)?;
         self.object_mut(self.cluster)?
             .write(abi::private::SECONDARY_STATUS_A, abi::StatusBlock::new())?;
+        // TEMP (T6050 kick bring-up): the secondary's trace class mask, after its status block.
+        self.object_mut(self.cluster)?
+            .write(abi::private::SECONDARY_STATUS_A, 0x7ffu32)?;
         let fwctl_va = self.object(tables.fwctl)?.gpu_va();
         let status_b_va = base + high::PRIVATE_CLUSTER
             + (abi::private::PRIMARY_STATE + abi::private::STATUS_B) as u64;
@@ -1340,6 +1353,46 @@ impl InitData {
                 .checked_add(offset)
                 .ok_or(EINVAL)?,
         )
+    }
+
+    /// TEMP (T6050 kick bring-up): hardware data words 0x27b0..0x27f0, around the QoS
+    /// pointer the firmware read as 0x1_fffffc20 in gpu25.
+    pub(super) fn temp_hw_data_tail(&self) -> Result<[u32; 16]> {
+        self.object(self.bundle)?
+            .read_words::<16>(abi::bundle::HW_DATA + 0x27b0)
+    }
+
+    /// TEMP (T6050 kick bring-up): Region C words 0xe0..0x100 (effort and its neighbours).
+    pub(super) fn temp_region_c_words(&self) -> Result<[u32; 8]> {
+        self.object(self.region_c)?.read_words::<8>(0xe0)
+    }
+
+    /// TEMP (T6050 kick bring-up): 8 bundle words at `offset`.
+    pub(super) fn temp_bundle_words(&self, offset: usize) -> Result<[u32; 8]> {
+        self.object(self.bundle)?.read_words::<8>(offset)
+    }
+
+    /// TEMP (T6050 kick bring-up): hardware data around the perf count both instances read
+    /// at 0x10e0, and the head of each main configuration.
+    pub(super) fn temp_dump_secondary_inputs(&self, why: &str) {
+        pr_info!(
+            "G17 TEMP {}: hw data 0x10d0.. {:08x?}\n",
+            why,
+            self.temp_bundle_words(abi::bundle::HW_DATA + 0x10d0)
+        );
+        pr_info!(
+            "G17 TEMP {}: hw data 0x2678.. {:08x?}\n",
+            why,
+            self.temp_bundle_words(abi::bundle::HW_DATA + 0x2678)
+        );
+        for (role, offset) in abi::bundle::MAIN_CONFIG.iter().enumerate() {
+            pr_info!(
+                "G17 TEMP {}: main config {} head {:08x?}\n",
+                why,
+                role,
+                self.temp_bundle_words(*offset)
+            );
+        }
     }
 
     pub(super) fn control_counters(&self) -> Result<[u32; 3]> {

@@ -46,6 +46,8 @@ pub(super) struct Pending {
 pub(super) trait Host: Transport + Queues {
     fn recovery(&self) -> &recovery::State;
     fn recovery_mut(&mut self) -> &mut recovery::State;
+    // TEMP (T6050 kick bring-up): firmware state when the firmware restarts.
+    fn temp_restart_dump(&self) {}
 }
 
 fn batch<H: Host>(host: &mut H, role: Role, masks: &mut [u64; 2]) -> Result {
@@ -56,6 +58,7 @@ fn batch<H: Host>(host: &mut H, role: Role, masks: &mut [u64; 2]) -> Result {
                 masks[1] |= bits[1];
             }
             Event::Restart { generation, stamp } => {
+                host.temp_restart_dump();
                 if host.recovery_mut().request(generation, stamp)? {
                     return Ok(false);
                 }

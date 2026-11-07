@@ -525,6 +525,8 @@ impl MainConfig {
         let bundle = args.bundle_va;
         let grid = args.state_grid_va;
         let status_a = args.status_a_va;
+        // TEMP (T6050 kick bring-up): firmware log output into the status-area log ring.
+        self.log_enable = 1;
         self.hw_data_va = bundle + bundle::HW_DATA as u64;
         self.firmware_area_va = [bundle + bundle::FIRMWARE_AREA as u64; 2];
         if role == Role::Primary {

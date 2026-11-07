@@ -281,6 +281,13 @@ impl Queue {
             Backing::Render { high, .. } => high.gpu_va(),
         }
     }
+    // TEMP (T6050 kick bring-up): read kick ring words for the timeout dump.
+    pub(crate) fn temp_read<const N: usize>(&self, offset: usize) -> Result<[u32; N]> {
+        match &self.backing {
+            Backing::Compute { low, .. } => low.read_words(offset),
+            Backing::Render { high, .. } => high.read_words(offset),
+        }
+    }
     fn object(&mut self) -> &mut KernelObject {
         match &mut self.backing {
             Backing::Compute { low, .. } => low,

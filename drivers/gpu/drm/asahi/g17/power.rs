@@ -94,6 +94,15 @@ fn wait<C: Control>(control: &C, target: u32, require_powered: bool) -> kernel::
         }
         control.wait_tick();
     }
+    // TEMP (T6050 kick bring-up): which wait failed.
+    pr_info!(
+        "G17 TEMP power wait timeout: target {} counters {:x?} retired {} powered {} require_powered {}\n",
+        target,
+        control.counters(),
+        retired,
+        control.powered(),
+        require_powered
+    );
     Err(ETIMEDOUT)
 }
 

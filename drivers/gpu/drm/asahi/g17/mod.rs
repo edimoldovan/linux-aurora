@@ -566,6 +566,89 @@ impl Drop for Firmware {
 }
 
 impl Firmware {
+    // TEMP (T6050 kick bring-up): what the firmware moved by the time a job timed out.
+    /// TEMP (T6050 kick bring-up): drain both trace rings now (the event pass alone lets the
+    /// secondary's ring fill within a few ms and drop everything after).
+    pub(crate) fn temp_drain_traces(&mut self) {
+        for role in [Role::Primary, Role::Secondary] {
+            self.rings
+                .drain_trace(&self.primary.state.shared.dev, &self.init, role);
+        }
+    }
+
+    fn temp_dump(&self, why: &str) {
+        use fw::queue::DataMaster;
+        let init = &self.init;
+        pr_info!("G17 TEMP dump ({}): control {:x?}\n", why, init.control_counters());
+        self.bridge.regs.temp_ksm_window(why);
+        pr_info!("G17 TEMP dump ({}): KSM 21038/40/1c8/1d0/21168 {:x?}\n", why, self.bridge.regs.temp_ksm());
+        for priority in 0..fw::queue::Policy::PRIORITIES {
+            for engine in [DataMaster::Tiling, DataMaster::Fragment, DataMaster::Compute] {
+                if let Ok(cursors) = init.work_cursors(priority, engine) {
+                    if cursors != [0; 3] {
+                        pr_info!("G17 TEMP work p{} {:?} cons/cons_b/prod {:x?}\n", priority, engine, cursors);
+                    }
+                }
+            }
+        }
+        for role in [Role::Primary, Role::Secondary] {
+            let mut offset = 0;
+            while offset < 0x300 {
+                match init.status_read_words::<8>(role, offset) {
+                    Ok(words) if words != [0; 8] => {
+                        pr_info!("G17 TEMP status {:?} +{:#05x} {:08x?}\n", role, offset, words)
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        pr_info!("G17 TEMP status {:?} +{:#05x} {:?}\n", role, offset, error);
+                        break;
+                    }
+                }
+                offset += 0x20;
+            }
+            // Firmware log (firmware 0x24b7c): per sub-channel, a 0x30-byte state at
+            // LOG_STATE (consumer +0, producer +0x20) and 256 ring entries; the text is a
+            // 0xd8-byte payload in channel 15's area, at +0x10.
+            let mut shown = 0;
+            for sub in 0..9usize {
+                let state = fw::initdata::status::LOG_STATE as usize + sub * 0x30;
+                let Ok(cursors) = init.status_read_words::<12>(role, state) else {
+                    break;
+                };
+                // gpu14: Secondary had 0x11 at +0x10 of a state with its producer 0.
+                let producer = cursors[8].max(cursors[4]);
+                if producer == 0 {
+                    continue;
+                }
+                pr_info!("G17 TEMP log {:?} sub {} producer {}\n", role, sub, producer);
+                for index in 0..producer.min(256) as usize {
+                    if shown >= 400 {
+                        break;
+                    }
+                    let at = fw::initdata::status::UNK_2D2C0 as usize + (sub * 256 + index) * 0xd8;
+                    let Ok(words) = init.status_read_words::<54>(role, at) else {
+                        break;
+                    };
+                    let mut text = [0u8; 0xc8];
+                    let mut len = 0;
+                    for byte in words[4..].iter().flat_map(|w| w.to_le_bytes()) {
+                        if byte == 0 {
+                            break;
+                        }
+                        text[len] = if (0x20..0x7f).contains(&byte) { byte } else { b'.' };
+                        len += 1;
+                    }
+                    let text = core::str::from_utf8(&text[..len]).unwrap_or("?");
+                    pr_info!(
+                        "G17 TEMP log {:?} {}.{} [{:x} {:x} {:x} {:x}] {}\n",
+                        role, sub, index, words[0], words[1], words[2], words[3], text
+                    );
+                    shown += 1;
+                }
+            }
+        }
+    }
+
     /// Publishes controls only while the restart handshake is closed. The device mutex remains
     /// held through publication and the following mailbox notification.
     fn publish_control(&mut self, record: &fw::channels::ControlRecord) -> Result<u32> {
@@ -1055,6 +1138,7 @@ impl Gpu {
             &session._pm_metrics,
         )?;
         session.uat.confirm_firmware_root_entries(root_entries)?;
+        session.init.temp_dump_secondary_inputs("after build");
         session.uat.mirror_secondary_root()?;
         session.bridge.regs.enable_g17_gating()?;
         session.primary.init(session.init.root_va(Role::Primary)?)?;

@@ -57,6 +57,8 @@ impl Backend {
                 // Teardown owns the detached queues and will settle their callbacks.
                 return Ok(None);
             };
+            firmware.temp_drain_traces();
+            firmware.temp_dump("compute timeout");
             firmware.scan_compute(None, &mut deferred)?;
             let Some(queue) = firmware.queues.compute_mut(self.owner) else {
                 return Ok(None);
@@ -64,6 +66,7 @@ impl Backend {
             if !queue.owns_packet(packet) {
                 return Ok(None);
             }
+            queue.temp_dump();
             queue.timeout(&mut |event| deferred.push(event))
         })();
         if result.as_ref().is_ok_and(|status| status.is_some()) {

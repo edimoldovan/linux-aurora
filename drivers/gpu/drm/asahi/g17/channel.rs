@@ -15,6 +15,25 @@ use super::fw::{channels::*, initdata::status};
 use super::initdata::InitData;
 use super::Role;
 
+// TEMP (T6050 kick bring-up): log the first records crossing the firmware rings.
+static TEMP_LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// TEMP: trace records are printed only from the first compute kick on.
+pub(crate) static TEMP_KICKED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// TEMP: marks the first compute kick and restarts the log budget there.
+pub(crate) fn temp_mark_kick() {
+    if !TEMP_KICKED.swap(true, Ordering::AcqRel) {
+        TEMP_LOGGED.store(0, Ordering::Relaxed);
+    }
+}
+
+fn temp_log<T: core::fmt::Debug>(role: Role, what: &str, record: T) {
+    if TEMP_LOGGED.fetch_add(1, Ordering::Relaxed) < 3000 {
+        pr_info!("G17 TEMP {:?} {} {:x?}\n", role, what, record);
+    }
+}
+
 /// Firmware rings whose contents do not affect host scheduling.
 #[derive(Copy, Clone, Debug)]
 enum ReportRing {
@@ -96,7 +115,13 @@ impl Rings {
             let offset = entries + consumer as usize * EVENT_RECORD_SIZE;
             let tag = match ring {
                 // Copy the entire trace entry before returning its slot.
-                ReportRing::Trace => init.status_read_words::<EVENT_WORDS>(role, offset)?[0],
+                ReportRing::Trace => {
+                    let words = init.status_read_words::<EVENT_WORDS>(role, offset)?;
+                    if TEMP_KICKED.load(Ordering::Acquire) {
+                        temp_log(role, "trace", words);
+                    }
+                    words[0]
+                }
                 ReportRing::Statistics => init.status_read_words::<1>(role, offset)?[0],
             };
             // Statistics records carry nothing the host uses; one of a type it does not
@@ -134,6 +159,7 @@ impl Rings {
         if next == consumer {
             return Err(EAGAIN);
         }
+        temp_log(Role::Primary, "control", (record.opcode(), producer, record.bytes()));
         // InitData validates every mapping before the first write, then writes
         // record, packed tally, barrier, producer, barrier without failure.
         init.publish_control(
@@ -198,7 +224,9 @@ impl Events {
             // Observe the producer before reading the record it publishes.
             fence(Ordering::Acquire);
             let offset = status::EVENT_RING as usize + consumer as usize * EVENT_RECORD_SIZE;
-            let record = EventRecord::from_words(init.status_read_words(role, offset)?);
+            let words: [u32; EVENT_WORDS] = init.status_read_words(role, offset)?;
+            temp_log(role, "event", words);
+            let record = EventRecord::from_words(words);
             let event = record.decode();
             fence(Ordering::SeqCst);
             consumer_word.store((consumer + 1) & (EVENT_SLOTS - 1), Ordering::Relaxed);

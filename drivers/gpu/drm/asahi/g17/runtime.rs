@@ -910,6 +910,7 @@ impl super::Firmware {
         {
             return Err(EAGAIN);
         }
+        super::channel::temp_mark_kick();
         // Hold the GPU powered (KeepPowered) across compute kicks: the firmware's KSM
         // scheduling pause is acknowledged only while the GPU is held on.
         if let Err(error) = self.acquire_registration_power() {
@@ -931,9 +932,16 @@ impl super::Firmware {
             accounting: &mut queues.accounting,
             generation: self.recovery.generation(),
         };
-        queue.publish(packet, dependencies, &mut host, &mut |event| {
+        let result = queue.publish(packet, dependencies, &mut host, &mut |event| {
             deferred.push(event)
-        })
+        });
+        // TEMP (T6050 kick bring-up): empty the trace rings so the records after the kick fit.
+        self.temp_drain_traces();
+        pr_info!(
+            "G17 TEMP Region C 0xe0.. after kick {:08x?}\n",
+            self.init.temp_region_c_words()
+        );
+        result
     }
 }
 

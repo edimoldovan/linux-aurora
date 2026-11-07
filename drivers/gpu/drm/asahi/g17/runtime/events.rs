@@ -57,6 +57,14 @@ impl event::Transport for Service<'_> {
 }
 
 impl event::Host for Service<'_> {
+    fn temp_restart_dump(&self) {
+        pr_info!(
+            "G17 TEMP restart: recovery state {:x?} host {:x?}\n",
+            recovery::Memory::recovery_state(&self.firmware.init),
+            recovery::Memory::host_recovery(&self.firmware.init)
+        );
+        self.firmware.temp_dump("restart");
+    }
     fn recovery(&self) -> &recovery::State {
         &self.firmware.recovery
     }

@@ -579,13 +579,23 @@ impl G17Resources {
         // (BIT(1) | BIT(2) cleared), each followed by a read-back.
         let gating = sgx.try_read32(G17_GATING_CONTROL)?;
         sgx.try_write32(gating | G17_GATING_HOLD, G17_GATING_CONTROL)?;
-        sgx.try_read32(G17_GATING_CONTROL)?;
+        let held = sgx.try_read32(G17_GATING_CONTROL)?;
         for &(offset, value) in writes {
             sgx.try_write64(value, offset)?;
         }
+        // TEMP (T6050 kick bring-up): KSM validity while the gating hold is in force.
+        let valid = [sgx.try_read64(0x21068)?, sgx.try_read64(0x21070)?];
         let released = sgx.try_read32(G17_GATING_CONTROL)? & !G17_GATING_DISABLE;
         sgx.try_write32(released, G17_GATING_CONTROL)?;
-        sgx.try_read32(G17_GATING_CONTROL)?;
+        let after = sgx.try_read32(G17_GATING_CONTROL)?;
+        dev_info!(
+            self.dev.as_ref(),
+            "G17 TEMP KSM writes held: gating {:#x} held {:#x} after {:#x}; 21068/70 held {:x?}\n",
+            gating,
+            held,
+            after,
+            valid
+        );
         Ok(true)
     }
 
@@ -689,6 +699,73 @@ impl G17Resources {
                 }
             }
         }
+    }
+
+    // TEMP (T6050 kick bring-up): the KSM valid masks (0x21068/70), the scheduling-pause
+    // request (0x211c8) and acknowledge (0x211d0).
+    pub(crate) fn temp_ksm(&self) -> [u64; 5] {
+        let Some(sgx) = self.sgx.try_access() else {
+            return [u64::MAX; 5];
+        };
+        let sgx = (&*sgx).as_view();
+        // 0x21068/0x21070 are write-1-to-set; the registered status is 0x21038/0x21040.
+        [0x21038, 0x21040, 0x211c8, 0x211d0, 0x21168]
+            .map(|offset| sgx.try_read64(offset).unwrap_or(u64::MAX))
+    }
+
+    // TEMP (T6050 kick bring-up): force every KSM event flag in words 0-2 on through the
+    // write-1-to-set registers 0x21108/0x21110/0x21118 (word 3 holds the firmware's hold bits).
+    pub(crate) fn temp_ksm_set_flags(&self) {
+        let Some(sgx) = self.sgx.try_access() else {
+            return;
+        };
+        let sgx = (&*sgx).as_view();
+        // gpu45: the flags were not the gate. gpu46: set the KSM enable bit 7 of 0x211c0
+        // (firmware cold path 0xf984 / trace-0x58 path 0x18a5c), which reads 0x11 here.
+        let _ = &sgx;
+    }
+
+    // TEMP (T6050 kick bring-up): the secondary checks the UMA PTC page-reserve registers
+    // 0xa598 (CDM), 0xa5a0 (GTP), 0xa5a8 (FRG) through the indirect window (tag
+    // 0x0020_0800_0000_0000 | reg) and finds 0. Write 32/64/96 there and read them back.
+    pub(crate) fn temp_uma_ptc(&self) {
+        const TAG: u64 = 0x0020_0800_0000_0000;
+        const VALUE: u64 = 0x0000_0060_0040_0020;
+        let read = |reg: u64| -> u64 {
+            let Some(sgx) = self.sgx.try_access() else {
+                return u64::MAX;
+            };
+            let sgx = (&*sgx).as_view();
+            let _ = sgx.try_write64(TAG | reg, 0x4090);
+            sgx.try_read64(0x4098).unwrap_or(u64::MAX)
+        };
+        for reg in [0xa598u64, 0xa5a0, 0xa5a8] {
+            let before = read(reg);
+            let _ = self.install_kick_queues(&[(0x4090, TAG | reg), (0x4098, VALUE)]);
+            pr_info!("G17 TEMP UMA PTC {:#x}: {:#x} -> {:#x}\n", reg, before, read(reg));
+        }
+    }
+
+    // TEMP (T6050 kick bring-up): non-zero u64 words of the KSM block 0x21000..0x21400.
+    pub(crate) fn temp_ksm_window(&self, why: &str) {
+        let Some(sgx) = self.sgx.try_access() else {
+            return;
+        };
+        let sgx = (&*sgx).as_view();
+        let mut offset = 0x21000;
+        while offset < 0x21400 {
+            if let Ok(value) = sgx.try_read64(offset) {
+                if value != 0 {
+                    pr_info!("G17 TEMP KSM window ({}) {:#x} = {:#x}\n", why, offset, value);
+                }
+            }
+            offset += 8;
+        }
+    }
+
+    // TEMP (T6050 kick bring-up): the raw power witness register.
+    pub(crate) fn temp_core_power(&self) -> u32 {
+        self.sgx_read32::<G17_CORE_POWER>()
     }
 
     /// Power witness for the queue-configuration port, accessible while the cores are gated.

@@ -1363,6 +1363,48 @@ impl Queue {
             .any(|active| Arc::ptr_eq(&active.packet, packet))
     }
 
+    // TEMP (T6050 kick bring-up): the queue graph as the firmware left it at the timeout.
+    pub(crate) fn temp_dump(&self) {
+        let graph = &self.graph.graph;
+        pr_info!("G17 TEMP queue graph va {:#x}\n", graph.gpu_va());
+        let records = Iterator::chain((ITEMS..ITEMS + 0x40).step_by(0x20), (0x6800..0x7200).step_by(0x20));
+        for offset in Iterator::chain((0..0x900).step_by(0x20), records) {
+            match graph.read_words::<8>(offset) {
+                Ok(words) if words != [0; 8] => {
+                    pr_info!("G17 TEMP queue +{:#06x} {:08x?}\n", offset, words)
+                }
+                Ok(_) => {}
+                Err(error) => pr_info!("G17 TEMP queue +{:#06x} {:?}\n", offset, error),
+            }
+        }
+        pr_info!(
+            "G17 TEMP support va {:#x} +0x300 {:08x?} +0x320 {:08x?}\n",
+            self.graph.support.gpu_va(),
+            self.graph.support.read_words::<8>(STAMP),
+            self.graph.support.read_words::<8>(STAMP + 0x20)
+        );
+        // The kick entries of the active tickets, by ring slot (KICK_ENTRY_STRIDE 0x200).
+        for active in self.active.iter() {
+            let Some(ticket) = active.ticket else { continue };
+            let slot = (ticket.kick & 0xff) as usize;
+            for offset in (0..0x200).step_by(0x20) {
+                if let Ok(words) = self.kick.temp_read::<8>(slot * 0x200 + offset) {
+                    if words != [0; 8] {
+                        pr_info!("G17 TEMP kick slot {} +{:#05x} {:08x?}\n", slot, offset, words);
+                    }
+                }
+            }
+        }
+        for active in self.active.iter() {
+            pr_info!(
+                "G17 TEMP active kick {:x?} item_producer {:x?} timestamps {:x?}\n",
+                active.ticket.map(|t| t.kick),
+                active.ticket.map(|t| t.item_producer),
+                active.packet.completion.compute_words()
+            );
+        }
+    }
+
     /// A watchdog settles spared, deferred waiters without changing their VM status.
     /// Fully ticketed spared work can still return this queue after its drain witness.
     pub(crate) fn timeout(
