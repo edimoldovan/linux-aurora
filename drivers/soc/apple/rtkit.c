@@ -230,7 +230,10 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 	if (!(msg & APPLE_RTKIT_MGMT_EPMAP_LAST))
 		return;
 
-	/* T6050: start the system endpoints in the loader's order, 3 1 2 4 8. */
+	/*
+	 * T6050: start the system endpoints in the loader's order, 3 1 2 4 8. The
+	 * loader never starts tracekit; the ANS firmware runs without it.
+	 */
 	static const u8 t6050_order[] = { APPLE_RTKIT_EP_DEBUG, APPLE_RTKIT_EP_CRASHLOG,
 					   APPLE_RTKIT_EP_SYSLOG, APPLE_RTKIT_EP_IOREPORT,
 					   APPLE_RTKIT_EP_OSLOG };
@@ -253,9 +256,6 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		case APPLE_RTKIT_EP_IOREPORT:
 		case APPLE_RTKIT_EP_OSLOG:
 		case APPLE_RTKIT_EP_TRACEKIT:
-			/* T6050: the loader never starts tracekit; the ANS firmware runs without it. */
-			if (ep == APPLE_RTKIT_EP_TRACEKIT)
-				break;
 			/* already started while handling the map */
 			if (ep == APPLE_RTKIT_EP_CRASHLOG &&
 			    apple_rtkit_coproc_places_buffers(rtk))
@@ -280,6 +280,21 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 			dev_warn(rtk->dev,
 				 "RTKit: Unknown system endpoint: 0x%02x\n",
 				 ep);
+		}
+	}
+
+	/*
+	 * The T6050 PMP firmware has a non-standard system endpoint 7
+	 * (CoreAnalytics) that t6050_order omits. It does not acknowledge IOP
+	 * power until that endpoint is started and its buffer granted.
+	 */
+	if (loader_order && test_bit(7, rtk->endpoints)) {
+		dev_dbg(rtk->dev, "RTKit: Starting non-standard system endpoint 0x07\n");
+		ret = apple_rtkit_start_ep(rtk, 7);
+		if (ret) {
+			rtk->boot_result = ret;
+			complete_all(&rtk->epmap_completion);
+			return;
 		}
 	}
 
@@ -416,6 +431,9 @@ reply:
 					    buffer->size >> 12);
 			reply |= FIELD_PREP(APPLE_RTKIT_BUFFER_REQUEST_IOVA,
 					    buffer->iova);
+			/* An endpoint 7 grant is class 1 (bits 54-55). */
+			if (ep == 7)
+				reply |= BIT_ULL(54);
 		}
 		apple_rtkit_send_message(rtk, ep, reply, NULL, false);
 	}
@@ -645,6 +663,29 @@ static void apple_rtkit_ioreport_rx(struct apple_rtkit *rtk, u64 msg)
 	}
 }
 
+/*
+ * The T6050 PMP firmware's system endpoint 7 is CoreAnalytics, and its power-on
+ * blocks until the buffer it requests there is granted. Bits 54-55 hold the
+ * message class (as macOS's RTBuddyCoreAnalyticsEndpoint reads them): 0 = buffer
+ * request (bits 52-53 size unit, 4 KiB for this request; 44-51 count; 0-43 IOVA),
+ * granted as class 1 with the same fields; 3 = event for the entry in bits 32-47,
+ * acknowledged as class 3 with that entry.
+ */
+static void apple_rtkit_ep7_rx(struct apple_rtkit *rtk, u64 msg)
+{
+	switch ((msg >> 54) & 3) {
+	case 0:
+		apple_rtkit_common_rx_get_buffer(rtk, &rtk->ep7_buffer, 7, msg);
+		break;
+	case 3:
+		apple_rtkit_send_message(rtk, 7, (msg & GENMASK_ULL(47, 32)) | (3ULL << 54),
+					 NULL, false);
+		break;
+	default:
+		dev_warn(rtk->dev, "RTKit: Unknown ep7 message: %llx\n", msg);
+	}
+}
+
 static void apple_rtkit_syslog_rx_init(struct apple_rtkit *rtk, u64 msg)
 {
 	size_t entries = FIELD_GET(APPLE_RTKIT_SYSLOG_N_ENTRIES, msg);
@@ -852,6 +893,13 @@ static void apple_rtkit_rx_work(struct work_struct *work)
 				"Received unexpected message to EP%02d: %llx\n",
 				rtk_work->ep, rtk_work->msg);
 		break;
+	/* The T6050 PMP's non-standard CoreAnalytics endpoint. */
+	case 7:
+		if (of_machine_is_compatible("apple,t6050")) {
+			apple_rtkit_ep7_rx(rtk, rtk_work->msg);
+			break;
+		}
+		fallthrough;
 	default:
 		dev_warn(rtk->dev,
 			 "RTKit: message to unknown endpoint %02x: %llx\n",
@@ -1272,6 +1320,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->kdebug_buffer0);
 	apple_rtkit_free_buffer(rtk, &rtk->kdebug_buffer1);
+	apple_rtkit_free_buffer(rtk, &rtk->ep7_buffer);
 
 	kfree(rtk->syslog_msg_buffer);
 
@@ -1573,6 +1622,7 @@ void apple_rtkit_free(struct apple_rtkit *rtk)
 	apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->kdebug_buffer0);
 	apple_rtkit_free_buffer(rtk, &rtk->kdebug_buffer1);
+	apple_rtkit_free_buffer(rtk, &rtk->ep7_buffer);
 
 	kfree(rtk->syslog_msg_buffer);
 	apple_rtkit_release_rx(rtk);

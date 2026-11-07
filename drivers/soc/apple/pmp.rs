@@ -160,9 +160,10 @@ impl PmpData {
     fn start(&self) -> Result<()> {
         let mut guard = self.rtkit.lock();
         let mut rtk = guard.as_mut().as_pin_mut().unwrap();
-        // The T6050 PMP waits for AP readiness before acknowledging IOP power
-        // (as ANS/AOP/USB2 do), so plain wake() times out the IOP power ACK.
-        rtk.as_mut().wake_early_ap()?;
+        // Plain wake(), as macsmc and m1n1's rtkit_boot do: INIT, then AP-ON only
+        // after IOP-ON. On T6050 pmp-report binds this driver once the PTD
+        // requests are seeded; wake_early_ap/boot_early_ap did not help without it.
+        rtk.as_mut().wake()?;
         rtk.start_endpoint(PMP_ENDPOINT)
     }
     fn patch_bootargs(
@@ -555,20 +556,30 @@ impl platform::Driver for PmpDriver {
             .property_read(c"apple,dram-vendor-id")
             .required_by(&dev)?;
         let bdid = node.property_read(c"apple,board-id").required_by(&dev)?;
-        match node.property_read(c"apple,dram-capacity").optional() {
-            Some(dcap) => data.patch_bootargs(
-                &pmp_mmio,
-                &[
-                    (from_fourcc(b"BDID"), bdid),
-                    (from_fourcc(b"DCAP"), dcap),
-                    (from_fourcc(b"DVID"), dvid),
-                ],
-            )?,
-            None => data.patch_bootargs(
-                &pmp_mmio,
-                &[(from_fourcc(b"BDID"), bdid), (from_fourcc(b"DVID"), dvid)],
-            )?,
+        let mut patches = [(0u32, 0u32); 7];
+        let mut count = 0;
+        let mut add = |tag: &[u8; 4], value: u32| {
+            patches[count] = (from_fourcc(tag), value);
+            count += 1;
         };
+        add(b"BDID", bdid);
+        add(b"DVID", dvid);
+        if let Some(dcap) = node.property_read(c"apple,dram-capacity").optional() {
+            add(b"DCAP", dcap);
+        }
+        // macOS's ApplePMPFirmware: PMC_ = pmgr "pmc", PMCV = "pmc-pmgr" bit 0,
+        // PMCB = "pmc-pmgr" bit 3, CVAR = the PMP nub's "soc-chip-variant".
+        if let Some(pmc) = node.property_read(c"apple,pmc").optional() {
+            add(b"PMC_", pmc);
+        }
+        if let Some(pmc_pmgr) = node.property_read::<u32>(c"apple,pmc-pmgr").optional() {
+            add(b"PMCV", pmc_pmgr & 1);
+            add(b"PMCB", (pmc_pmgr >> 3) & 1);
+        }
+        if let Some(cvar) = node.property_read(c"apple,soc-chip-variant").optional() {
+            add(b"CVAR", cvar);
+        }
+        data.patch_bootargs(&pmp_mmio, &patches[..count])?;
         let rtkit = rtkit::RtKit::<PmpData>::new(&dev, None, 0, data.clone())?;
         data.rtkit.lock().as_mut().set(Some(rtkit));
         asc_mmio.update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
