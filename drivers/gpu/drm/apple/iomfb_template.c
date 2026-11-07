@@ -474,7 +474,8 @@ static void complete_dfb_surface(struct apple_dcp *dcp, void *out, void *cookie)
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 	struct dcp_channel *ch = &dcp->ch_cb;
 
-	*(u8 *)ch->output[ch->depth - 1] = out && !get_unaligned_le32(out);
+	/* update_dfb() reports success in bit 0 of its reply */
+	*(u8 *)ch->output[ch->depth - 1] = out && (*(u8 *)out & 1);
 	dcp_ack(dcp, DCP_CONTEXT_CB);
 #else
 	dcp_ack_dfb_surface(dcp);
