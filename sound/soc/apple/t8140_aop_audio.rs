@@ -2980,13 +2980,21 @@ unsafe extern "C" fn asoc_pcm_copy(
                 let p = p % ring_bytes;
                 u16::from_le_bytes([ring[p], ring[p + 1]])
             };
+            let late = data.hw.sense_late_current;
+            let frame = frame_bytes as usize;
             let mut chunk = [0u8; 512];
             let mut off = 0;
             while off < bytes {
                 let n = core::cmp::min(chunk.len(), bytes - off) & !1;
                 for i in (0..n).step_by(2) {
-                    let w = word_at(pos + off + i);
-                    let next = word_at(pos + off + i + 2);
+                    let mut p = pos + off + i;
+                    // A late pair's voltage is taken from the frame before.
+                    let ch = (p % frame) / 2;
+                    if ch & 1 == 1 && late & (1 << (ch / 2)) != 0 {
+                        p += ring_bytes - frame;
+                    }
+                    let w = word_at(p);
+                    let next = word_at(p + 2);
                     let v = (w << 1) | (next >> 15);
                     chunk[i..i + 2].copy_from_slice(&v.to_le_bytes());
                 }
@@ -4007,6 +4015,10 @@ struct HwConfig {
     /// (0, T8140) or the speaker service's own V/I sense return with this
     /// many 16-bit channels (T6050).
     sense_channels: u32,
+    /// Amplifier pairs (bit n: sense channels 2n current, 2n+1 voltage) whose
+    /// current word arrives one frame after the voltage it belongs to; the
+    /// copy delays those voltages by a frame so each V/I pair is one instant.
+    sense_late_current: u32,
     /// The microphone array (hpai, LEAP-S ADMAC RX0): its channel count,
     /// float32 at 48 kHz; 0 without one.
     hpai_channels: u32,
@@ -4027,6 +4039,7 @@ const HW_T8140: HwConfig = HwConfig {
     spkr_channels: 2,
     spkr_output_mute: true,
     sense_channels: 0,
+    sense_late_current: 0,
     hpai_channels: 2,
     hpai_pdm: false,
     fe_dai_names: [c"j700-pcm-0", c"j700-pcm-1", c"j700-pcm-2"],
@@ -4044,6 +4057,9 @@ const HW_T6050: HwConfig = HwConfig {
     spkr_channels: 6,
     spkr_output_mute: false,
     sense_channels: 12,
+    // J714c: Left Woofer 1 (slot 0) reads its current one sample behind its
+    // voltage; the other five pairs are aligned (phase of V/I to 12 kHz).
+    sense_late_current: 1 << 0,
     // ADT audio-hp-mic-proxy physical-descriptions: lpcm, float, 12 bytes
     // per frame at 48 kHz, three microphones.
     hpai_channels: 3,
