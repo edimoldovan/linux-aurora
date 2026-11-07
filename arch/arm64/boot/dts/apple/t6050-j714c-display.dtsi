@@ -23,6 +23,8 @@
 		/* disp0_dart must be first since the loader locks it */
 		iommus = <&disp0_dart 0>;
 		power-domains = <&ps_disp_fe>;
+		memory-region = <&dcp_fw_8>;
+		memory-region-names = "framebuffer";
 		phandle = <&display>;
 	};
 };
@@ -78,9 +80,12 @@
 		reg = <0x11f 0xd88b8000 0x0 0xc0000>;
 		no-map;
 	};
-	/* Starts at the framebuffer iBoot scans out of (m1n1: FDT: framebuffer@11fd310c000). */
-	dcp_fw_8: asc-firmware@11fd310c000 {
-		compatible = "apple,asc-mem";
+	/*
+	 * ADT /vram: the framebuffer iBoot scans out of (m1n1: FDT: framebuffer@11fd310c000),
+	 * DCP firmware segment 8. The display subsystem takes the boot framebuffer over from it.
+	 */
+	dcp_fw_8: framebuffer@11fd310c000 {
+		compatible = "framebuffer";
 		reg = <0x11f 0xd310c000 0x0 0x57ac000>;
 		no-map;
 	};
