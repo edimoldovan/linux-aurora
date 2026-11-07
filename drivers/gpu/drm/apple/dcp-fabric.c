@@ -1757,12 +1757,27 @@ int dcp_tunnel_crossbar_down(struct apple_dcp *dcp, u32 unit)
  * The output is the borrowed Type-C route's, or the fixed route's. Other
  * SoCs clock it at select. Runs inside a DCP apcall: only tb_lock.
  */
+static int dcp_direct_crossbar_link_t6050(struct apple_dcp *dcp, bool up)
+{
+	struct mux_control *xbar;
+
+	guard(mutex)(&dcp->tb_lock);
+	xbar = dcp->active_typec_route ?
+		dcp->active_typec_route->active_xbar : dcp->xbar;
+	if (dcp->dptx_tunnel || !dcp->phy || !xbar)
+		return 0;
+	/* No T6050 DisplayPort PHY or crossbar link driver in this tree yet. */
+	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 ? -ENODEV : 0;
+}
+
 int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
 {
 	struct apple_dcp_typec_route *route;
 	struct mux_control *xbar = NULL;
 	int ret;
 
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+		return dcp_direct_crossbar_link_t6050(dcp, up);
 	if (!of_machine_is_compatible("apple,t6030"))
 		return 0;
 	guard(mutex)(&dcp->tb_lock);
@@ -4101,4 +4116,11 @@ void dcp_fabric_shutdown_dptx(struct apple_dcp *dcp)
 			}
 		}
 	}
+}
+
+int dcp_typec_test_link(struct platform_device *pdev, bool enabled)
+{
+	guard(mutex)(&dcp_typec_fabric_lock);
+	return enabled ? dcp_dptx_connect_oob(pdev, 0) :
+			 dcp_dptx_disconnect_oob(pdev, 0);
 }

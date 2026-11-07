@@ -27,12 +27,15 @@
 #include "dcp-180hz.h"
 #include "iomfb.h"
 #include "iomfb_h17p.h"
+#include "iomfb_v27.h"
 #include "iomfb-state.h"
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
 #include "iomfb_v14_7.h"
 #include "iomfb_v14_7_tpl.h"
 #include "iomfb_v26_6.h"
+#include "dcp-peer-v26_6.h"
+#include "dcp-peer-frames-v27.h"
 #include "epic/dpavservep.h"
 #include "version_utils.h"
 
@@ -183,6 +186,7 @@ enum dcp_iomfb_method_profile {
 };
 
 struct apple_dcp_hw_data {
+	u8 firmware_dma_bits;
 	u32 num_dptx_ports;
 	enum dcp_iomfb_method_profile iomfb_method_profile;
 	/*
@@ -204,6 +208,19 @@ struct apple_dcp_hw_data {
 	 * (the T8122 dcpext), see dcp_fw_is_14_7().
 	 */
 	bool fw_14_7_endpoints;
+	/*
+	 * Firmware 27.3 (T6050): the IOMFB call tags of macOS 27.3's
+	 * IOMobileGraphicsFamily-DCP, its swap record and the endpoints macOS
+	 * starts.
+	 */
+	bool fw_27_3;
+	/*
+	 * The firmware reads swap timestamp 6 as the time to present at, in its
+	 * own clock rather than the AP's counter: leave the swap timestamps zero.
+	 */
+	bool swap_no_timestamps;
+	/* Use the full panel height, the notch rows included. */
+	bool show_notch;
 };
 
 enum dcp_test_point {
@@ -225,6 +242,20 @@ struct apple_dcp {
 	bool vblank_works_disabled;
 	struct dcp_fabric_pipeline fabric;
 	struct device *dev;
+	/* Peer DCP for a dual-pipe display: the primary reserves an idle peer
+	 * pipe; the peer records its owner.  Protected by dcp_peer_lock.
+	 */
+	struct apple_dcp *peer_reserved;
+	struct apple_dcp *peer_owner;
+	bool peer_starved;
+	struct dcp_peer_tiling peer_tiling;
+	bool peer_unbinding;
+	/* Firmware display endpoint (its Disp_Index), apple,dcp-endpoint. */
+	u32 peer_endpoint;
+	/* Paired DRM scanout on the primary; under dcp_peer_lock. */
+	bool peer_active, peer_failed;
+	u32 peer_mode_timing, peer_mode_color, peer_min_vrr;
+	bool peer_complete_logged;
 	struct platform_device *piodma;
 	bool piodma_created;
 	struct iommu_domain *iommu_dom;
@@ -233,6 +264,10 @@ struct apple_dcp {
 	struct apple_rtkit *rtk;
 	struct apple_crtc *crtc;
 	struct apple_connector *connector;
+	/* Protected by dcp_peer_lock; never take the physical route lock in
+	 * an AFK callback (a route operation may be waiting for that reply).
+	 */
+	struct dcp_peer_frames_v27 peer_frames;
 
 	struct apple_dcp_hw_data hw;
 	bool external_prepared;
@@ -319,6 +354,8 @@ struct apple_dcp {
 
 	/* DCP has crashed */
 	bool crashed;
+	/* CoreAnalytics events dumped in full (dcpep_cb_core_analytics_v27). */
+	u32 analytics_dumps;
 
 	DECLARE_BITMAP(iomfb_surfaces, DCP_MAX_PLANES);
 
@@ -330,6 +367,20 @@ struct apple_dcp {
 	/* clock rate request by dcp in */
 	struct clk *clk;
 	struct clk *clk_194;
+	struct clk_bulk_data *firmware_clocks;
+	unsigned int num_firmware_clocks;
+	u64 disp_firmware_base[MAX_DISP_REGISTERS];
+	u32 dfb_format, dfb_compression;
+	u64 dfb_region_size;
+	bool dfb_format_valid, dfb_compression_valid;
+	struct list_head iomfb_boolean_properties;
+	u32 iomfb_boolean_property_count;
+	u32 external_pipes_v27, external_displays_v27, external_suppression_v27;
+	struct dcp_swap_submit_req_v27 present_v27;
+	/* The present request as firmware 27.3 takes it, see dcp_swap_submit() */
+	u8 present_27_3[0x1144];
+	/* Both paired wire records belong to the primary endpoint lock. */
+	struct dcp_swap_submit_req_v27 peer_present_v27;
 
 	/* DCP shared memory */
 	void *shmem;
@@ -415,6 +466,8 @@ struct apple_dcp {
 
 	/* completion for active turning true */
 	struct completion start_done;
+	/* IOMFB has published fresh modes and acknowledged a Type-C display. */
+	struct completion typec_display_ready;
 
 	/* Is the DCP booted? */
 	bool active;
@@ -483,6 +536,8 @@ struct apple_dcp {
 	struct dcp_panel panel;
 
 	struct apple_dcp_afkep *systemep;
+	/* Endpoints started for the firmware only, by endpoint - 0x20 */
+	struct apple_dcp_afkep *plain_afk[0x20];
 	struct completion systemep_done;
 
 	struct apple_dcp_afkep *ibootep;
@@ -615,6 +670,10 @@ struct apple_dcp {
 		struct iomfb_transaction *active;
 		struct task_struct *owner;
 		struct work_struct work;
+		spinlock_t callback_lock;
+		struct list_head callbacks;
+		struct work_struct callback_work;
+		unsigned int callback_count;
 		struct delayed_work timeout;
 		struct delayed_work backlight_retry;
 		unsigned long deadline;
@@ -642,6 +701,31 @@ struct apple_dcp {
 	struct dcp_hdmi *hdmi;
 };
 
+/* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */
+static inline bool iomfb_is_m4(const struct apple_dcp *dcp)
+{
+	return IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132) &&
+	       dcp->fw_compat == DCP_FIRMWARE_M4;
+}
+
+/* Presents carry nits; one serialized IOMFB owner. */
+static inline bool dcp_presents_nits(const struct apple_dcp *dcp)
+{
+	return ((dcp->fw_compat == DCP_FIRMWARE_H17P ||
+	         dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
+		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) ||
+	       iomfb_is_m4(dcp);
+}
+
+/* An adopted firmware session that fails stop and is never torn down. */
+static inline bool dcp_fail_stop(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_H17P ||
+	       dcp->fw_compat == DCP_FIRMWARE_V_27_0 ||
+	       iomfb_is_m4(dcp);
+}
+
+bool dcp_firmware_metadata_enabled(struct apple_dcp *dcp);
 void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, bool connected);
 void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected);
 void dcp_firmware_metadata_announced(struct apple_dcp *dcp);
@@ -667,6 +751,8 @@ void iomfb_opaque_x_reset_h17p(struct apple_dcp *dcp);
 int iomfb_configure_backlight_h17p(struct apple_dcp *dcp, u32 maximum,
 				   bool inherited_valid, u32 inherited,
 				   bool default_valid, u32 default_nits);
+int iomfb_queue_callback(struct apple_dcp *dcp, dcp_callback_t callback,
+			 const void *data, size_t size, void *cookie);
 void iomfb_queue_init(struct apple_dcp *dcp);
 void iomfb_queue_stop(struct apple_dcp *dcp);
 bool iomfb_queue_drain(struct apple_dcp *dcp, unsigned long timeout);

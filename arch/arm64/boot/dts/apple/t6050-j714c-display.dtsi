@@ -1,0 +1,199 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J714c internal display pipeline: the DCP coprocessor, its mailbox, both
+ * DARTs, the bandwidth scratch window and the firmware memory.
+ *
+ * iBoot leaves the DCP running macOS 27 firmware with its memory mapped
+ * through the DARTs; the loader does not touch it on T6050, so everything
+ * the driver needs to adopt the running session is written here from this
+ * machine's Apple Device Tree: register windows (/arm-io bus addresses gain
+ * 0x2_0000_0000 on the CPU side), the iop-dcp-nub segment table (segment 8
+ * starts at the boot framebuffer) and the panel.
+ */
+
+/ {
+	aliases {
+		dcp = &dcp;
+		disp0 = &display;
+		disp0_piodma = &disp0_piodma;
+	};
+
+	/*
+	 * The ADT gives no rate for it: macOS 27.2's DCP reads 810 MHz for
+	 * getClockFrequency(0) ("returned pixelClock = 810000000").
+	 */
+	clk_disp0: clock-disp0 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <810000000>;
+		clock-output-names = "clk_disp0";
+	};
+
+	display: display-subsystem {
+		compatible = "apple,t6050-display-subsystem", "apple,display-subsystem";
+		/* disp0_dart must be first since the loader locks it */
+		iommus = <&disp0_dart 0>;
+		power-domains = <&ps_disp_fe>;
+		memory-region = <&dcp_fw_8>;
+		memory-region-names = "framebuffer";
+		phandle = <&display>;
+	};
+};
+
+&{/reserved-memory} {
+	/*
+	 * iop-dcp-nub segment-ranges (phys, size): reserved RAM. The DCP's DART is locked on
+	 * the firmware's four-level root, whose slot 16 maps these at their remap DVAs; Linux
+	 * resolves them through those tables and never maps into that slot.
+	 */
+	dcp_fw_text: asc-firmware@1000031c000 {
+		compatible = "apple,asc-mem";
+		reg = <0x100 0x0031c000 0x0 0x9a4000>;
+		no-map;
+	};
+	dcp_fw_data: asc-firmware@11fd21ac000 {
+		compatible = "apple,asc-mem";
+		reg = <0x11f 0xd21ac000 0x0 0xb04000>;
+		no-map;
+	};
+	dcp_fw_shared: asc-firmware@11fd218c000 {
+		compatible = "apple,asc-mem";
+		reg = <0x11f 0xd218c000 0x0 0x20000>;
+		no-map;
+	};
+	dcp_fw_shared_rw: asc-firmware@11fd2cb0000 {
+		compatible = "apple,asc-mem";
+		reg = <0x11f 0xd2cb0000 0x0 0x8000>;
+		no-map;
+	};
+	/*
+	 * The OS log (segment flags 0xa) runs at its physical address, not through
+	 * the DCP's DART: reserved, no DART mapping, as m1n1 marks it on T6030.
+	 */
+	dcp_fw_oslog: asc-firmware@10005cd4000 {
+		compatible = "apple,asc-mem";
+		reg = <0x100 0x05cd4000 0x0 0x28000>;
+		apple,dcp-os-log;
+		no-map;
+	};
+	dcp_fw_5: asc-firmware@11fd8cd8000 {
+		compatible = "apple,asc-mem";
+		reg = <0x11f 0xd8cd8000 0x0 0xc00000>;
+		no-map;
+	};
+	dcp_fw_6: asc-firmware@11fd8978000 {
+		compatible = "apple,asc-mem";
+		reg = <0x11f 0xd8978000 0x0 0x360000>;
+		no-map;
+	};
+	dcp_fw_7: asc-firmware@11fd88b8000 {
+		compatible = "apple,asc-mem";
+		reg = <0x11f 0xd88b8000 0x0 0xc0000>;
+		no-map;
+	};
+	/*
+	 * ADT /vram: the framebuffer iBoot scans out of (m1n1: FDT: framebuffer@11fd310c000),
+	 * DCP firmware segment 8. The display subsystem takes the boot framebuffer over from it.
+	 */
+	dcp_fw_8: framebuffer@11fd310c000 {
+		compatible = "framebuffer";
+		reg = <0x11f 0xd310c000 0x0 0x57ac000>;
+		no-map;
+	};
+	dcp_fw_9: asc-firmware@11fd3104000 {
+		compatible = "apple,asc-mem";
+		reg = <0x11f 0xd3104000 0x0 0x4000>;
+		no-map;
+	};
+};
+
+&soc {
+	/* ADT disp0 reg[4] (0x86700000, 0x114000): scratch at +0x20000, doorbell at +0xa4000. */
+	pmgr_dcp: power-management@286720000 {
+		reg = <0x2 0x86720000 0x0 0x8>, <0x2 0x867a4000 0x0 0x4>;
+		reg-names = "dcp-bw-scratch", "dcp-bw-doorbell";
+		#apple,bw-scratch-cells = <3>;
+		#apple,bw-doorbell-cells = <2>;
+	};
+
+	/* ADT dcp interrupts [1044 1043 1046 1045 ...]: the mailbox's four, ascending. */
+	dcp_mbox: mailbox@48ae08000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x4 0x8ae08000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 1043 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1044 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1045 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1046 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_disp_cpu>;
+	};
+
+	/* ADT dart-disp0: sid 0 (display) and 16 (piodma); Linux's window 1-2 TiB (DCP DMA is 41 bits) */
+	disp0_dart: iommu@48a300000 {
+		compatible = "apple,t6050-dart", "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x4 0x8a300000 0x0 0xc000>;
+		interrupts = <AIC_IRQ 990 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x100 0x0>;
+		power-domains = <&ps_disp_cpu>;
+	};
+
+	/* ADT dart-dcp: sid 23, the same window; the firmware's slot 16 (1 TiB + 64 GiB) is kept */
+	dcp_dart: iommu@48a340000 {
+		compatible = "apple,t6050-dart", "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x4 0x8a340000 0x0 0x20000>;
+		interrupts = <AIC_IRQ 990 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x100 0x0>;
+		power-domains = <&ps_disp_cpu>;
+	};
+
+	dcp: dcp@48ae00000 {
+		compatible = "apple,t6050-dcp", "apple,dcp";
+		mboxes = <&dcp_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcp_dart 23>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2",
+			    "disp-3", "disp-4", "iop-vbar";
+		reg = <0x4 0x8ae00000 0x0 0x4000>,
+		      <0x4 0x88000000 0x0 0x4000000>,
+		      <0x4 0x8a240000 0x0 0x10000>,
+		      <0x4 0x8a3ac000 0x0 0x4000>,
+		      <0x4 0x8a800000 0x0 0x800000>,
+		      <0x2 0x86700000 0x0 0x114000>,
+		      <0x4 0x8a850000 0x0 0x4000>;
+		apple,bw-scratch = <&pmgr_dcp 0 5 0>;
+		apple,bw-doorbell = <&pmgr_dcp 1 6>;
+		apple,iomfb-surfaces = <0 0 1 0>;
+		apple,firmware-compat = <27 0 0>;
+		clocks = <&clk_disp0>;
+		apple,clock-ids = <0>;
+		memory-region = <&dcp_fw_8>, <&dcp_fw_text>, <&dcp_fw_data>, <&dcp_fw_shared>,
+				<&dcp_fw_shared_rw>, <&dcp_fw_oslog>, <&dcp_fw_5>, <&dcp_fw_6>,
+				<&dcp_fw_7>, <&dcp_fw_9>;
+		memory-region-names = "framebuffer", "fw-text", "fw-data", "fw-shared",
+				      "fw-shared-data-rw", "fw-os-log", "fw-5", "fw-6",
+				      "fw-7", "fw-9";
+		power-domains = <&ps_disp_cpu>;
+		phandle = <&dcp>;
+		/* required bus properties for 'piodma' subdevice */
+		#address-cells = <2>;
+		#size-cells = <2>;
+
+		disp0_piodma: piodma {
+			iommus = <&disp0_dart 16>;
+			phandle = <&disp0_piodma>;
+		};
+
+		/* 14.2", 3024x1964 at 254 ppi; ADT user-accessible-max-nits 1000. */
+		panel: panel {
+			compatible = "apple,panel-mini-led", "apple,panel";
+			width-mm = <302>;
+			height-mm = <196>;
+			adj-height-mm = <189>;
+			apple,max-brightness = <1000>;
+		};
+	};
+};
