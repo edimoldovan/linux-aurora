@@ -630,7 +630,9 @@ impl power::Control for Firmware {
         self.primary.state.shared.crashed.load(Ordering::Acquire)
     }
     fn powered(&self) -> bool {
-        self.bridge.regs.g17_configuration_powered()
+        // 0xe01000 reads 0 on G17C whatever the power state, so there a retired KeepPowered
+        // counts as powered.
+        self.init.g17c() || self.bridge.regs.g17_configuration_powered()
     }
     fn counters(&self) -> Result<[u32; 3]> {
         self.init.control_counters()
