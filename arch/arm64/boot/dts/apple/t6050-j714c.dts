@@ -352,9 +352,27 @@
 };
 
 /*
+ * iBoot leaves the N1 port's gates in automatic power management with the
+ * target on and the block gated (APCIE_SYS_GP and APHY_GP_AUS5 actual 0,
+ * APCIE_PHY_SW actual 4). The kernel trains the port, so these gates stay
+ * at the requested state.
+ */
+&ps_apcie_sys_gp {
+	apple,no-auto-pm;
+};
+
+&ps_apcie_phy_sw {
+	apple,no-auto-pm;
+};
+
+&ps_aphy_gp_aus5 {
+	apple,no-auto-pm;
+};
+
+/*
  * The N1 (Wi-Fi and Bluetooth) on apcie0 port 0, as aurora-silicon's t6050-j716c.dts names it;
- * the J714c has the same port, registers and pins (ADT 2026-11-05). The port is trained before
- * Linux (pcie-exp1-host.py v13 over the proxy): PERST# GPIO 80 is high and the link is in L0.
+ * the J714c has the same port, registers and pins (ADT 2026-11-05). iBoot leaves the port
+ * untrained and the N1 off (SMC GPIO gP13 low, PERST# GPIO 80 low); the kernel trains it.
  * Platform id = (board-id 0x0a << 16) | 0x6050 by aurora's J716c rule; the FTAB comes from the
  * macOS install (not shipped by aurora).
  */
@@ -363,8 +381,16 @@
 	      <0x4 0x14000000 0x0 0x4000>,
 	      <0x4 0x10028000 0x0 0x8000>,
 	      <0x4 0x17010000 0x0 0x4000>,
-	      <0x4 0x10024000 0x0 0x4000>;
-	reg-names = "config", "rc", "port0", "phy0", "intr2axi0";
+	      <0x4 0x10024000 0x0 0x4000>,
+	      <0x4 0x17020000 0x0 0x4000>,
+	      <0x4 0x17004000 0x0 0x4000>,
+	      <0x4 0x16000000 0x0 0x24000>,		/* ADT reg[5] */
+	      <0x4 0x15044000 0x0 0x4000>,		/* ADT reg[6] */
+	      <0x4 0x17000000 0x0 0x24000>,		/* ADT reg[2] */
+	      <0x4 0x17800000 0x0 0x1b4000>;	/* ADT reg[4] */
+	/* phy-shared: ADT reg[3]; phy-common: ADT reg[2] + 0x4000; the rest: tunable windows */
+	reg-names = "config", "rc", "port0", "phy0", "intr2axi0", "phy-shared", "phy-common",
+		    "axi2af", "pcieclkgen", "phy-window", "phy-ip";
 	interrupts = <AIC_IRQ 1523 IRQ_TYPE_LEVEL_HIGH>;
 	interrupt-names = "port0";
 
@@ -377,8 +403,10 @@
 		reg = <0x0 0 0 0 0>;
 		bus-range = <1 1>;
 		apple,link-trained-by-bootloader;
-		/* PERST#, driven only by the root-port reset after the N1's ROM stage */
+		/* PERST#, for the kernel's train and the root-port reset after the N1's ROM stage */
 		reset-gpios = <&pinctrl_ap 80 GPIO_ACTIVE_LOW>;
+		/* The N1's power/reset: ADT function-reset = pKW4('gP13', ...), SMC GPIO pin 0x13 */
+		pwren-gpios = <&smc_gpio 19 GPIO_ACTIVE_HIGH>;
 		status = "okay";
 
 		#address-cells = <3>;
@@ -418,3 +446,5 @@
 &dart_apcie0 {
 	status = "okay";
 };
+
+#include "t6050-j714c-pcie-tunables.dtsi"

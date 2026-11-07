@@ -440,6 +440,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	int ret;
 	const char *name;
 	bool active;
+	u32 reg;
 
 	regmap = syscon_node_to_regmap(node->parent);
 	if (IS_ERR(regmap))
@@ -531,6 +532,16 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	if (active && !ps->firmware_owned && !t6050_noauto)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
 				   ps->no_auto_pm ? 0 : APPLE_PMGR_AUTO_ENABLE);
+
+	/*
+	 * Under auto-PM a domain counts as on when only its target is. Taken out
+	 * of auto-PM, it must reach that target before a consumer touches it.
+	 */
+	if (active && ps->no_auto_pm && !ps->firmware_owned && !t6050_noauto &&
+	    regmap_read_poll_timeout(regmap, ps->offset, reg,
+				     FIELD_GET(APPLE_PMGR_PS_ACTUAL, reg) == APPLE_PMGR_PS_ACTIVE,
+				     1, APPLE_PMGR_PS_SET_TIMEOUT))
+		dev_warn(dev, "PS %s: not on after leaving auto-PM (now: 0x%x)\n", name, reg);
 
 	ret = pm_genpd_init(&ps->genpd, NULL, !active);
 	if (ret < 0) {

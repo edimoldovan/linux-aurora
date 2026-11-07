@@ -377,6 +377,10 @@
 		reg = <0x4 0x10000000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 1524 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		/* iBoot leaves its block gated; it is read at probe */
+		power-domains = <&ps_apcie_sys_gp>;
+		/* Its registers answer only once the root complex is up */
+		apple,manual-availability;
 		status = "disabled";
 	};
 
@@ -418,6 +422,8 @@
 	pcie0: pcie@1cb0000000 {
 		compatible = "apple,t6050-pcie";
 		device_type = "pci";
+		/* The GP port's domain; its parents up to ps_apcie_gp follow it. */
+		power-domains = <&ps_aphy_gp_aus5>;
 		nonposted-mmio;
 		interrupt-parent = <&aic>;
 
