@@ -98,7 +98,9 @@
 &soc {
 	isp_dart0: iommu@5828c0000 {
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
-		reg = <0x5 0x828c0000 0x0 0xc000>;
+		/* ADT dart-isp0 reg[0] and reg[5], its address filter */
+		reg = <0x5 0x828c0000 0x0 0xc000>, <0x5 0x828d0000 0x0 0x4000>;
+		reg-names = "dart", "dapf";
 		#iommu-cells = <1>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 531 IRQ_TYPE_LEVEL_HIGH>;
