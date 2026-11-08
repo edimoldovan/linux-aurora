@@ -704,7 +704,7 @@ impl InitData {
             base: range.start,
             dynamic: range.start + t8140::dynamic::KERNEL_OFFSET..range.end,
         };
-        self.map_register_windows(&env, cfg)?;
+        self.map_register_windows(&env)?;
         let tables = self.build_descriptor_tables(&env)?;
         self.build_render_free_lists(&env)?;
         let first_block = self.build_render_pool(&env)?;
@@ -713,8 +713,8 @@ impl InitData {
         self.initialize_firmware_objects(&env, cfg, &tables, &bundle)
     }
 
-    fn map_register_windows(&mut self, env: &BuildEnv<'_>, cfg: &Config) -> Result {
-        for window in cfg.register_windows {
+    fn map_register_windows(&mut self, env: &BuildEnv<'_>) -> Result {
+        for window in &t8140::REGISTER_WINDOWS {
             let (phys, va, size) = window.mapping().ok_or(EINVAL)?;
             self.aliases.push(
                 env.vm.map_io(
@@ -988,13 +988,13 @@ impl InitData {
         bundle: &BundleObjects,
     ) -> Result {
         let base = env.base;
-        let opps = Self::opps(env.dev, cfg.opps)?;
+        let opps = Self::opps(env.dev)?;
         let hw_args = abi::HwDataArgs {
             chip_id: cfg.chip_id,
-            windows: cfg.register_windows,
-            reserved_slots: cfg.reserved_slots,
+            windows: &t8140::REGISTER_WINDOWS,
+            reserved_slots: &t8140::RESERVED_REGISTER_SLOTS,
             opps: &opps,
-            perf: cfg.perf,
+            perf: &t8140::PERF,
             completion_rings: bundle.completion_rings,
             qos_va: self.object(bundle.qos)?.gpu_va(),
         };
@@ -1077,7 +1077,6 @@ impl InitData {
                 abi::OpeningRecord::new(abi_role),
             )?;
             let root = abi::RootArgs {
-                version: cfg.interface_version,
                 region_a_va: self.object(bundle.region_a)?.gpu_va(),
                 region_c_va: self.object(self.region_c)?.gpu_va(),
                 main_config_va: main_va,
@@ -1122,7 +1121,6 @@ impl InitData {
         &mut self,
         vm: &mmu::Vm,
         metrics: &KernelObject,
-        cfg: &Config,
     ) -> Result<KVec<mmu::KernelMapping>> {
         let mut mappings = KVec::with_capacity(24, GFP_KERNEL)?;
         mappings.push(
@@ -1152,7 +1150,7 @@ impl InitData {
             )?;
         }
         mappings.push(
-            metrics.map_alias(vm, cfg.pm_metrics.va, mmu::PROT_GPU_FW_SHARED_RW)?,
+            metrics.map_alias(vm, t8140::CONFIG.pm_metrics.va, mmu::PROT_GPU_FW_SHARED_RW)?,
             GFP_KERNEL,
         )?;
         Ok(mappings)
@@ -1182,7 +1180,7 @@ impl InitData {
             .load(Ordering::Relaxed))
     }
 
-    fn opps(dev: &AsahiDrmDevice, expected: usize) -> Result<KVec<abi::Opp>> {
+    fn opps(dev: &AsahiDrmDevice) -> Result<KVec<abi::Opp>> {
         let node = dev.as_ref().as_ref().of_node().ok_or(EIO)?;
         let table = node
             .parse_phandle(c_str!("operating-points-v2"), 0)
@@ -1197,7 +1195,7 @@ impl InitData {
                 GFP_KERNEL,
             )?;
         }
-        if opps.len() != expected {
+        if opps.len() != t8140::OPPS {
             return Err(EINVAL);
         }
         Ok(opps)
