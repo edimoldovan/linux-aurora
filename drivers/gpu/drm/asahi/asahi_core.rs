@@ -210,6 +210,10 @@ module! {
             default: 50,
             description: "Per-client GPU memory limit in percent of RAM (0: the device limit)",
         },
+        m5_poll_in_flight: u8 {
+            default: 1,
+            description: "M5: poll the event rings every 1 ms while work is in flight (1 = on); the firmware drops a completion notification while its previous mailbox message is still pending",
+        },
         oom_attribution: u8 {
             default: 1,
             description: "Count held GPU memory in its creator's RSS for the OOM killer (1 = on)",

@@ -548,7 +548,14 @@ impl crate::g17::Shared {
         // a preparation waits for unclaimed room, every pass polls the consumers.
         let outer = firmware.init.poll_outer_progress()?;
         let backpressured = firmware.render_control_backpressured();
+        // The M5 firmware sends its event notification without waiting: while its previous
+        // mailbox message is still pending, the notification is dropped and the completion
+        // waits in the event ring. Poll the rings while work is in flight.
+        let poll_in_flight = in_flight
+            && firmware.init.is_m5()
+            && crate::module_parameters::m5_poll_in_flight.value() != 0;
         let polling = backpressured
+            || poll_in_flight
             || firmware.init.outer_waiting()
             || firmware.queues.replay_outer_wait.is_some()
             || firmware.queues.replay_consumer_wait.is_some()
