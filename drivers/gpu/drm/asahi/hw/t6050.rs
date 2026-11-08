@@ -31,16 +31,16 @@ pub(crate) const CONFIG: Config = Config {
     // Placeholder (t8140); consumed after the version gate.
     secondary_root_offset: 0x40000,
     // Crash-log buffers: the firmware requests these during RTKit init, before
-    // the version gate, at the physical addresses of its GFX / GFX1
-    // __DATA_SHARED_RO segments (masked low 40 bits). Where iBoot loads them on
-    // mBoot-20457.60.65 (macOS 27.3 beta 1): 0x1000286c000 / 0x10002928000.
+    // the version gate. VAs observed from the firmware's RTKit buffer requests
+    // (masked low 40 bits of iova 0x10002864000 / 0x10002920000); they match the
+    // GFX / GFX1 __DATA_SHARED_RO segments from the proxy probe.
     crash_buffers: [
         FixedBuffer {
-            va: 0x286_c000,
+            va: 0x286_4000,
             size: 0x8000,
         },
         FixedBuffer {
-            va: 0x292_8000,
+            va: 0x292_0000,
             size: 0x8000,
         },
     ],
