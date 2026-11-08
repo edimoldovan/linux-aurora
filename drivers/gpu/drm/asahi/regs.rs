@@ -39,6 +39,10 @@ pub(crate) const SGX_SIZE: usize = 0x1000000;
 
 const FAULT_INFO: usize = 0x17030;
 
+/// A nonzero low nibble permits writes through the G17 queue configuration port.
+const G17_HOST_IRQ_SUMMARY: usize = 0xe01000;
+const G17_HOST_POWERED: u32 = 0xf;
+
 const ID_VERSION: usize = 0xd04000;
 const ID_UNK08: usize = 0xd04008;
 const ID_COUNTS_1: usize = 0xd04010;
@@ -60,8 +64,6 @@ const G17_BRIDGE_ENABLE: u32 = 0x1; // BIT(0)
 /// G17 dynamic power gating control. Clearing these bits enables gating of idle GPU cores.
 const G17_GATING_CONTROL: usize = 0xd06030;
 const G17_GATING_DISABLE: u32 = 0x6; // BIT(1) | BIT(2)
-/// Held while the host writes the KSM ports.
-const G17_GATING_HOLD: u32 = 0x4; // BIT(2)
 
 /// These performance selectors must be sampled before firmware can gate the core registers.
 const G17_PERF_CONTROL: usize = 0xe0141c;
@@ -566,26 +568,21 @@ impl G17Resources {
         })
     }
 
-    /// Installs kick queues ([`crate::g17::fw::kick::KickRegistration`] writes) while the
-    /// caller holds the device mutex. No other port publisher may interleave between the
-    /// gating hold and the final validity strobe. AGXG17X configureHardware writes without
-    /// a power witness (G17C's reads 0 before and after a kick), so this always writes and
-    /// returns true.
-    pub(crate) fn install_kick_queues(&self, writes: &[(usize, u64)]) -> Result<bool> {
+    /// Installs both render queues while the caller holds the device mutex.
+    /// No other port publisher may interleave between this power witness and
+    /// the final validity strobe. False means no write was attempted.
+    pub(crate) fn install_render_pair(
+        &self,
+        registration: &crate::g17::fw::kick::RenderRegistration,
+    ) -> Result<bool> {
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let sgx = (&*sgx).as_view();
-        // AGXG17X brackets every KSM port write with AGXArmFenderChinook's
-        // disableDynamicFenderGating (BIT(2) set) and enableDynamicFenderGating
-        // (BIT(1) | BIT(2) cleared), each followed by a read-back.
-        let gating = sgx.try_read32(G17_GATING_CONTROL)?;
-        sgx.try_write32(gating | G17_GATING_HOLD, G17_GATING_CONTROL)?;
-        sgx.try_read32(G17_GATING_CONTROL)?;
-        for &(offset, value) in writes {
+        if sgx.relaxed().read32(G17_HOST_IRQ_SUMMARY) & G17_HOST_POWERED == 0 {
+            return Ok(false);
+        }
+        for &(offset, value) in registration.writes() {
             sgx.try_write64(value, offset)?;
         }
-        let released = sgx.try_read32(G17_GATING_CONTROL)? & !G17_GATING_DISABLE;
-        sgx.try_write32(released, G17_GATING_CONTROL)?;
-        sgx.try_read32(G17_GATING_CONTROL)?;
         Ok(true)
     }
 

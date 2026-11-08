@@ -493,58 +493,6 @@ impl KickEntry {
     }
 }
 
-/// The hardware installation of one kick queue, as AGXG17X
-/// KSMKickQueue::configureHardware writes it for every tiling, fragment and
-/// compute queue: the configuration tag and payload through the indirect port,
-/// then the queue's validity bit, high mask word before low.
-pub(crate) struct KickRegistration {
-    writes: [(usize, u64); 4],
-}
-
-impl KickRegistration {
-    const TAG_PORT: usize = 0x4090;
-    const DATA_PORT: usize = 0x4098;
-    const VALID_LOW: usize = 0x21068;
-    const VALID_HIGH: usize = 0x21070;
-    /// AGXG17X: 0x0020_0800_0002_1008 | qid << 44 (the G17P form was
-    /// 0x0000_0400_0002_1008 | qid << 43).
-    const CONFIG_TAG: u64 = 0x0020_0800_0002_1008;
-    const QID_SHIFT: u32 = 44;
-    const ADDRESS_MASK: u64 = 0x0000_07ff_ffff_ffe0;
-
-    /// Validates the queue without touching MMIO. `va` is the kick ring's
-    /// lower address; the queue is registered at priority class `priority`.
-    pub(crate) fn new(
-        qid: u8,
-        va: u64,
-        engine: super::queue::DataMaster,
-        priority: u8,
-    ) -> Result<Self> {
-        if qid > QID_MAX || va & !Self::ADDRESS_MASK != 0 || priority >= Policy::PRIORITIES {
-            return Err(EINVAL);
-        }
-        let completion = (3 * (4 - u64::from(priority)) + 0x3fe).wrapping_shl(54);
-        let payload = ((engine as u64 + 1) << 60) | va | completion;
-        let (low, high) = if qid < 64 {
-            (1u64 << qid, 0)
-        } else {
-            (0, 1u64 << (qid - 64))
-        };
-        Ok(Self {
-            writes: [
-                (Self::TAG_PORT, Self::CONFIG_TAG | (u64::from(qid) << Self::QID_SHIFT)),
-                (Self::DATA_PORT, payload),
-                (Self::VALID_HIGH, high),
-                (Self::VALID_LOW, low),
-            ],
-        })
-    }
-
-    pub(crate) fn writes(&self) -> &[(usize, u64)] {
-        &self.writes
-    }
-}
-
 /// The complete write-only installation of a fragment/tiling queue pair.
 /// Firmware must see both queues configured before either outer command.
 pub(crate) struct RenderRegistration {
@@ -552,28 +500,50 @@ pub(crate) struct RenderRegistration {
 }
 
 impl RenderRegistration {
+    const TAG_PORT: usize = 0x4090;
+    const DATA_PORT: usize = 0x4098;
+    const VALID_LOW: usize = 0x21068;
+    const VALID_HIGH: usize = 0x21070;
+    const CONFIG_TAG: u64 = 0x0000_0400_0002_1008;
+    const ADDRESS_MASK: u64 = 0x0000_07ff_ffff_ffe0;
+
     /// Validates both queues without touching MMIO. The resulting transaction
     /// writes fragment configuration and validity before tiling configuration
-    /// and validity. Both queues are registered at priority class `priority`.
+    /// and validity. Each validity mask is stored high before low. Both queues
+    /// are registered at priority class `priority`.
     pub(crate) fn new(fragment: (u8, u64), tiling: (u8, u64), priority: u8) -> Result<Self> {
-        if fragment.0 == tiling.0 {
+        if fragment.0 == tiling.0 || priority >= Policy::PRIORITIES {
             return Err(EINVAL);
         }
-        let fragment = KickRegistration::new(
-            fragment.0,
-            fragment.1,
-            super::queue::DataMaster::Fragment,
-            priority,
-        )?;
-        let tiling =
-            KickRegistration::new(tiling.0, tiling.1, super::queue::DataMaster::Tiling, priority)?;
         let mut writes = [(0, 0); 8];
-        writes[..4].copy_from_slice(fragment.writes());
-        writes[4..].copy_from_slice(tiling.writes());
+        for (slot, ((qid, va), engine)) in [
+            (fragment, super::queue::DataMaster::Fragment),
+            (tiling, super::queue::DataMaster::Tiling),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if qid > QID_MAX || va & !Self::ADDRESS_MASK != 0 {
+                return Err(EINVAL);
+            }
+            let completion = (3 * (4 - u64::from(priority)) + 0x3fe).wrapping_shl(54);
+            let payload = ((engine as u64 + 1) << 60) | va | completion;
+            let (low, high) = if qid < 64 {
+                (1u64 << qid, 0)
+            } else {
+                (0, 1u64 << (qid - 64))
+            };
+            writes[slot * 4..slot * 4 + 4].copy_from_slice(&[
+                (Self::TAG_PORT, Self::CONFIG_TAG | (u64::from(qid) << 43)),
+                (Self::DATA_PORT, payload),
+                (Self::VALID_HIGH, high),
+                (Self::VALID_LOW, low),
+            ]);
+        }
         Ok(Self { writes })
     }
 
-    pub(crate) fn writes(&self) -> &[(usize, u64)] {
+    pub(crate) fn writes(&self) -> &[(usize, u64); 8] {
         &self.writes
     }
 }

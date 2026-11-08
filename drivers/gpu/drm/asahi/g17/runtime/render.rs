@@ -409,7 +409,7 @@ impl crate::g17::queue::render::Host for Host<'_> {
                 .firmware
                 .bridge
                 .regs
-                .install_kick_queues(registration.writes())?
+                .install_render_pair(registration)?
             {
                 return Ok(());
             }
