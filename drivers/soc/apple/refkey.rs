@@ -167,7 +167,7 @@ impl SepData {
     pub(crate) fn sks_machine_refkey(&self, handle: crate::sks::KeyBagHandle, secret: &[u8]) {
         const MACHINE_REFKEY_PATH: &CStr = c"/var/lib/aurora-sep-refkey.bin";
         const MACHINE_REFKEY_V2_PATH: &CStr = c"/var/lib/aurora-sep-refkey-v2.bin";
-        let path = if *crate::module_parameters::refkey_v2.value() != 0 {
+        let path = if crate::module_parameters::refkey_v2.value() != 0 {
             MACHINE_REFKEY_V2_PATH
         } else {
             MACHINE_REFKEY_PATH

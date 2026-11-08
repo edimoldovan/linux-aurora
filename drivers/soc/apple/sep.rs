@@ -845,10 +845,10 @@ impl SepData {
         )?;
         let dma_ring = dma::Coherent::<u8>::zeroed_slice(dev, DMA_RING_SIZE, GFP_KERNEL)?;
 
-        let xart_writes = *module_parameters::xart_writes.value() != 0;
-        let xart_start = *module_parameters::xart_start_sector.value();
+        let xart_writes = module_parameters::xart_writes.value() != 0;
+        let xart_start = module_parameters::xart_start_sector.value();
         let xart_guard =
-            xart_guard::level(*module_parameters::xart_guard.value(), profile.xart_guard);
+            xart_guard::level(module_parameters::xart_guard.value(), profile.xart_guard);
         let store = match xart_store::Store::open_owner(xart_writes, xart_start) {
             Ok(mut store) => {
                 match xart_guard {
@@ -1535,8 +1535,8 @@ impl SepData {
     }
 
     fn prepare_os_uuid(&self) {
-        let hi = *module_parameters::os_uuid_hi.value();
-        let lo = *module_parameters::os_uuid_lo.value();
+        let hi = module_parameters::os_uuid_hi.value();
+        let lo = module_parameters::os_uuid_lo.value();
         if hi != 0 || lo != 0 {
             let mut uuid = [0u8; 16];
             uuid[..8].copy_from_slice(&hi.to_be_bytes());
@@ -1636,7 +1636,7 @@ impl SepData {
             );
         }
 
-        if *module_parameters::xarm_trace.value() != 0 {
+        if module_parameters::xarm_trace.value() != 0 {
             dev_info!(
                 self.dev,
                 "xarm: op 0x{:02x} request_len {} reply_status 0x{:02x} reply_len {}\n",
@@ -2623,8 +2623,8 @@ impl platform::Driver for SepDriver {
         _info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev: &device::Device<device::Core<'_>> = pdev.as_ref();
-        if *module_parameters::provision_keybag.value() != 0
-            && *module_parameters::xart_writes.value() == 0
+        if module_parameters::provision_keybag.value() != 0
+            && module_parameters::xart_writes.value() == 0
         {
             dev_err!(dev, "provision_keybag=1 requires xart_writes=1\n");
             return Err(EINVAL);

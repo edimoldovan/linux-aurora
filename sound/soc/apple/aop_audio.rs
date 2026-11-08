@@ -986,7 +986,7 @@ impl platform::Driver for SndSocAopDriver {
         let fwnode = parent_fwnode
             .get_child_by_name(c_str!("audio"))
             .ok_or(EIO)?;
-        let audio = *module_parameters::mic_check_123.value() != 0;
+        let audio = module_parameters::mic_check_123.value() != 0;
         if !audio && parent_fwnode.property_present(c_str!("apple,no-beamforming")) {
             return Err(ENODEV);
         }
