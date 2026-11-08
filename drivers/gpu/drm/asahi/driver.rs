@@ -103,6 +103,9 @@ impl drm::driver::Driver for AsahiDrmDriver {
     /// Our `Object` type.
     type Object = drm::gem::shmem::Object<AsahiObject>;
     type ParentDevice<Ctx: DeviceContext> = platform::Device<Ctx>;
+    /// Open files and exported buffers hold this module.
+    const MODULE: Option<&'static kernel::ThisModule> =
+        Some(kernel::module::this_module::<crate::LocalModule>());
 
     const INFO: drm::driver::DriverInfo = INFO;
     const FEAT_RENDER: bool = true;
@@ -153,6 +156,7 @@ macro_rules! asahi_of_device_table {
     ($($g15_owned:tt)*) => {
         kernel::of_device_table!(
             OF_TABLE,
+            MODULE_OF_TABLE,
             <AsahiPlatformDriver as platform::Driver>::IdInfo,
             [
                 (

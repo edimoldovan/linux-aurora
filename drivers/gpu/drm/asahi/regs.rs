@@ -15,13 +15,11 @@ use core::mem::MaybeUninit;
 use kernel::{
     bindings,
     c_str,
+    devres::Devres,
     device::Core,
     error::{from_err_ptr, to_result},
     io::{
-        mem::{
-            DevresIoMem,
-            IoMem, //
-        },
+        mem::IoMem,
         Io,
         IoBase, //
     },
@@ -568,6 +566,9 @@ impl Resources<'_> {
         })
     }
 }
+
+/// A device-managed I/O memory region; 7.2.11 has no `kernel::io::mem::DevresIoMem`.
+type DevresIoMem<const SIZE: usize = 0> = Devres<IoMem<'static, SIZE>>;
 
 /// Device resources of a G17 GPU.
 ///
