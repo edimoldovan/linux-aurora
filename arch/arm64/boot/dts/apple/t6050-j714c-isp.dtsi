@@ -94,6 +94,8 @@
 		apple,dart-vm-size = <0x0 0xe0000000>;
 		apple,platform-id = <0x73>;
 		apple,temporal-filter = <1>;
+		/* ADT isp0 cam-connections-scheme, as on the M4 Pro/Max J614/J616 */
+		apple,cam-connections-scheme = <0x10>;
 
 		sensor-presets {
 			/* 1280x720 */
