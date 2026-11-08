@@ -1036,35 +1036,11 @@ impl InitData {
         self.object_mut(self.cluster)?
             .write(abi::private::SECONDARY_STATUS_A, abi::StatusBlock::new())?;
         let fwctl_va = self.object(tables.fwctl)?.gpu_va();
-        let status_b_va = base + high::PRIVATE_CLUSTER
-            + (abi::private::PRIMARY_STATE + abi::private::STATUS_B) as u64;
-        // g17c: the firmware-control page, unused otherwise, holds the secondary's power
-        // state (AGXG17X: its own 0x790-byte object); the primary and the secondary each
-        // point at the other's flag.
-        let secondary_power_va = match cfg.abi {
-            Abi::G17p => {
-                status_b_va + abi::PrimaryStatusB::POWER_STATE as u64
-            }
-            Abi::G17c => {
-                let page = self.object_mut(tables.fwctl)?;
-                page.initialize::<abi::PowerState>(0, |power| {
-                    power.init();
-                    Ok(())
-                })?;
-                page.write(abi::PowerState::G17C_FLAG, 1u32)?;
-                page.write(
-                    abi::PowerState::G17C_PEER_FLAG,
-                    status_b_va + abi::PrimaryStatusB::G17C_FLAG as u64,
-                )?;
-                fwctl_va
-            }
-        };
         self.object_mut(self.cluster)?
             .initialize::<abi::PrimaryStatusB>(abi::private::STATUS_B, |status| {
                 match cfg.abi {
                     Abi::G17p => status.init(fwctl_va),
-                    Abi::G17c => status
-                        .init_g17c(secondary_power_va + abi::PowerState::G17C_FLAG as u64),
+                    Abi::G17c => status.init_g17c(fwctl_va),
                 }
                 Ok(())
             })?;
@@ -1153,7 +1129,8 @@ impl InitData {
                     abi::SECONDARY_ROOT_OFFSET,
                     abi::SecondaryRoot::new(
                         &root,
-                        secondary_power_va,
+                        base + high::PRIVATE_CLUSTER
+                            + (abi::private::STATUS_B + abi::PrimaryStatusB::POWER_STATE) as u64,
                         state_va + abi::private::STATUS_B as u64,
                     ),
                 )?,

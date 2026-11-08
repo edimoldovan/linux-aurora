@@ -1567,11 +1567,9 @@ impl PrimaryStatusB {
     /// Offset of the [`PowerState`].
     pub(crate) const POWER_STATE: usize = 0xe440;
 
-    /// g17c: the primary's flag (u32), raised before it reads the secondary's flag; it lies
-    /// inside G17P's [`PowerState`], which leaves those bytes zero.
-    pub(crate) const G17C_FLAG: usize = 0xe71c;
-    /// g17c: pointer (u64) to the secondary's flag ([`PowerState::G17C_FLAG`]).
-    const G17C_PEER_FLAG: usize = 0xe720;
+    /// g17c: pointer to a host word the firmware reads after raising its flag at
+    /// `+0xe71c`; it lies inside G17P's [`PowerState`], which leaves those bytes zero.
+    const G17C_FWCTL_STATE: usize = 0xe720;
 
     /// Initializes the primary status B; `fwctl_va` is the zeroed
     /// firmware-control page ([`FWCTL_SIZE`] bytes).
@@ -1585,14 +1583,13 @@ impl PrimaryStatusB {
     }
 
     /// Initializes the g17c primary status B. Its recovery area is laid out differently,
-    /// so only the status block, the power state and the pointer to the secondary's flag
-    /// (`peer_flag_va`) are set.
-    pub(crate) fn init_g17c(&mut self, peer_flag_va: u64) {
+    /// so only the status block, the power state and the firmware-control pointer are set.
+    pub(crate) fn init_g17c(&mut self, fwctl_va: u64) {
         clear(self);
         self.status = StatusBlock::new();
         self.power.init();
-        let at = Self::G17C_PEER_FLAG - Self::POWER_STATE;
-        self.power.0[at..at + 8].copy_from_slice(&peer_flag_va.to_le_bytes());
+        let at = Self::G17C_FWCTL_STATE - Self::POWER_STATE;
+        self.power.0[at..at + 8].copy_from_slice(&fwctl_va.to_le_bytes());
     }
 }
 
@@ -1959,13 +1956,7 @@ pub(crate) struct PowerState(pub(crate) [u8; 0x6c0]);
 unsafe impl Zeroable for PowerState {}
 
 impl PowerState {
-    /// g17c: the secondary raises this flag (u32) before it reads the primary's flag
-    /// through [`Self::G17C_PEER_FLAG`]; AGXG17X starts it at 1.
-    pub(crate) const G17C_FLAG: usize = 0x784;
-    /// g17c: pointer (u64) to the primary's flag in its status B.
-    pub(crate) const G17C_PEER_FLAG: usize = 0x788;
-
-    pub(crate) fn init(&mut self) {
+    fn init(&mut self) {
         fill_words(&mut self.0, POWER_STATE_WORDS);
     }
 }
