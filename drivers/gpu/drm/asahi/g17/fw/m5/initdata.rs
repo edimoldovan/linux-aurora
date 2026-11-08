@@ -1676,7 +1676,9 @@ pub(crate) const M5_HW_DATA_SIZE: usize = ABI_ALLOCATION_SIZES_26A428_M5[ALLOC_H
 pub(crate) const M5_KICK_SHARED_SIZE: usize = 0x2000;
 pub(crate) const M5_KICK_SHARED_POINTER: usize = 0x27dc;
 
-pub(crate) fn set_m5_kick_shared(out: &mut [u8], address: u64) -> Result<(), InitdataError> {
+/// `shift_2728`: the HW data has 4 more bytes at 0x2728 (27.3 beta 1), so the pointer is 4 bytes later.
+pub(crate) fn set_m5_kick_shared(out: &mut [u8], address: u64, shift_2728: bool)
+    -> Result<(), InitdataError> {
     if out.len() != M5_HW_DATA_SIZE {
         return Err(InitdataError::BufferSize);
     }
@@ -1687,7 +1689,7 @@ pub(crate) fn set_m5_kick_shared(out: &mut [u8], address: u64) -> Result<(), Ini
     if address & (UAT_PAGE_SIZE as u64 - 1) != 0 {
         return Err(InitdataError::AddressOutOfRange);
     }
-    put_u64(out, M5_KICK_SHARED_POINTER, address);
+    put_u64(out, M5_KICK_SHARED_POINTER + if shift_2728 { 4 } else { 0 }, address);
     Ok(())
 }
 

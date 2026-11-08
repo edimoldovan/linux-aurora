@@ -164,7 +164,8 @@ impl InitData {
         m::encode_m5_hw_data(board, completions, QOS, windows, variant.m5_hw_data_shift_2728,
             &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE]).map_err(|_| EINVAL)?;
         m::set_m5_kick_shared(
-            &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE], KICK_SHARED)
+            &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE], KICK_SHARED,
+            variant.m5_hw_data_shift_2728)
             .map_err(|_| EINVAL)?;
         let masked_cores: u32 = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
         let enabled_cores = if masked_cores != 0 { masked_cores }
