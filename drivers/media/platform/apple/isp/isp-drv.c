@@ -788,6 +788,61 @@ static const struct apple_isp_hw apple_isp_hw_t8140 = {
 	.resident_fw = true,
 };
 
+/*
+ * T6050 (M5 Max, J714c): ISP17a, ASC version 0x110003. The J714c ADT's
+ * dart-isp0 dapf-instance-0 ranges, rounded out to 16 KiB pages; the T8140
+ * windows at other bases, with eight DSID windows.
+ */
+static const struct isp_mmio_window apple_isp_fw_mmio_t6050[] = {
+	{ 0x2220004000, 0x14000 },	/* DSID broadcast-clear windows */
+	{ 0x2222004000, 0x14000 },
+	{ 0x2224004000, 0x14000 },
+	{ 0x2226004000, 0x14000 },
+	{ 0x2228004000, 0x14000 },
+	{ 0x222a004000, 0x14000 },
+	{ 0x222c004000, 0x14000 },
+	{ 0x222e004000, 0x14000 },
+	{ 0x280680000, 0x8000 },
+	{ 0x280900000, 0x4000 },	/* PMGR, ISP power states */
+	{ 0x284240000, 0x28000 },	/* PMGR, as T8140's PMP clock scratch window */
+	{ 0x284e3c000, 0x4000 },
+	{ 0x286724000, 0x4000 },	/* PMP bandwidth scratch */
+	{ 0x29062c000, 0x20000 },
+	{ 0x509660000, 0x4000 },
+};
+
+static const struct apple_isp_hw apple_isp_hw_t6050 = {
+	.gen = ISP_GEN_T8140,
+	.fw_abi = ISP_FW_ABI_H17,
+	.pmu_base = 0x0,
+
+	/* The first window's clear block, at +0x12000 as on T8142. */
+	.dsid_count = 1,
+	.dsid_clr_base0 = 0x2220016000,
+	.dsid_clr_range0 = 0x2fc,
+
+	/*
+	 * The PMP clock scratch word is not known yet; without it the driver
+	 * sends no PMP control, as on T6031.
+	 */
+	.clock_scratch = 0x0,
+	.mbox_irq_enable = ISP_MBOX_IRQ_ENABLE_T6031,
+
+	.scl1 = true,
+	.lpdp = true,
+	.meta_size = ISP_META_SIZE_T8140,
+
+	.fw_iova_mask = GENMASK_ULL(35, 0),
+	.mbox2_offset = 0x410,
+	.mbox_irq_route = true,
+	.coproc_control = ISP_COPROC_CONTROL_T8140,
+	.fw_mmio = apple_isp_fw_mmio_t6050,
+	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t6050),
+	.boot_mode = 1,
+	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
+	.resident_fw = true,
+};
+
 static const struct of_device_id apple_isp_of_match[] = {
 	{ .compatible = "apple,t8103-isp", .data = &apple_isp_hw_t8103 },
 	{ .compatible = "apple,t8112-isp", .data = &apple_isp_hw_t8112 },
@@ -797,6 +852,7 @@ static const struct of_device_id apple_isp_of_match[] = {
 	{ .compatible = "apple,t6030-isp", .data = &apple_isp_hw_t6030 },
 	{ .compatible = "apple,t6031-isp", .data = &apple_isp_hw_t6031 },
 	{ .compatible = "apple,t8140-isp", .data = &apple_isp_hw_t8140 },
+	{ .compatible = "apple,t6050-isp", .data = &apple_isp_hw_t6050 },
 	{},
 };
 MODULE_DEVICE_TABLE(of, apple_isp_of_match);
