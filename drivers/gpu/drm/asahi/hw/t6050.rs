@@ -114,6 +114,27 @@ pub(crate) const CONFIG_MAX: Config = Config {
             },
         ],
         variant: &crate::g17::fw::variant::V26A428_M5,
+    }, crate::g17::fw::variant::Build {
+        os_version: [27, 3, 0],
+        name: "27.3b1 (mBoot-20457.60.65), G17C",
+        images: &[
+            crate::fwid::FirmwareBuild {
+                name: "mBoot-20457.60.65 for T6050 G17C, primary then secondary",
+                text_size: 0xa4000,
+                data_size: 0x184000,
+                entropy: &[[0x49eac, 0x49f8f], [0x9d92c, 0x9da0f]],
+                boot_filled: &[
+                    (0x224, 4), (0x23c, 8), (0x4976c, 0x740), (0x49eac, 0x231),
+                    (0x50224, 4), (0x5023c, 8), (0x9d1ec, 0x740), (0x9d92c, 0x231),
+                ],
+                text_sha256: [
+                    0x54, 0x3f, 0x7c, 0xf9, 0xbd, 0xa3, 0x72, 0xd9, 0xbc, 0x24, 0xb3, 0x40, 0x13,
+                    0xb0, 0x58, 0x54, 0x40, 0x9e, 0xce, 0xd9, 0xf8, 0x01, 0x93, 0x34, 0xf5, 0x09,
+                    0xce, 0x64, 0x72, 0xc9, 0xe9, 0x12,
+                ],
+            },
+        ],
+        variant: &crate::g17::fw::variant::V27_3B1_M5,
     }]),
     // Four clusters of ten cores. The buffers are sized for every core slot of the board, so the
     // board's cluster and slot counts admit the GPU, whichever cores are fused off.
