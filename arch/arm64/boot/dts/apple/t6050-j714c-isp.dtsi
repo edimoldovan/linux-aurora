@@ -168,23 +168,32 @@
 		apple,cil-active-high;
 
 		/*
-		 * IMX958 firmware configuration 5, as aurora streams it on the
-		 * M4 Pro/Max J614/J616.
+		 * The full IMX958 (firmware configuration 7, 3040x2880), cropped to
+		 * the centre: inside the lens circle and about the field of view
+		 * macOS shows. 1920x1080 and 1280x720 scale a 2400x1350 window;
+		 * 2560x1440 is the centre 1:1.
 		 */
 		sensor-presets {
 			/* 1920x1080 */
 			preset0 {
-				apple,config-index = <5>;
-				apple,input-size = <1920 2160>;
+				apple,config-index = <7>;
+				apple,input-size = <3040 2880>;
 				apple,output-size = <1920 1080>;
-				apple,crop = <0 0 1920 1080>;
+				apple,crop = <320 765 2400 1350>;
 			};
-			/* 1280x720: the same window as 1920x1080, scaled down */
+			/* 1280x720 */
 			preset1 {
-				apple,config-index = <5>;
-				apple,input-size = <1920 2160>;
+				apple,config-index = <7>;
+				apple,input-size = <3040 2880>;
 				apple,output-size = <1280 720>;
-				apple,crop = <0 0 1920 1080>;
+				apple,crop = <320 765 2400 1350>;
+			};
+			/* 2560x1440 */
+			preset2 {
+				apple,config-index = <7>;
+				apple,input-size = <3040 2880>;
+				apple,output-size = <2560 1440>;
+				apple,crop = <240 720 2560 1440>;
 			};
 		};
 	};
