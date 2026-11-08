@@ -1164,38 +1164,37 @@ static const struct isp_mmio_window apple_isp_fw_mmio_t6050[] = {
 	{ 0x509660000, 0x4000 },
 };
 
+/*
+ * T6050 (M5 Max, J714c) boots as T6040: the same isp0 and dart-isp0
+ * addresses, mailbox at +0x2924000, and 32 MiB of firmware main memory at
+ * IOVA 0 whose __TEXT and __DATA end at 0x1fec000. The broadcast-clear
+ * window is the first of the eight in its DAPF ranges. The PMP clock scratch
+ * word is not known yet; without it the driver sends no PMP control.
+ */
 static const struct apple_isp_hw apple_isp_hw_t6050 = {
-	.gen = ISP_GEN_T8140,
+	.gen = ISP_GEN_T6040,
 	.fw_abi = ISP_FW_ABI_H17,
 	.pmu_base = 0x0,
 
-	/* The first window's clear block, at +0x12000 as on T8142. */
 	.dsid_count = 1,
+	.dsid_slots = 8,
 	.dsid_clr_base0 = 0x2220016000,
 	.dsid_clr_range0 = 0x2fc,
 
-	/*
-	 * The PMP clock scratch word is not known yet; without it the driver
-	 * sends no PMP control, as on T6031.
-	 */
 	.clock_scratch = 0x0,
 	.mbox_irq_enable = ISP_MBOX_IRQ_ENABLE_T6031,
 
 	.scl1 = true,
-	.lpdp = true,
+	.lpdp = false,
 	.meta_size = ISP_META_SIZE_T8140,
-
-	.fw_iova_mask = GENMASK_ULL(35, 0),
-	.mbox2_offset = 0x410,
-	.mbox_irq_route = true,
-	.coproc_control = ISP_COPROC_CONTROL_T8140,
 	.fw_mmio = apple_isp_fw_mmio_t6050,
 	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t6050),
+
+	.coproc_control = ISP_COPROC_CONTROL_T8140,
 	.boot_mode = 1,
-	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
+	.shared_size = 0xde600000,
 	.resident_fw = true,
-	/* As T8142's IMX958, which runs the xx24 setfile 2224_01. */
-	.setfile_stride_fixup = true,
+	.meta_exposure = true,
 };
 
 static const struct of_device_id apple_isp_of_match[] = {
