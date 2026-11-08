@@ -1663,7 +1663,7 @@ impl Queue {
         let config = self.queue_config(&identity, first, args.context_id, policy, &packet)?;
         let announce =
             KickAnnounce::new(qid, DataMaster::Compute, kick_timestamp, policy.priority())?;
-        let predecessor = KickPredecessor::new(qid, kick_timestamp)?;
+        let predecessor = KickPredecessor::new(qid, kick_parent)?;
         let kick_args = KickArgs {
             qid,
             timestamp: kick_timestamp,
