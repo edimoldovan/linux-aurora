@@ -17,8 +17,7 @@
  * addresses are this boot firmware's (2026-11-08) and move with it. No "isp"
  * alias: the boot loader leaves this node as it is.
  *
- * The sensor presets are the M5 (T8142) IMX958 ones; the J714c sensor is not
- * identified yet.
+ * The front camera is an IMX958 (sensor 0x958), as on the M4 Pro/Max.
  */
 
 &{/reserved-memory} {
@@ -155,20 +154,24 @@
 		/* ADT isp0 cam-connections-scheme, as on the M4 Pro/Max J614/J616 */
 		apple,cam-connections-scheme = <0x10>;
 
+		/*
+		 * IMX958 firmware configuration 5, as aurora streams it on the
+		 * M4 Pro/Max J614/J616.
+		 */
 		sensor-presets {
-			/* 1280x720 */
-			preset0 {
-				apple,config-index = <7>;
-				apple,input-size = <3040 2880>;
-				apple,output-size = <1280 720>;
-				apple,crop = <0 584 3040 1710>;
-			};
 			/* 1920x1080 */
-			preset1 {
-				apple,config-index = <7>;
-				apple,input-size = <3040 2880>;
+			preset0 {
+				apple,config-index = <5>;
+				apple,input-size = <1920 2160>;
 				apple,output-size = <1920 1080>;
-				apple,crop = <0 584 3040 1710>;
+				apple,crop = <0 0 1920 1080>;
+			};
+			/* 1280x720: the same window as 1920x1080, scaled down */
+			preset1 {
+				apple,config-index = <5>;
+				apple,input-size = <1920 2160>;
+				apple,output-size = <1280 720>;
+				apple,crop = <0 0 1920 1080>;
 			};
 		};
 	};
