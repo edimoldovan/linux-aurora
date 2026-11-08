@@ -78,10 +78,10 @@ use core::sync::atomic::{
 };
 
 use kernel::{
-    c_str,
+    bindings, c_str,
     device::{self, Core},
     drm::gem::shmem,
-    impl_has_delayed_work, impl_has_work,
+    impl_has_delayed_work, impl_has_work, irq,
     io::{
         IoBase,
         IoSysMap,
@@ -1204,6 +1204,33 @@ impl WorkItem<POLL_WORK> for Shared {
         }
     }
 }
+/// The M5 firmware's event interrupt (ADT sgx interrupt 1), raised with new event records.
+#[pin_data]
+struct EventIrq {
+    shared: Arc<Shared>,
+    irq: u32,
+}
+
+impl irq::ThreadedHandler for EventIrq {
+    fn handle(&self, _dev: &device::Device<device::Bound>) -> irq::ThreadedIrqReturn {
+        self.shared.queue_event_records();
+        irq::ThreadedIrqReturn::WakeThread
+    }
+
+    fn handle_threaded(&self, _dev: &device::Device<device::Bound>) -> irq::IrqReturn {
+        // Drain both mailboxes: their receive interrupt stays silent after the handshake, and
+        // the firmware's later messages fail once a FIFO is full.
+        if let Some(firmware) = self.shared.state.lock().as_deref() {
+            for coprocessor in Iterator::chain(core::iter::once(&firmware.primary), firmware.secondary.as_ref()) {
+                let _ = coprocessor.rtkit.with(|rtkit| rtkit.poll());
+            }
+        }
+        // The line was masked since the hard handler: pick up records written meanwhile.
+        self.shared.queue_event_records();
+        irq::IrqReturn::Handled
+    }
+}
+
 impl WorkItem<IDLE_WORK> for Shared {
     type Pointer = Arc<Shared>;
     fn run(this: Arc<Shared>) {
@@ -1422,6 +1449,8 @@ pub(crate) struct Gpu {
     _capacity: Pin<KBox<kernel::debugfs::File<capacity::View>>>,
     _reports: Pin<KBox<kernel::debugfs::File<reports::View>>>,
     _power: Pin<KBox<kernel::debugfs::File<reports::PowerView>>>,
+    /// The M5 event interrupt, enabled once the firmware runs.
+    event_irq: Option<Pin<KBox<irq::ThreadedRegistration<EventIrq>>>>,
 }
 
 impl Gpu {
@@ -1595,6 +1624,11 @@ impl Gpu {
             }),
             GFP_KERNEL,
         )?;
+        let event_irq = if cfg.profile.is_m5() {
+            Self::request_event_irq(pdev, &shared)?
+        } else {
+            None
+        };
 
         let directory = kernel::debugfs::Dir::new(c"aurora-g17");
         let capacity = KBox::pin_init(
@@ -1628,6 +1662,7 @@ impl Gpu {
                 _capacity: capacity,
                 _reports: reports,
                 _power: power,
+                event_irq,
             },
             GFP_KERNEL,
         )?;
@@ -1636,8 +1671,36 @@ impl Gpu {
             .port
             .store(Arc::as_ptr(&firmware.port).cast_mut(), Ordering::Release);
         *gpu.shared.state.lock() = Some(firmware);
+        if let Some(event_irq) = gpu.event_irq.as_ref() {
+            // SAFETY: The interrupt was requested with IRQF_NO_AUTOEN and stays requested while
+            // `gpu` lives.
+            unsafe { bindings::enable_irq(event_irq.handler().irq) };
+        }
         gpu.shared.queue_events();
         Ok(gpu)
+    }
+
+    /// Requests the device tree's "sgx1" interrupt, disabled until the firmware runs. A device
+    /// tree without it leaves event delivery to the firmware's mailbox message and the poll.
+    /// The in-flight poll stays on with it ([`crate::module_parameters::m5_poll_in_flight`]).
+    fn request_event_irq(
+        pdev: &platform::Device<Core<'_>>,
+        shared: &Arc<Shared>,
+    ) -> Result<Option<Pin<KBox<irq::ThreadedRegistration<EventIrq>>>>> {
+        let Ok(request) = pdev.optional_irq_by_name(c_str!("sgx1")) else {
+            return Ok(None);
+        };
+        let irq = request.irq();
+        let registration = KBox::pin_init(
+            irq::ThreadedRegistration::new(
+                request,
+                irq::Flags::ONESHOT | irq::Flags::NO_AUTOEN,
+                c_str!("aurora-event"),
+                try_pin_init!(EventIrq { shared: shared.clone(), irq }),
+            ),
+            GFP_KERNEL,
+        )?;
+        Ok(Some(registration))
     }
 
     /// Returns the variant of the loaded firmware build. An identified SoC refuses a build it
@@ -2111,6 +2174,11 @@ impl Gpu {
 
     /// Stops the firmware and releases everything it used.
     pub(crate) fn shutdown(&self) {
+        if let Some(event_irq) = self.event_irq.as_ref() {
+            // SAFETY: The interrupt stays requested while `self` lives. This waits for a
+            // running handler.
+            unsafe { bindings::disable_irq(event_irq.handler().irq) };
+        }
         self.shared.feed.begin_shutdown();
         self.shared.preparations.remove();
         self.shared.stop_queues();

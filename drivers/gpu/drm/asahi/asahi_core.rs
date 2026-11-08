@@ -212,7 +212,7 @@ module! {
         },
         m5_poll_in_flight: u8 {
             default: 1,
-            description: "M5: poll the event rings every 1 ms while work is in flight (1 = on); the firmware drops a completion notification while its previous mailbox message is still pending",
+            description: "M5: poll the event rings every 1 ms while work is in flight (1 = on): the only completion notice without the event interrupt, a safety net with it; the firmware drops a completion notification while its previous mailbox message is still pending",
         },
         oom_attribution: u8 {
             default: 1,
