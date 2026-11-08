@@ -1668,7 +1668,6 @@ impl Queue {
             qid,
             timestamp: kick_timestamp,
             parent: kick_parent,
-            implicit_parent: true,
             barriers: dependencies,
             descriptor_va: descriptor_high,
             queue_va: self.graph.graph.gpu_va(),
