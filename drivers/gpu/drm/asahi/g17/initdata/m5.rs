@@ -51,7 +51,8 @@ impl InitData {
     pub(crate) fn note_m5_submission_history(&self) -> Result {
         if !self.m5 { return Err(EINVAL); }
         let private = self.object(self.cluster)?;
-        let base = m::M5_PRIVATE_LAYOUT.status_config;
+        // 27.3 beta 1: the history block sits m5_status_config_tail later.
+        let base = m::M5_PRIVATE_LAYOUT.status_config + self.m5_status_config_tail;
         for _ in 0..64 {
             let generation = private.word(base + 0x74c)?.load(Ordering::Acquire);
             if generation & 1 != 0 { core::hint::spin_loop(); continue; }
@@ -86,6 +87,7 @@ impl InitData {
         use mmu::{PROT_FW_SHARED_RW as RW, PROT_FW_SHARED_RO as RO,
                   PROT_GPU_SHARED_RW as GPU};
         self.m5 = true;
+        self.m5_status_config_tail = variant.m5_status_config_tail;
         // TA, fragment and compute share the compute work ring per priority; every
         // preparation's claim on it is counted from the first publication on.
         self.outer_credits = Some(super::outer_credit::Credits::new()?);
@@ -137,7 +139,7 @@ impl InitData {
             .map_err(|_| EINVAL)?;
         m::encode_m5_region_c(self.object_mut(self.region_c)?.bytes_mut()).map_err(|_| EINVAL)?;
         m::encode_m5_private_cluster(PRIVATE, FWCTL,
-            variant.m5_status_config_link.unwrap_or(m::M5_STATUS_CONFIG_LINK_WORD),
+            variant.m5_status_config_tail,
             &mut self.object_mut(self.cluster)?.bytes_mut()[..private.total]).map_err(|_| EINVAL)?;
         let windows = board.register_windows();
         let windows = &windows[..board.register_window_count()];

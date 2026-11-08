@@ -172,6 +172,8 @@ impl WorkPublication<'_> {
 /// Session-long storage and mappings. Aliases are released before their backing objects.
 pub(super) struct InitData {
     m5: bool,
+    /// The variant's `m5_status_config_tail`, for the submission history.
+    m5_status_config_tail: usize,
     outer_credits: Option<Arc<outer_credit::Credits>>,
     // Live publication uses interior writes under the device mutex. This owner is Send but not
     // Sync, so safe host code cannot issue those writes concurrently through shared references.
@@ -284,6 +286,7 @@ impl InitData {
     pub(super) fn new() -> Self {
         Self {
             m5: false,
+            m5_status_config_tail: 0,
             outer_credits: None,
             _single_publisher: core::marker::PhantomData,
             aliases: KVec::new(),

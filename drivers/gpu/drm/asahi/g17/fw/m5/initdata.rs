@@ -1753,8 +1753,6 @@ pub(crate) const M5_RECOVERY_SLOT_MASK: usize = 0x4ab8;
 pub(crate) const M5_STATUS_CONFIG_LINK_WORD: usize = 0x774;
 
 pub(crate) const M5_STATUS_CONFIG_LINK_PTR: usize = 0x778;
-/// 27.3 beta 1: the secondary's flag and the pointer to the primary's flag, 0x10 later.
-pub(crate) const M5_27_3B1_STATUS_CONFIG_LINK_WORD: usize = 0x784;
 
 pub(crate) const M5_HW_DATA_INSERT: usize = 0x267c;
 
@@ -2444,7 +2442,7 @@ pub(crate) fn encode_m5_primary_status_b(
 pub(crate) fn encode_m5_private_cluster(
     private_base: u64,
     fwctl_state: u64,
-    status_config_link: usize,
+    status_config_tail: usize,
     out: &mut [u8],
 ) -> Result<(), InitdataError> {
     let layout = M5_PRIVATE_LAYOUT;
@@ -2468,7 +2466,8 @@ pub(crate) fn encode_m5_private_cluster(
     let status_b = layout.status_b;
     let status_a = layout.roles[0].status_a;
     encode_m5_primary_status_b(fwctl_state, fwctl_ring, private_base + status_b as u64,
-                               status_config_link, &mut out[status_b..status_a])?;
+                               M5_STATUS_CONFIG_LINK_WORD + status_config_tail,
+                               &mut out[status_b..status_a])?;
     for role in layout.roles {
         encode_status_block(&mut out[role.status_a..role.status_a + STATUS_BLOCK_SIZE])?;
     }
