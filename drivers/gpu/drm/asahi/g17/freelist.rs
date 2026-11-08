@@ -483,7 +483,6 @@ impl ComputePool {
                 state_va: state.gpu_va(),
             }),
         )?;
-        control.write(FreeListControl::EVENT_FLAG_ENABLE, 1u32)?;
         fence(Ordering::SeqCst);
         Ok(Self {
             pages: Some(pages),
@@ -540,8 +539,6 @@ impl ComputePool {
         });
         header.unk_54[..8].copy_from_slice(&bytes);
         self.control.write(0, header)?;
-        self.control
-            .write(FreeListControl::EVENT_FLAG_ENABLE, 1u32)?;
         fence(Ordering::SeqCst);
         self.pages = Some(pages);
         Ok(())

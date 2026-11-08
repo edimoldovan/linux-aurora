@@ -2203,10 +2203,6 @@ impl FreeListControl {
 
     /// Offset of the firmware-completed counter. It must be read bytewise.
     pub(crate) const COMPLETED: usize = 0x54;
-    /// Offset, past the structure, of the u32 that lets the firmware raise this pool's KSM
-    /// event flag (bit `unk_10` * 64 + context): AGXG17X sets 1 for compute pools
-    /// (AGXUSCPrivMemFList::populateInitialFirmwareState).
-    pub(crate) const EVENT_FLAG_ENABLE: usize = 0x7c;
 
     /// Returns the control object of the free list `args` describes.
     pub(crate) const fn new(args: &FreeListArgs) -> Self {

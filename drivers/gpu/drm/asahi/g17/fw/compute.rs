@@ -20,16 +20,8 @@ use super::{
 pub(crate) const COMPUTE_DESCRIPTOR_SIZE: usize = 0x4000;
 /// QoS class of compute kicks.
 pub(crate) const COMPUTE_QOS_CLASS: u8 = 0x08;
-/// Event mask of a compute kick: one bit at `priority * 64 + context_id`
-/// (AGXG17X AGXCLChannelSKSM::submitBuffer).
-pub(crate) fn compute_kick_event_mask(priority: u8, context_id: u32) -> Result<[u64; 4]> {
-    if priority >= 3 || context_id >= 64 {
-        return Err(EINVAL);
-    }
-    let mut mask = [0u64; 4];
-    mask[usize::from(priority)] = 1 << context_id;
-    Ok(mask)
-}
+/// Event mask of compute kicks.
+pub(crate) const COMPUTE_KICK_EVENT_MASK: [u64; 4] = [0, 0, 4, 0];
 
 const COMPUTE_REGISTERS: usize = 41;
 const COMPUTE_REGISTERS_MAX: usize = COMPUTE_REGISTERS + 1;

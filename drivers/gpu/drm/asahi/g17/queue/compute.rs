@@ -1583,7 +1583,7 @@ impl Queue {
     ) -> Result {
         use crate::g17::fw::{
             channels::WorkSlot,
-            compute::{compute_kick_event_mask, ComputeArgs, ComputeDescriptor, COMPUTE_QOS_CLASS},
+            compute::{ComputeArgs, ComputeDescriptor, COMPUTE_KICK_EVENT_MASK, COMPUTE_QOS_CLASS},
             kick::{KickArgs, KickQos},
         };
         let (epoch, addresses) = self.publication_preflight(&packet, host)?;
@@ -1677,9 +1677,7 @@ impl Queue {
                 class: COMPUTE_QOS_CLASS,
             },
             mcache: None,
-            // The firmware raises this flag for the pool (its control sets
-            // FreeListControl::EVENT_FLAG_ENABLE; unk_10 = 2 = the priority word).
-            event_mask: compute_kick_event_mask(policy.priority(), args.context_id.into())?,
+            event_mask: COMPUTE_KICK_EVENT_MASK,
             register_arrays: ComputeDescriptor::register_bindings(descriptor_low, *scratch)?,
             scs_enabled: scratch.enabled(),
             priority: policy.priority(),
