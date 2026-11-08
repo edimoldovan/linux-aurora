@@ -910,11 +910,6 @@ impl super::Firmware {
         {
             return Err(EAGAIN);
         }
-        // Hold the GPU powered (KeepPowered) across compute kicks: the firmware's KSM
-        // scheduling pause is acknowledged only while the GPU is held on.
-        if let Err(error) = self.acquire_registration_power() {
-            pr_warn!("G17 compute power hold failed: {:?}\n", error);
-        }
         let queues = &mut self.queues;
         let queue = queues
             .compute

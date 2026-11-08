@@ -1220,11 +1220,6 @@ impl InitData {
         Ok(mappings)
     }
 
-    /// The firmware objects use the g17c layout.
-    pub(super) fn g17c(&self) -> bool {
-        self.g17c
-    }
-
     /// Writes the effort input in firmware order, then cleans its cache line to coherency.
     pub(super) fn publish_effort(&self, effort: u32) -> Result {
         let region = self.object(self.region_c)?;
