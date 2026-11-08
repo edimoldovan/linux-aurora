@@ -7,7 +7,9 @@
 //! word is exactly 0x3e (0xbe with `g15_early_tiling`). Never advertise SOFT_FAULTS,
 //! FEW_PRIMITIVES or RENDER_RAY_QUERY on G15S.
 
-use kernel::{prelude::*, uapi};
+use kernel::prelude::*;
+
+use super::wire as uapi;
 
 use super::{hw, Gpu, GPU_GENERATION};
 use crate::module_parameters;
@@ -158,5 +160,7 @@ pub(crate) fn queue_limits() -> uapi::drm_asahi_queue_limits {
     }
 }
 
-/// Shared native G15 status/queue feature assignments, replaced by named wire constants next.
-pub(crate) fn feature_flags() -> u64 { 0x16 }
+/// Shared status/queue features in the native G15 ABI's assignments.
+pub(crate) fn feature_flags() -> u64 {
+    uapi::SHARED_FEATURE_FLAGS
+}

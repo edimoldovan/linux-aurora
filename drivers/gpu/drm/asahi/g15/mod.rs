@@ -654,7 +654,7 @@ impl gpu::Gpu for Gpu {
         Some(params::MAX_BINDS)
     }
 
-    fn vm_closed(&self) {
+    fn vm_closed(&self, _vm: &mmu::Vm) {
         vm::closed(self)
     }
 
@@ -681,7 +681,7 @@ impl gpu::Gpu for Gpu {
         &self,
         bo: gem::ObjectRef,
         range: Range<usize>,
-    ) -> Result<mmu::KernelMapping> {
-        timestamp::map(self, bo, range)
+    ) -> Result<crate::timestamp::Buffer> {
+        crate::timestamp::Buffer::firmware(timestamp::map(self, bo, range)?)
     }
 }
