@@ -850,24 +850,11 @@ pub(crate) struct HwDataArgs<'a> {
 /// Register-map slots of the g17c hardware data; everything after the map moves by
 /// 7 slots (0x118 bytes).
 pub(crate) const G17C_REGISTER_MAP_SLOTS: usize = 60;
-/// The g17c chip identifier is a u64 (AGXG17X AGXFirmware::initFirmwareData), which moves
-/// the fields after it to G17P + 0x11c.
-pub(crate) const G17C_CHIP_ID_HI: usize = 4;
-/// Bytes the g17c hardware data inserts after [`HwData::unk_2554`] (to G17P + 0x124).
-pub(crate) const G17C_HW_DATA_GAP_A: usize = 8;
-/// Bytes the g17c hardware data inserts after [`HwData::unk_25b4`] (to G17P + 0x128).
-pub(crate) const G17C_HW_DATA_GAP_B: usize = 4;
-/// Bytes the g17c hardware data inserts after [`HwData::ksm_pause_timeout_us`] (to G17P + 0x12c):
-/// one u32 the firmware skips while it is zero.
-pub(crate) const G17C_HW_DATA_GAP_C: usize = 4;
+/// Further bytes the g17c hardware data inserts before the fields G17P has at `0x2544` and
+/// on, which sit 0x128 bytes later in all.
+pub(crate) const G17C_HW_DATA_GAP: usize = 0x10;
 /// The g17c hardware data.
-pub(crate) type HwDataG17c = HwData<
-    G17C_REGISTER_MAP_SLOTS,
-    G17C_CHIP_ID_HI,
-    G17C_HW_DATA_GAP_A,
-    G17C_HW_DATA_GAP_B,
-    G17C_HW_DATA_GAP_C,
->;
+pub(crate) type HwDataG17c = HwData<G17C_REGISTER_MAP_SLOTS, G17C_HW_DATA_GAP>;
 
 /// Size of the QoS object named by the hardware data.
 pub(crate) const QOS_SIZE: usize = 0xe40;
@@ -875,13 +862,7 @@ pub(crate) const QOS_SIZE: usize = 0xe40;
 /// The hardware data, at the base of the bundle and shared by both
 /// instances.
 #[repr(C, packed)]
-pub(crate) struct HwData<
-    const SLOTS: usize = REGISTER_MAP_SLOTS,
-    const CHIP_HI: usize = 0,
-    const GAP_A: usize = 0,
-    const GAP_B: usize = 0,
-    const GAP_C: usize = 0,
-> {
+pub(crate) struct HwData<const SLOTS: usize = REGISTER_MAP_SLOTS, const GAP: usize = 0> {
     /// Required: 0x6f_0000_0000.
     pub(crate) unk_0: u64,
     /// Required: 0xffc0_0000.
@@ -913,8 +894,6 @@ pub(crate) struct HwData<
     pub(crate) unk_e88: [u8; 8],
     /// Chip identifier.
     pub(crate) chip_id: u32,
-    /// High half of the g17c chip identifier ([`G17C_CHIP_ID_HI`]), zero.
-    pub(crate) chip_id_hi: [u8; CHIP_HI],
     /// Required: 1.
     pub(crate) unk_e94: u32,
     /// Required: 1.
@@ -999,6 +978,8 @@ pub(crate) struct HwData<
     /// Performance table B. Each voltage is stored in lane 0 only.
     pub(crate) perf_b: PerfGroup,
     pub(crate) unk_23dc: [u8; 0x168],
+    /// Bytes the g17c firmware adds before the tail ([`G17C_HW_DATA_GAP`]).
+    pub(crate) unk_g17c: [u8; GAP],
     /// Required: 4.
     pub(crate) unk_2544: u32,
     /// Required: 6.
@@ -1009,8 +990,6 @@ pub(crate) struct HwData<
     pub(crate) unk_2550: u32,
     /// Required: 7.
     pub(crate) unk_2554: u32,
-    /// Bytes the g17c hardware data adds here ([`G17C_HW_DATA_GAP_A`]).
-    pub(crate) unk_g17c_a: [u8; GAP_A],
     pub(crate) unk_2558: [u8; 0x10],
     /// Required: 5.
     pub(crate) unk_2568: u32,
@@ -1027,14 +1006,9 @@ pub(crate) struct HwData<
     pub(crate) unk_25b0: [u8; 4],
     /// Required: 0xffff_ffff in every entry, one per work channel.
     pub(crate) unk_25b4: [u32; WORK_CHANNELS],
-    /// Bytes the g17c hardware data adds here ([`G17C_HW_DATA_GAP_B`]).
-    pub(crate) unk_g17c_b: [u8; GAP_B],
     pub(crate) unk_25e4: [u8; 0x10],
-    /// Limit of the firmware's KSM scheduling-pause poll, in microseconds
-    /// (agfKSMKickQueuesSchedulingPause). AGXG17X AGXArmFirmware::initFirmwareData: 150.
-    pub(crate) ksm_pause_timeout_us: u32,
-    /// Bytes the g17c hardware data adds here ([`G17C_HW_DATA_GAP_C`]).
-    pub(crate) unk_g17c_c: [u8; GAP_C],
+    /// Required: 1.
+    pub(crate) unk_25f4: u32,
     pub(crate) unk_25f8: [u8; 8],
     /// Required: 1.
     pub(crate) unk_2600: u32,
@@ -1074,34 +1048,17 @@ static_assert!(core::mem::offset_of!(HwData, completion_rings) == 0x2614);
 static_assert!(core::mem::offset_of!(HwData, qos_va) == 0x26ac);
 static_assert!(size_of::<HwData>() == 0x3db4);
 static_assert!(core::mem::offset_of!(HwDataG17c, chip_id) == 0xfa8);
-static_assert!(core::mem::offset_of!(HwDataG17c, unk_ed0) == 0xfec);
-static_assert!(core::mem::offset_of!(HwDataG17c, unk_f04) == 0x1020);
-static_assert!(core::mem::offset_of!(HwDataG17c, perf_a) == 0x10e0);
-static_assert!(core::mem::offset_of!(HwDataG17c, perf_b_freq_mhz) == 0x1924);
-static_assert!(core::mem::offset_of!(HwDataG17c, perf_a_states) == 0x1ae4);
-static_assert!(core::mem::offset_of!(HwDataG17c, perf_b) == 0x1df4);
-static_assert!(core::mem::offset_of!(HwDataG17c, unk_2544) == 0x2660);
-static_assert!(core::mem::offset_of!(HwDataG17c, unk_2558) == 0x267c);
-static_assert!(core::mem::offset_of!(HwDataG17c, unk_25b4) == 0x26d8);
-static_assert!(core::mem::offset_of!(HwDataG17c, ksm_pause_timeout_us) == 0x271c);
-static_assert!(core::mem::offset_of!(HwDataG17c, unk_g17c_c) == 0x2720);
-static_assert!(core::mem::offset_of!(HwDataG17c, completion_rings) == 0x2740);
-static_assert!(core::mem::offset_of!(HwDataG17c, qos_va) == 0x27d8);
+static_assert!(core::mem::offset_of!(HwDataG17c, perf_a) == 0x10dc);
+static_assert!(core::mem::offset_of!(HwDataG17c, unk_2544) == 0x266c);
+static_assert!(core::mem::offset_of!(HwDataG17c, completion_rings) == 0x273c);
+static_assert!(core::mem::offset_of!(HwDataG17c, qos_va) == 0x27d4);
 static_assert!(bundle::HW_DATA + size_of::<HwDataG17c>() <= bundle::VIEWS[2]);
 static_assert!(bundle::HW_DATA + size_of::<HwData>() <= bundle::VIEWS[2]);
 
 // SAFETY: `HwData` consists of integers and arrays of integers only.
-unsafe impl<const SLOTS: usize, const CHIP_HI: usize, const GAP_A: usize, const GAP_B: usize, const GAP_C: usize>
-    Zeroable for HwData<SLOTS, CHIP_HI, GAP_A, GAP_B, GAP_C>
-{
-}
+unsafe impl<const SLOTS: usize, const GAP: usize> Zeroable for HwData<SLOTS, GAP> {}
 
-impl<const SLOTS: usize, const CHIP_HI: usize, const GAP_A: usize, const GAP_B: usize, const GAP_C: usize>
-    HwData<SLOTS, CHIP_HI, GAP_A, GAP_B, GAP_C>
-{
-    /// The g17c layout, whose constants differ from G17P's in places.
-    const G17C: bool = CHIP_HI == G17C_CHIP_ID_HI;
-
+impl<const SLOTS: usize, const GAP: usize> HwData<SLOTS, GAP> {
     const UNK_E0: [u16; 24] = [
         0x2008, 0, 0, 0, 0, 0x2008, 0, 0, 0, 0, 0x2008, 0, 0x24cb, 0, 0x2cfa, 0xc98a, 0x24cb,
         0xf4f6, 0xe917, 0x1877, 0x24cb, 0x38d9, 0, 0xbdab,
@@ -1155,12 +1112,7 @@ impl<const SLOTS: usize, const CHIP_HI: usize, const GAP_A: usize, const GAP_B: 
         self.unk_e98 = 1;
         self.unk_ea0 = 1;
         self.unk_ea4 = 1;
-        // AGXG17X stores the words 0, 0, 0, 1 from 0xfcc: 0 here, 1 in the word after.
-        if Self::G17C {
-            self.unk_ebc = 1u32.to_le_bytes();
-        } else {
-            self.unk_eb8 = 1;
-        }
+        self.unk_eb8 = 1;
         self.unk_ec0 = 1;
         self.unk_ec8 = 1;
         self.unk_ed0 = 0x5dc0;
@@ -1175,7 +1127,7 @@ impl<const SLOTS: usize, const CHIP_HI: usize, const GAP_A: usize, const GAP_B: 
         self.unk_f6c = 1;
         self.unk_f88 = 6;
         self.unk_f8c = 1;
-        self.unk_fac = if Self::G17C { 0 } else { 1 };
+        self.unk_fac = 1;
         self.unk_fb8 = 0x1e;
         self.unk_fbc = 4;
         self.unk_fc0 = 6;
@@ -1190,14 +1142,8 @@ impl<const SLOTS: usize, const CHIP_HI: usize, const GAP_A: usize, const GAP_B: 
             self.perf_a_states[index] = perf.states_a[index].into();
             self.perf_b_states[index] = perf.states_b[index].into();
         }
-        if Self::G17C {
-            // AGXG17X populateLinearPowerTransferTable: f32 percentages.
-            self.perf_a_relative = perf.relative_a.map(f32_bits);
-            self.perf_b_relative = perf.relative_b.map(f32_bits);
-        } else {
-            self.perf_a_relative = perf.relative_a;
-            self.perf_b_relative = perf.relative_b;
-        }
+        self.perf_a_relative = perf.relative_a;
+        self.perf_b_relative = perf.relative_b;
         self.unk_1848 = [0x3f82_8f5c; 11];
         self.unk_2544 = 4;
         self.unk_2548 = 6;
@@ -1208,11 +1154,10 @@ impl<const SLOTS: usize, const CHIP_HI: usize, const GAP_A: usize, const GAP_B: 
         self.unk_2570 = 1;
 
         self.unk_258e = WORK_CHANNELS as u16;
-        self.unk_2590 = if Self::G17C { [0, 0, 1, 0] } else { [0, 1, 1, 1] };
+        self.unk_2590 = [0, 1, 1, 1];
         self.unk_25a0 = [0, 1, 1, 1];
         self.unk_25b4 = [u32::MAX; WORK_CHANNELS];
-        // G17P's value of 1 us is shorter than the G17C KSM's pause acknowledgement.
-        self.ksm_pause_timeout_us = if Self::G17C { 150 } else { 1 };
+        self.unk_25f4 = 1;
         self.unk_2600 = 1;
         self.unk_2608 = 1;
         self.unk_2610 = 0x100;
@@ -1230,11 +1175,6 @@ impl<const SLOTS: usize, const CHIP_HI: usize, const GAP_A: usize, const GAP_B: 
         self.unk_26b4 = 1;
         self.unk_26b8 = 1;
         self.unk_26e8 = 1;
-        if Self::G17C {
-            // AGXG17X AGXArmFirmware::initFirmwareData: 1 at 0x27ec and a u64 1 at 0x281c.
-            self.unk_26bc[4..8].copy_from_slice(&1u32.to_le_bytes());
-            self.unk_26ec[4..8].copy_from_slice(&1u32.to_le_bytes());
-        }
         self.unk_3d98 = 0xffff_ffff;
         self.unk_3db0 = 0xffff_ffff;
         Ok(())
@@ -1644,21 +1584,6 @@ type Words = &'static [(usize, u32, usize)];
 
 fn fill_words(bytes: &mut [u8], words: Words) {
     bytes.fill(0);
-    put_words(bytes, words);
-}
-
-/// IEEE-754 single-precision bits of `value`, exact below 2^24.
-const fn f32_bits(value: u32) -> u32 {
-    if value == 0 {
-        return 0;
-    }
-    let exponent = 31 - value.leading_zeros();
-    let mantissa = (value << (23 - exponent)) & 0x7f_ffff;
-    (127 + exponent) << 23 | mantissa
-}
-
-/// Stores `words` into `bytes` without clearing it first.
-fn put_words(bytes: &mut [u8], words: Words) {
     for &(offset, value, repeat) in words {
         for index in 0..repeat {
             let at = offset + 4 * index;
