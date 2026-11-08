@@ -134,11 +134,13 @@
 	isp: isp@580000000 {
 		compatible = "apple,t6050-isp", "apple,isp";
 		iommus = <&isp_dart0 0>, <&isp_dart1 0>, <&isp_dart2 0>;
-		reg-names = "coproc", "mbox", "gpio", "mbox2";
+		reg-names = "coproc", "mbox", "gpio", "mbox2", "wdt", "cil";
 		reg = <0x5 0x80000000 0x0 0x1604000>,
 		      <0x5 0x82924000 0x0 0x40>,
 		      <0x5 0x829241d0 0x0 0x20>,
-		      <0x5 0x82924464 0x0 0x10>;
+		      <0x5 0x82924464 0x0 0x10>,
+		      <0x5 0xc3b50000 0x0 0x8000>,
+		      <0x2 0xdc000234 0x0 0x4>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 513 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_isp_sys>, <&ps_isp_cpu>, <&ps_isp_fe>,
@@ -153,6 +155,13 @@
 		apple,temporal-filter = <1>;
 		/* ADT isp0 cam-connections-scheme, as on the M4 Pro/Max J614/J616 */
 		apple,cam-connections-scheme = <0x10>;
+		/*
+		 * The camera light: ADT eic cil-gpio-offset 141 in gpio0
+		 * (0x2dc000000), cil-gpio-config 0x474002, driven low to light.
+		 * "wdt" is the eic's mmio-wd-isp: frames pass only while it is fed,
+		 * which the driver does only while the light is on.
+		 */
+		apple,cil-config = <0x474002>;
 
 		/*
 		 * IMX958 firmware configuration 5, as aurora streams it on the
