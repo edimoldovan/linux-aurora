@@ -113,6 +113,10 @@
 		reg = <0x23 0x02600000 0x0 0x88000>,
 		      <0x23 0x00000000 0x0 0x3fdc000>;
 		reg-names = "asc", "sgx";
+		/* ADT sgx interrupt 1: the firmware raises it with new event records. */
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 2449 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "sgx1";
 		mboxes = <&gfx_mbox>, <&gfx1_mbox>;
 		power-domains = <&ps_gfx>;
 		memory-region = <&uat_ttbs>, <&uat_pagetables>,
