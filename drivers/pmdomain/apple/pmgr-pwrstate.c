@@ -670,7 +670,7 @@ late_initcall(t6050_wdt_arm);
 #include <linux/workqueue.h>
 #include <linux/ktime.h>
 
-static unsigned int t6050_wdtmon, t6050_wdtmon_ping;
+static unsigned int t6050_wdtmon, t6050_wdtmon_ping, t6050_wdtmon_ping_max;
 
 static int __init t6050_wdtmon_setup(char *s)
 {
@@ -683,6 +683,16 @@ static int __init t6050_wdtmon_ping_setup(char *s)
 	return kstrtouint(s, 0, &t6050_wdtmon_ping) == 0;
 }
 __setup("t6050_wdtmon_ping=", t6050_wdtmon_ping_setup);
+
+/*
+ * t6050_wdtmon_ping_max=<seconds>: stop the ping at that uptime, so the watchdog still fires by
+ * then plus the armed time, whatever state the boot is in.
+ */
+static int __init t6050_wdtmon_ping_max_setup(char *s)
+{
+	return kstrtouint(s, 0, &t6050_wdtmon_ping_max) == 0;
+}
+__setup("t6050_wdtmon_ping_max=", t6050_wdtmon_ping_max_setup);
 
 static void __iomem *t6050_wdtmon_w, *t6050_wdtmon_s, *t6050_wdtmon_p, *t6050_wdtmon_q;
 
@@ -718,7 +728,8 @@ static void t6050_wdtmon_fn(struct work_struct *work)
 		if (t6050_peek_map[i])
 			pr_emerg("peek %#llx = %#010x\n", t6050_peek_addr[i],
 				 readl_relaxed(t6050_peek_map[i]));
-	if (t6050_wdtmon_ping)
+	if (t6050_wdtmon_ping &&
+	    (!t6050_wdtmon_ping_max || ktime_get_boottime_seconds() < t6050_wdtmon_ping_max))
 		writel_relaxed(0, w + 0x10);
 	schedule_delayed_work(&t6050_wdtmon_work, t6050_wdtmon * HZ);
 }
