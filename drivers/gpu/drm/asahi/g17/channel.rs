@@ -99,11 +99,7 @@ impl Rings {
                 ReportRing::Trace => init.status_read_words::<EVENT_WORDS>(role, offset)?[0],
                 ReportRing::Statistics => init.status_read_words::<1>(role, offset)?[0],
             };
-            // Statistics records carry nothing the host uses; one of a type it does not
-            // know is skipped like the others (the firmware emits types up to 32).
-            if matches!(ring, ReportRing::Trace)
-                && (tag >= u32::BITS || allowed_types & (1 << tag) == 0)
-            {
+            if tag >= u32::BITS || allowed_types & (1 << tag) == 0 {
                 return Err(EIO);
             }
             consumer = (consumer + 1) & (capacity - 1);
