@@ -13,7 +13,6 @@
 			reg = <0 0 0 0>;
 		};
 
-		/* Only reserved: the GPU node does not reference it */
 		uat_l2_pagetables: uat-l2-pagetables {
 			reg = <0 0 0 0>;
 		};
@@ -24,6 +23,21 @@
 
 		uat_ttbs: uat-ttbs {
 			reg = <0 0 0 0>;
+		};
+
+		/*
+		 * The GFX and GFX1 firmware the system firmware loaded, from the
+		 * J714c ADT gfx-asc/gfx1-asc segment-ranges: TEXT of both roles,
+		 * then DATA of both roles.
+		 */
+		gpu_fw_text: gpu-fw-text@10001180000 {
+			reg = <0x100 0x01180000 0x0 0xa4000>;
+			no-map;
+		};
+
+		gpu_fw_data: gpu-fw-data@100027ac000 {
+			reg = <0x100 0x027ac000 0x0 0x184000>;
+			no-map;
 		};
 	};
 
@@ -95,15 +109,17 @@
 
 &soc {
 	gpu: gpu@2302600000 {
-		compatible = "apple,agx-t6050";
+		compatible = "apple,agx-g17c", "apple,agx-g17s", "gpu,t6050";
 		reg = <0x23 0x02600000 0x0 0x88000>,
 		      <0x23 0x00000000 0x0 0x3fdc000>;
 		reg-names = "asc", "sgx";
 		mboxes = <&gfx_mbox>, <&gfx1_mbox>;
 		power-domains = <&ps_gfx>;
 		memory-region = <&uat_ttbs>, <&uat_pagetables>,
-				<&uat_handoff>;
-		memory-region-names = "ttbs", "pagetables", "handoff";
+				<&uat_handoff>, <&uat_l2_pagetables>,
+				<&gpu_fw_text>, <&gpu_fw_data>;
+		memory-region-names = "ttbs", "pagetables", "handoff",
+				      "l2-pagetables", "fw-text", "fw-data";
 		operating-points-v2 = <&gpu_opp>;
 		status = "disabled";
 	};
