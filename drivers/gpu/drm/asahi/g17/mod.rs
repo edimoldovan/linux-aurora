@@ -1179,6 +1179,15 @@ impl WorkItem<POLL_WORK> for Shared {
     fn run(this: Arc<Shared>) {
         let result = {
             let mut state = this.state.lock();
+            if crate::module_parameters::m5_poll_in_flight.value() != 0 {
+                if let Some(firmware) = (*state).as_deref() {
+                    // Drain both mailboxes: with no receive interrupt the FIFO fills and
+                    // the firmware's later messages fail.
+                    for coprocessor in Iterator::chain(core::iter::once(&firmware.primary), firmware.secondary.as_ref()) {
+                        let _ = coprocessor.rtkit.with(|rtkit| rtkit.poll());
+                    }
+                }
+            }
             match (*state).as_deref_mut() {
                 Some(firmware) if firmware.render_control_backpressured() => {
                     firmware.note_render_control_backpressure()
@@ -1338,6 +1347,11 @@ impl Shared {
     /// actual publication, by publishers with or without the device mutex; callable from any
     /// context.
     pub(super) fn note_gpu_activity(self: &Arc<Self>) {
+        // The firmware's completion notification can be lost (see the poll in the event
+        // worker): start the in-flight poll at publication, also after the GPU was idle.
+        if crate::module_parameters::m5_poll_in_flight.value() != 0 {
+            self.queue_poll();
+        }
         if self.governs && thermal::requested() {
             self.governor_activity_ns.store(now_ns().max(1), Ordering::Release);
             self.queue_governor();

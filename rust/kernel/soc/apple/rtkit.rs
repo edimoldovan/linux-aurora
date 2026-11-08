@@ -325,6 +325,15 @@ impl<T: Operations> RtKit<T> {
         })
     }
 
+    /// Reads every message waiting in the coprocessor's mailbox, as its receive interrupt
+    /// would. Returns how many it read.
+    pub fn poll(self: Pin<&mut Self>) -> Result<i32> {
+        // SAFETY: `rtk` is valid per the type invariant.
+        let ret = unsafe { bindings::apple_rtkit_poll(self.rtk) };
+        to_result(ret.min(0))?;
+        Ok(ret)
+    }
+
     /// Checks if an endpoint is present
     pub fn has_endpoint(self: Pin<&mut Self>, endpoint: u8) -> bool {
         unsafe { bindings::apple_rtkit_has_endpoint(self.rtk, endpoint) }
