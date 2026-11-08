@@ -82,7 +82,7 @@ impl InitData {
     }
 
     pub(crate) fn build_m5(&mut self, dev: &AsahiDrmDevice, uat: &mmu::Uat,
-        id: &crate::regs::G17Id, board: &m::Board) -> Result {
+        id: &crate::regs::G17Id, board: &m::Board, variant: &crate::g17::fw::Variant) -> Result {
         use mmu::{PROT_FW_SHARED_RW as RW, PROT_FW_SHARED_RO as RO,
                   PROT_GPU_SHARED_RW as GPU};
         self.m5 = true;
@@ -161,7 +161,7 @@ impl InitData {
         let views = m::PrimaryRegionViews {
             sentinel_high: BASE + 0xc07e_0000, alias_high: [PB, UMA],
         };
-        m::encode_m5_hw_data(board, completions, QOS, windows,
+        m::encode_m5_hw_data(board, completions, QOS, windows, variant.m5_hw_data_shift_2728,
             &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE]).map_err(|_| EINVAL)?;
         m::set_m5_kick_shared(
             &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE], KICK_SHARED)
@@ -217,7 +217,8 @@ impl InitData {
                 &mut self.object_mut(self.bundle)?.bytes_mut()[offset..offset + m::MAIN_CONFIG_SIZE])
                 .map_err(|_| EINVAL)?;
             let offset = index * 0x8000;
-            m::encode_root_for_profile(profile, role, &addresses, &instance,
+            m::encode_root_for_profile(profile,
+                variant.m5_version_word.unwrap_or(profile.version_word()), role, &addresses, &instance,
                 &mut self.object_mut(self.roots)?.bytes_mut()[offset..offset + m::M5_ROOT_SIZE])
                 .map_err(|_| EINVAL)?;
         }

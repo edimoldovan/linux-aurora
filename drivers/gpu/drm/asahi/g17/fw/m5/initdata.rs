@@ -627,6 +627,7 @@ fn encode_uat_level_descriptor(bytes: &mut [u8], offset: usize, shift: u8, entri
 
 pub(crate) fn encode_root_for_profile(
     profile: RootProfile,
+    version_word: u64,
     role: InstanceRole,
     shared: &SharedAddresses,
     inst: &InstanceAddresses,
@@ -640,7 +641,7 @@ pub(crate) fn encode_root_for_profile(
     validate_instance(role, inst)?;
 
     out.fill(0);
-    put_u64(out, ROOT_VERSION, profile.version_word());
+    put_u64(out, ROOT_VERSION, version_word);
     put_u64(out, ROOT_REGION_A, shared.region_a);
 
     put_u64(out, ROOT_MAIN_CONFIG, inst.main_config);
@@ -2234,6 +2235,7 @@ pub(crate) fn encode_m5_hw_data(
     aliases: [G17PKsmCompletionAliases; M5_25G76_COMPLETION_QUEUE_COUNT],
     qos_high: u64,
     windows: &[M5RegisterWindow],
+    shift_2728: bool,
     out: &mut [u8],
 ) -> Result<(), InitdataError> {
     if out.len() != M5_HW_DATA_SIZE {
@@ -2300,8 +2302,14 @@ pub(crate) fn encode_m5_hw_data(
     out.copy_within(insert..COMMON26_HW_DATA_SIZE, insert + len);
     out[insert..insert + len].fill(0);
     put_u32(out, 0x2660, 0);
-    put_u32(out, 0x2728, 0);
-    put_u32(out, 0x272c, 1);
+    // 27.3 beta 1 has 4 more bytes at 0x2728: everything from there on sits 4 bytes later.
+    let shift = if shift_2728 { 4 } else { 0 };
+    if shift_2728 {
+        out.copy_within(0x2728..M5_HW_DATA_SIZE - shift, 0x2728 + shift);
+        out[0x2728..0x2728 + shift].fill(0);
+    }
+    put_u32(out, 0x2728 + shift, 0);
+    put_u32(out, 0x272c + shift, 1);
     if let Some(mask) = board.mcc_mask {
         put_u64(out, 0x10a8, mask);
     }
