@@ -91,6 +91,9 @@ pub(crate) struct Variant {
     pub(crate) m5_version_word: Option<u64>,
     /// The M5 HW data has 4 more bytes at 0x2728: everything from there on sits 4 bytes later.
     pub(crate) m5_hw_data_shift_2728: bool,
+    /// Where the M5 status config holds the secondary's flag (then the pointer to the
+    /// primary's flag), when it is not 26A428's 0x774.
+    pub(crate) m5_status_config_link: Option<usize>,
 }
 
 /// A firmware build a SoC supports, identified by its loaded TEXT.
@@ -140,6 +143,7 @@ pub(crate) const V26A428: Variant = Variant {
     registration_power_hold: true,
     m5_version_word: None,
     m5_hw_data_shift_2728: false,
+    m5_status_config_link: None,
 };
 
 /// The M4 Pro firmware (25G83, `mBoot-18000.161.10`).
@@ -176,6 +180,7 @@ pub(crate) const V25G83: Variant = Variant {
     registration_power_hold: true,
     m5_version_word: None,
     m5_hw_data_shift_2728: false,
+    m5_status_config_link: None,
 };
 
 /// The 26A428 firmware of the M5 GPUs, which runs the M5 protocol (the M5 graph, queues and
@@ -188,10 +193,12 @@ pub(crate) const V26A428_M5: Variant = Variant {
 };
 
 /// The 27.3 beta 1 firmware of the M5 GPUs (`mBoot-20457.60.65`): the 26A428 M5 protocol with
-/// version word 0x0c8e_4339_8728_04c0 and 4 more HW data bytes at 0x2728.
+/// version word 0x0c8e_4339_8728_04c0, 4 more HW data bytes at 0x2728 and the status config
+/// link at 0x784.
 pub(crate) const V27_3B1_M5: Variant = Variant {
     m5_version_word: Some(0x0c8e_4339_8728_04c0),
     m5_hw_data_shift_2728: true,
+    m5_status_config_link: Some(crate::g17::fw::m5::initdata::M5_27_3B1_STATUS_CONFIG_LINK_WORD),
     ..V26A428_M5
 };
 

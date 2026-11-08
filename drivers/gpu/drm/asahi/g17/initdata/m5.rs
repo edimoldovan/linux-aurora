@@ -137,6 +137,7 @@ impl InitData {
             .map_err(|_| EINVAL)?;
         m::encode_m5_region_c(self.object_mut(self.region_c)?.bytes_mut()).map_err(|_| EINVAL)?;
         m::encode_m5_private_cluster(PRIVATE, FWCTL,
+            variant.m5_status_config_link.unwrap_or(m::M5_STATUS_CONFIG_LINK_WORD),
             &mut self.object_mut(self.cluster)?.bytes_mut()[..private.total]).map_err(|_| EINVAL)?;
         let windows = board.register_windows();
         let windows = &windows[..board.register_window_count()];

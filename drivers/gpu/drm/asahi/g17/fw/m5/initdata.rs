@@ -1656,9 +1656,11 @@ pub(crate) const M5_INITDATA_VERSION_WORD: u64 = 0x0c8e_0339_8728_04c0;
 
 pub(crate) const M5_ROOT_SIZE: usize = 0xc8;
 
+// The status config is 0x780 bytes on 26A428 and 0x790 on 27.3 beta 1 (the secondary's power
+// state, AGXG17X): its allocation is the larger one.
 pub(crate) const ABI_ALLOCATION_SIZES_26A428_M5: [usize; 24] = [
     0x2850, 0x0c18, 0x1048, 0x0e10, 0x126b0, 0x0068, 0x0800, 0x0088, 0x1800, 0x04c0, 0x4000, 0x0030,
-    0xe730, 0x0780, 0x0020, 0x01b0, 0x4800, 0x28800, 0x79800, 0x9000, 0x00a8, 0x0008, 0x1ca0, 0x00e4,
+    0xe730, 0x0790, 0x0020, 0x01b0, 0x4800, 0x28800, 0x79800, 0x9000, 0x00a8, 0x0008, 0x1ca0, 0x00e4,
 ];
 
 pub(crate) const M5_SHARED_LAYOUT: SharedClusterLayout =
@@ -1695,8 +1697,8 @@ pub(crate) fn set_m5_kick_shared(out: &mut [u8], address: u64, shift_2728: bool)
 
 pub(crate) const M5_POLICY_SIZE: usize = ABI_ALLOCATION_SIZES_26A428_M5[ALLOC_POLICY];
 
-pub(crate) const M5_STATUS_CONFIG_SIZE: usize =
-    ABI_ALLOCATION_SIZES_26A428_M5[ALLOC_STATUS_CONFIG];
+/// The 26A428 status config the template fills; its allocation may be larger.
+pub(crate) const M5_STATUS_CONFIG_SIZE: usize = 0x780;
 
 pub(crate) const M5_REGION_C_ALLOCATION: usize =
     ABI_ALLOCATION_SIZES_26A428_M5[ALLOC_REGION_C];
@@ -1751,6 +1753,8 @@ pub(crate) const M5_RECOVERY_SLOT_MASK: usize = 0x4ab8;
 pub(crate) const M5_STATUS_CONFIG_LINK_WORD: usize = 0x774;
 
 pub(crate) const M5_STATUS_CONFIG_LINK_PTR: usize = 0x778;
+/// 27.3 beta 1: the secondary's flag and the pointer to the primary's flag, 0x10 later.
+pub(crate) const M5_27_3B1_STATUS_CONFIG_LINK_WORD: usize = 0x784;
 
 pub(crate) const M5_HW_DATA_INSERT: usize = 0x267c;
 
@@ -2411,6 +2415,7 @@ pub(crate) fn encode_m5_primary_status_b(
     fwctl_state: u64,
     fwctl_ring: u64,
     status_b: u64,
+    link_word: usize,
     out: &mut [u8],
 ) -> Result<(), InitdataError> {
     if out.len() != M5_STATUS_B_SPAN {
@@ -2427,11 +2432,11 @@ pub(crate) fn encode_m5_primary_status_b(
     put_u32(out, COMMON26_STATUS_B_CONFIG_HEADER, 1);
     put_u32(out, COMMON26_STATUS_B_LINK_WORD, 0);
     put_u64(out, COMMON26_STATUS_B_LINK_PTR,
-            status_b + (config + M5_STATUS_CONFIG_LINK_WORD) as u64);
+            status_b + (config + link_word) as u64);
     write_relocated_words(M5_25G76_STATUS_CONFIG_WORDS, 0, COMMON26_STATUS_CONFIG_BANDS,
                           &mut out[config..config + M5_STATUS_CONFIG_SIZE])?;
-    put_u32(out, config + M5_STATUS_CONFIG_LINK_WORD, 1);
-    put_u64(out, config + M5_STATUS_CONFIG_LINK_PTR,
+    put_u32(out, config + link_word, 1);
+    put_u64(out, config + link_word + (M5_STATUS_CONFIG_LINK_PTR - M5_STATUS_CONFIG_LINK_WORD),
             status_b + COMMON26_STATUS_B_LINK_WORD as u64);
     Ok(())
 }
@@ -2439,6 +2444,7 @@ pub(crate) fn encode_m5_primary_status_b(
 pub(crate) fn encode_m5_private_cluster(
     private_base: u64,
     fwctl_state: u64,
+    status_config_link: usize,
     out: &mut [u8],
 ) -> Result<(), InitdataError> {
     let layout = M5_PRIVATE_LAYOUT;
@@ -2462,7 +2468,7 @@ pub(crate) fn encode_m5_private_cluster(
     let status_b = layout.status_b;
     let status_a = layout.roles[0].status_a;
     encode_m5_primary_status_b(fwctl_state, fwctl_ring, private_base + status_b as u64,
-                                        &mut out[status_b..status_a])?;
+                               status_config_link, &mut out[status_b..status_a])?;
     for role in layout.roles {
         encode_status_block(&mut out[role.status_a..role.status_a + STATUS_BLOCK_SIZE])?;
     }
