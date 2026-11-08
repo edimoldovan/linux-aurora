@@ -157,11 +157,13 @@
 		apple,cam-connections-scheme = <0x10>;
 		/*
 		 * The camera light: ADT eic cil-gpio-offset 141 in gpio0
-		 * (0x2dc000000), cil-gpio-config 0x474002, driven low to light.
+		 * (0x2dc000000), cil-gpio-config 0x474002. Active high: driven
+		 * low it is off even while the sensor streams (measured).
 		 * "wdt" is the eic's mmio-wd-isp: frames pass only while it is fed,
 		 * which the driver does only while the light is on.
 		 */
 		apple,cil-config = <0x474002>;
+		apple,cil-active-high;
 
 		/*
 		 * IMX958 firmware configuration 5, as aurora streams it on the
