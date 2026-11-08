@@ -1185,7 +1185,8 @@ static const struct apple_isp_hw apple_isp_hw_t6050 = {
 	.mbox_irq_enable = ISP_MBOX_IRQ_ENABLE_T6031,
 
 	.scl1 = true,
-	.lpdp = false,
+	/* The sensor link is LPDP ("SIF 0 (LPDP)"), as on T8142. */
+	.lpdp = true,
 	.meta_size = ISP_META_SIZE_T8140,
 	.fw_mmio = apple_isp_fw_mmio_t6050,
 	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t6050),
