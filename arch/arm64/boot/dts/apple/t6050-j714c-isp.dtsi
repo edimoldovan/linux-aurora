@@ -115,3 +115,14 @@
 };
 
 #include "isp-common.dtsi"
+
+/*
+ * Off, after isp-common.dtsi turns it on: the IRQ block's first word
+ * (0x582920000) stalls the bus from the AP with every ISP power domain
+ * active, while the coproc, GPIO, DART and EIC watchdog words answer. The
+ * J714c ISP is exclave-assigned (macOS drives it through the ISPEngine
+ * exclave), so the driver's first mailbox access hangs the boot.
+ */
+&isp {
+	status = "disabled";
+};
