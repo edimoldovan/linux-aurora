@@ -148,8 +148,6 @@ pub(super) struct InitData {
     cluster: usize,
     bundle: usize,
     region_c: usize,
-    /// The g17c layout.
-    g17c: bool,
     qos: usize,
     pb: usize,
     page_pool: usize,
@@ -230,7 +228,6 @@ impl InitData {
             cluster: 0,
             bundle: 0,
             region_c: 0,
-            g17c: false,
             qos: 0,
             pb: 0,
             page_pool: 0,
@@ -698,7 +695,6 @@ impl InitData {
         render: &mmu::Vm,
         metrics: &KernelObject,
     ) -> Result {
-        self.g17c = matches!(cfg.abi, Abi::G17c);
         let range = uat.geometry().kernel_range();
         let env = BuildEnv {
             dev,
@@ -1228,12 +1224,6 @@ impl InitData {
         let line = region.pointer(abi::RegionC::EFFORT, 4)?;
         override_word.store(0, Ordering::Relaxed);
         effort_word.store(effort, Ordering::Relaxed);
-        if self.g17c {
-            // The g17c secondary reads Region C +0xe8 and +0xec (gfx1 0x15bcc), never +0xe4:
-            // the G17P pair moves up by 4, zero at +0xec and the effort at +0xe8.
-            region.word(abi::RegionC::UNK_E8 + 4)?.store(0, Ordering::Relaxed);
-            override_word.store(effort, Ordering::Relaxed);
-        }
         // SAFETY: line points into the retained kernel mapping; cleaning this host-owned cache
         // line and the following system barrier publish the two naturally aligned stores.
         unsafe {
