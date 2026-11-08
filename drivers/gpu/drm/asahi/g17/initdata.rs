@@ -8,7 +8,7 @@
 use super::{
     fw::initdata as abi,
     object::{CpuMap, KernelObject, Placement},
-    Abi, Config, Role,
+    Config, Role,
 };
 use crate::{driver::AsahiDrmDevice, hw::t8140, mmu};
 use core::ops::Range;
@@ -716,18 +716,6 @@ impl InitData {
     fn map_register_windows(&mut self, env: &BuildEnv<'_>, cfg: &Config) -> Result {
         for window in cfg.register_windows {
             let (phys, va, size) = window.mapping().ok_or(EINVAL)?;
-            if window.phys == abi::SCRATCH_WINDOW_PHYS {
-                let scratch = KernelObject::new(
-                    env.dev,
-                    env.vm,
-                    Placement::At(va),
-                    size.try_into()?,
-                    mmu::PROT_FW_PRIV_RW,
-                    CpuMap::WriteCombined,
-                )?;
-                self.add(scratch)?;
-                continue;
-            }
             self.aliases.push(
                 env.vm.map_io(
                     env.dev.as_ref().as_ref(),
@@ -1010,17 +998,8 @@ impl InitData {
             completion_rings: bundle.completion_rings,
             qos_va: self.object(bundle.qos)?.gpu_va(),
         };
-        match cfg.abi {
-            Abi::G17p => self
-                .object_mut(self.bundle)?
-                .initialize::<abi::HwData>(abi::bundle::HW_DATA, |hw| hw.init(&hw_args))?,
-            Abi::G17c => self
-                .object_mut(self.bundle)?
-                .initialize::<abi::HwDataG17c>(
-                    abi::bundle::HW_DATA,
-                    |hw| hw.init(&hw_args),
-                )?,
-        }
+        self.object_mut(self.bundle)?
+            .initialize::<abi::HwData>(abi::bundle::HW_DATA, |hw| hw.init(&hw_args))?;
         self.object_mut(self.region_c)?
             .initialize::<abi::RegionC>(0, |region| {
                 region.init();
@@ -1033,10 +1012,7 @@ impl InitData {
         let fwctl_va = self.object(tables.fwctl)?.gpu_va();
         self.object_mut(self.cluster)?
             .initialize::<abi::PrimaryStatusB>(abi::private::STATUS_B, |status| {
-                match cfg.abi {
-                    Abi::G17p => status.init(fwctl_va),
-                    Abi::G17c => status.init_g17c(fwctl_va),
-                }
+                status.init(fwctl_va);
                 Ok(())
             })?;
         self.object_mut(self.cluster)?
@@ -1088,10 +1064,7 @@ impl InitData {
                 .initialize::<abi::MainConfig>(main_offset, |main| {
                     match role {
                         Role::Primary => main.init_primary(&args, &views),
-                        Role::Secondary => match cfg.abi {
-                            Abi::G17p => main.init_secondary(&args),
-                            Abi::G17c => main.init_secondary_g17c(&args),
-                        },
+                        Role::Secondary => main.init_secondary(&args),
                     };
                     Ok(())
                 })?;

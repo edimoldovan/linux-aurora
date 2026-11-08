@@ -3,7 +3,6 @@
 //! Hardware configuration for t8140 platforms (A18 Pro).
 
 use crate::g17::{
-    Abi,
     Config,
     FixedBuffer,
     Identity, //
@@ -12,7 +11,6 @@ use crate::hw::GpuVariant;
 
 /// Static configuration of the T8140 GPU.
 pub(crate) const CONFIG: Config = Config {
-    abi: Abi::G17p,
     chip_id: CHIP_ID,
     identity: Identity {
         family: 0xa,
@@ -38,7 +36,6 @@ pub(crate) const CONFIG: Config = Config {
             size: 0x8000,
         },
     ],
-    crash_log_phys: false,
     // Read by the firmware through the kernel lower root, whose top-level entries it only
     // samples when it starts.
     pm_metrics: FixedBuffer {
@@ -73,7 +70,6 @@ const fn window(
         phys,
         va: MMIO_APERTURE + offset,
         size,
-        elements: 1,
         unk_18,
         unk_20,
     }
