@@ -29,6 +29,7 @@
 #include "t6050-pmp.dtsi"
 #include "t6050-j714c-pmp-tunables.dtsi"
 #include "t6050-j714c-display.dtsi"
+#include "t6050-j714c-isp.dtsi"
 
 / {
 	compatible = "apple,j714c", "apple,t6050", "apple,arm-platform";

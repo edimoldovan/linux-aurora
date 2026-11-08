@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J714c ISP: T6050's ISP17a (ASC version 0x110003, the T8140/T8142 block).
+ * From the J714c ADT: isp0 reg 0x580000000 + 0x3ff0000, IRQs [513 514 515
+ * 516 526] (513 carries the IPC mailbox), sensor-type 0x73, firmware
+ * pre-loaded by iBoot; dart-isp0 at 0x5828c0000/0x5828e0000/0x582900000
+ * (+0xc000), IRQ 531, remap streams 1 6 7 10 11 -> 0; EIC mmio-wd-isp
+ * 0x5c3b50000 + 0x8000.
+ *
+ * The ADT marks ISP_CPU (id 220) and ISP_FE (221) no_ps, but pmgr1's slots
+ * run by device id 8 bytes apart from ISP_SYS (218, +0x3a0): ISP_CPU +0x3b0,
+ * ISP_FE +0x3b8. Measured: both reach active from the AP, and the ISP then
+ * reports its version. The remaining ISP slots (+0x3d8..+0x3f0) sit in the
+ * DAPF range the boot loader passes to the ISP.
+ *
+ * m1n1 powers ISP_SYS, ISP_CPU and ISP_FE, carves the firmware heap and
+ * fills in "isp-heap"; without it the driver has no heap.
+ *
+ * The sensor presets are the M5 (T8142) IMX958 ones; the J714c sensor is not
+ * identified yet.
+ */
+
+&pmgr1 {
+	ps_isp_cpu: power-controller@3b0 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3b0 4>;
+		label = "isp_cpu";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_isp_sys>;
+	};
+
+	ps_isp_fe: power-controller@3b8 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3b8 4>;
+		label = "isp_fe";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_isp_sys>;
+	};
+};
+
+&soc {
+	isp_dart0: iommu@5828c0000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x5 0x828c0000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 531 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_isp_sys>;
+		/* As on T8140/T8142: 3-level tables, vm-base 0x10000000000. */
+		apple,dma-range = <0x0 0x0 0x8 0x0>;
+		apple,remap-streams = <1 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+	};
+
+	isp_dart1: iommu@5828e0000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x5 0x828e0000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 531 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_isp_sys>;
+		apple,dma-range = <0x0 0x0 0x8 0x0>;
+		apple,remap-streams = <1 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+	};
+
+	isp_dart2: iommu@582900000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x5 0x82900000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 531 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_isp_sys>;
+		apple,dma-range = <0x0 0x0 0x8 0x0>;
+		apple,remap-streams = <1 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+	};
+
+	/*
+	 * As on T8140/T8142: "coproc" stops short of the secure route table at
+	 * +0x1804000 and of the IRQ block (+0x2920000, "mbox") and the GPIO
+	 * words (+0x2921000).
+	 */
+	isp: isp@580000000 {
+		compatible = "apple,t6050-isp", "apple,isp";
+		iommus = <&isp_dart0 0>, <&isp_dart1 0>, <&isp_dart2 0>;
+		reg-names = "coproc", "mbox", "gpio", "wdt";
+		reg = <0x5 0x80000000 0x0 0x1801000>,
+		      <0x5 0x82920000 0x0 0x1000>,
+		      <0x5 0x82921000 0x0 0x100>,
+		      <0x5 0xc3b50000 0x0 0x8000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 513 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_isp_sys>, <&ps_isp_cpu>, <&ps_isp_fe>;
+		apple,dart-vm-size = <0x0 0xe0000000>;
+		apple,platform-id = <0x73>;
+		apple,temporal-filter = <1>;
+
+		sensor-presets {
+			/* 1280x720 */
+			preset0 {
+				apple,config-index = <7>;
+				apple,input-size = <3040 2880>;
+				apple,output-size = <1280 720>;
+				apple,crop = <0 584 3040 1710>;
+			};
+			/* 1920x1080 */
+			preset1 {
+				apple,config-index = <7>;
+				apple,input-size = <3040 2880>;
+				apple,output-size = <1920 1080>;
+				apple,crop = <0 584 3040 1710>;
+			};
+		};
+	};
+};
+
+#include "isp-common.dtsi"
