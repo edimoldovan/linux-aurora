@@ -84,7 +84,8 @@ pub(crate) const CONFIG_MAX: Config = Config {
     uat_quirks: CONFIG_ULTRA.uat_quirks,
     region_c: None,
     chip: None,
-    m5: Some(&crate::g17::fw::m5::initdata::J716C),
+    // This tree boots the 14-inch M5 Max (J714c).
+    m5: Some(&crate::g17::fw::m5::initdata::J714C),
     adopt_root_entries: true,
     fabric_bridge: false,
     recovery_slot_keys: None,
