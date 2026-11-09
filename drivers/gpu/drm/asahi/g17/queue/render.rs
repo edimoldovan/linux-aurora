@@ -35,6 +35,10 @@ use crate::g17::{
 use crate::{hw::t8140::queues, mmu};
 pub(crate) use dependencies::Dependencies;
 use kernel::{prelude::*, sync::Arc};
+
+/// The last MMU fault address the recovery path decoded; diagnostics only.
+pub(crate) static LAST_FAULT_ADDRESS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 use retirement::{Ticket, Tracker};
 
 /// Firmware dependencies of one render, kept by origin until the kick entries
@@ -1438,6 +1442,13 @@ impl Pair {
                 pr_warn!("G17: recovery render geometry ordinal={} width={} height={} layers={} layout={:?}\n",
                     active.ticket.ordinal, pass.width, pass.height, pass.layers,
                     target::Layout::new(pass, self.clusters, self.variant.programs));
+                let fault = LAST_FAULT_ADDRESS.load(core::sync::atomic::Ordering::Relaxed);
+                let vm = active.packet.context.vm();
+                let mapped = (fault != 0).then(|| vm.try_covers_read(fault));
+                pr_warn!("G17: recovery render ordinal={} fault={:#x} mapped={:?} vdm={:#x} scissor={:#x} dbias={:#x} oclqry={:#x} samplers={:#x} scissor_mapped={:?}\n",
+                    active.ticket.ordinal, fault, mapped,
+                    pass.vdm_va, pass.scissor_va, pass.depth_bias_va, pass.occlusion_query_va,
+                    pass.sampler_heap_va, vm.try_covers_read(pass.scissor_va));
             }
             pr_warn!(
                 "G17: recovery render ordinal={} published={} ctx={} seq={} snapshot={:?}\n",

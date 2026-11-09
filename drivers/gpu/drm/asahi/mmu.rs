@@ -2475,6 +2475,12 @@ impl Vm {
         Self::covers_range_locked(&mut inner, address, size, read, write)
     }
 
+    /// Diagnostics: whether `address` is readable now; `None` while the reservation is held.
+    pub(crate) fn try_covers_read(&self, address: u64) -> Option<bool> {
+        let mut inner = self.gpuvm.try_lock_private()?;
+        Some(Self::covers_range_locked(&mut inner, address, 64, true, false))
+    }
+
     /// Checks all writable sparse blocks and their guard coverage under one
     /// GPUVM lock. A fully mapped guard is not a valid sparse allocation.
     pub(crate) fn covers_sparse_blocks_with_guards(

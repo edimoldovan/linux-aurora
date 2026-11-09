@@ -153,6 +153,10 @@ impl recovery::Memory for Service<'_> {
             if let Ok([_, status, address, ..]) = registers {
                 if status & 1 != 0 {
                     mmu_fault = true;
+                    crate::g17::queue::render::LAST_FAULT_ADDRESS.store(
+                        (address & ((1 << 42) - 1)) << 6,
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
                     let access = if status & 0x10 != 0 { "read" } else { "write" };
                     pr_err!("asahi: recovery: GPU MMU fault: {} reason {} at {:#x}, level {}, requestor {:#x}, VM slot {}\n",
                         access, (status >> 1) & 7,
