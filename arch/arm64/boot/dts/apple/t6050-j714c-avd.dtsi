@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J714c AVD video decoder, laid out as the M5's (T8142, J813). From the J714c
+ * ADT: avd0 reg[0] 0x2108000000 + 0x1404000 (the M5's size), avd-version 4,
+ * at the arm-io offset 0x2220000000 - 0x2020000000 = 0x200000000. CM3 code
+ * and SRAM 0x14000 each, mailbox at +0x10a8000, ctrl at +0x1100000; IRQs
+ * 2417/2418; dart-avd0 at +0x1020000, IRQ 2424, SIDs 0-2. Power: AVD_SYS.
+ */
+
+&{/soc} {
+	avd: avd@2309080000 {
+		compatible = "apple,t6050-avd", "apple,t8142-avd";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 2417 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 2418 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_avd_sys>;
+		resets = <&ps_avd_sys>;
+		reg = <0x23 0x09080000 0x0 0x14000>,
+		      <0x23 0x09094000 0x0 0x14000>,
+		      <0x23 0x090a8000 0x0 0x4000>,
+		      <0x23 0x09100000 0x0 0x10000>;
+		reg-names = "code", "sram", "mbox", "ctrl";
+		iommus = <&avd_dart 0>, <&avd_dart 1>, <&avd_dart 2>;
+	};
+
+	avd_dart: iommu@2309020000 {
+		compatible = "apple,t6050-dart", "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x23 0x09020000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 2424 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_avd_sys>;
+	};
+};
