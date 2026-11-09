@@ -2976,22 +2976,36 @@ unsafe extern "C" fn asoc_pcm_copy(
                 % ring_bytes as u64) as usize;
             // SAFETY: the ring is SENSE_DRAIN_BYTES long for the driver's life.
             let ring = unsafe { slice::from_raw_parts(ring_base, ring_bytes) };
-            let word_at = |p: usize| -> u16 {
-                let p = p % ring_bytes;
-                u16::from_le_bytes([ring[p], ring[p + 1]])
-            };
             let late = data.hw.sense_late_current;
             let frame = frame_bytes as usize;
-            let mut chunk = [0u8; 512];
+            const CHUNK: usize = 512;
+            const MAX_FRAME: usize = 64;
+            if frame > MAX_FRAME {
+                return EINVAL.to_errno();
+            }
+            let mut chunk = [0u8; CHUNK];
+            // The ring is uncached DMA memory, where every load is a trip to
+            // DRAM: copy each chunk's span (the frame before it, for the late
+            // pairs, and the word after it) in one bulk copy, then work from
+            // the cached window.
+            let mut win = [0u8; MAX_FRAME + CHUNK + 2];
             let mut off = 0;
             while off < bytes {
                 let n = core::cmp::min(chunk.len(), bytes - off) & !1;
+                let start = (pos + off + ring_bytes - frame) % ring_bytes;
+                let len = frame + n + 2;
+                let first = core::cmp::min(len, ring_bytes - start);
+                win[..first].copy_from_slice(&ring[start..start + first]);
+                win[first..len].copy_from_slice(&ring[..len - first]);
+                let word_at = |p: usize| -> u16 { u16::from_le_bytes([win[p], win[p + 1]]) };
                 for i in (0..n).step_by(2) {
-                    let mut p = pos + off + i;
+                    // `p` is the word's place in the window, which starts one
+                    // frame before the chunk.
+                    let mut p = frame + i;
                     // A late pair's voltage is taken from the frame before.
-                    let ch = (p % frame) / 2;
+                    let ch = ((pos + off + i) % frame) / 2;
                     if ch & 1 == 1 && late & (1 << (ch / 2)) != 0 {
-                        p += ring_bytes - frame;
+                        p -= frame;
                     }
                     let w = word_at(p);
                     let next = word_at(p + 2);
