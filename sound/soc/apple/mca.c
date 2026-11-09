@@ -1093,7 +1093,16 @@ static int mca_pcm_new(struct snd_soc_component *component,
 		}
 
 		cl->dma_chans[i] = chan;
-		snd_pcm_set_managed_buffer(substream, SNDRV_DMA_TYPE_DEV_IRAM,
+		/*
+		 * A capture buffer is read by the CPU: keep it cached and let the
+		 * PCM core invalidate it before each read. Reading the uncached
+		 * buffer on T6050 runs at a few MB/s, so the 12-channel speaker
+		 * sense stream alone cost a third of a CPU core.
+		 */
+		snd_pcm_set_managed_buffer(substream,
+					   i == SNDRV_PCM_STREAM_CAPTURE ?
+					   SNDRV_DMA_TYPE_NONCOHERENT :
+					   SNDRV_DMA_TYPE_DEV_IRAM,
 					   chan->device->dev, 512 * 1024 * 6,
 					   SIZE_MAX);
 	}
