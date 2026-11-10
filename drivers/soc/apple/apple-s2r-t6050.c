@@ -262,6 +262,16 @@ static int __init apple_s2r_init(void)
 		readl(aop + AOP_WAKE_EN(6)), readl(aop + AOP_WAKE_EN(7)), readl(aop + AOP_WAKE_EN(8)),
 		readl(aop + AOP_WAKE_EN(9)));
 
+	/* Probe: does the wake-enable word keep a written value? Restored right after. */
+	{
+		u32 w3 = readl(aop + AOP_WAKE_EN(WAKE_SRC_SMC / 32));
+
+		writel(w3 | BIT(WAKE_SRC_SMC % 32), aop + AOP_WAKE_EN(WAKE_SRC_SMC / 32));
+		pr_info("wake word 3: %08x -> wrote bit %d -> reads %08x; S2R timer reads %08x\n", w3,
+			WAKE_SRC_SMC % 32, readl(aop + AOP_WAKE_EN(WAKE_SRC_SMC / 32)), readl(s2r_timer));
+		writel(w3, aop + AOP_WAKE_EN(WAKE_SRC_SMC / 32));
+	}
+
 	suspend_set_ops(&apple_s2r_ops);
 	pr_info("suspend-to-RAM registered (first stage: the wake is a cold boot)\n");
 	return 0;
