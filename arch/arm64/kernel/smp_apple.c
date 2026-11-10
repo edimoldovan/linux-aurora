@@ -252,6 +252,15 @@ extern volatile unsigned long secondary_holding_pen_release;
 void apple_cpu_mmu_off_jump(unsigned long entry, unsigned long arg0,
 			    unsigned long arg1, unsigned long arg2);
 void apple_cpu_park_mmuoff(unsigned long pen_pa, unsigned long flushed_pa);
+void apple_t6050_deep_wfi(void);
+
+/*
+ * Set by the T6050 suspend-to-RAM entry (drivers/soc/apple/apple-s2r-t6050.c) before the PM core takes
+ * the secondaries offline: a parking core then goes into the T6050 deep WFI instead of the holding pen,
+ * and never comes back (the wake is a cold boot).
+ */
+bool apple_cpu_deep_park;
+EXPORT_SYMBOL_GPL(apple_cpu_deep_park);
 void apple_cpu_off_mmuoff(unsigned long stop_pa, unsigned long flushed_pa,
 			  unsigned long stop_bit);
 
@@ -821,7 +830,10 @@ static void apple_cpu_die(unsigned int cpu)
 		     apple_cpu_bit(cpu));
 	else
 		jump(__pa_symbol(apple_cpu_park_mmuoff),
-		     __pa_symbol(secondary_holding_pen), flushed_pa, 0);
+		     READ_ONCE(apple_cpu_deep_park) ?
+				__pa_symbol(apple_t6050_deep_wfi) :
+				__pa_symbol(secondary_holding_pen),
+		     flushed_pa, 0);
 
 	unreachable();
 }

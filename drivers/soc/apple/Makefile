@@ -51,3 +51,5 @@ obj-$(CONFIG_APPLE_MCC) += apple-mcc.o
 apple-mcc-y := mcc.o
 
 obj-$(CONFIG_APPLE_CLPC) += clpc.o
+
+obj-$(CONFIG_APPLE_S2R_T6050) += apple-s2r-t6050.o

@@ -171,3 +171,26 @@ SYM_FUNC_START(apple_cpu_off_mmuoff)
 	wfi
 	b	1b
 SYM_FUNC_END(apple_cpu_off_mmuoff)
+
+/*
+ * apple_t6050_deep_wfi() - never returns; MMU on or off. The T6050 (M5) core's deep WFI, as the one
+ * deep-sleep site in the macOS 27 kernel (J714c kernelcache) does it: clear bit 0 of S3_1_C15_C7_4,
+ * set bits 0 and 63 of S3_5_C15_C6_2, then WFI. A WFI that returns acknowledges the IPI status
+ * (S3_5_C15_C1_1 = 1) and waits again. Used by the T6050 suspend-to-RAM entry for every core.
+ */
+SYM_FUNC_START(apple_t6050_deep_wfi)
+	mrs	x9, s3_1_c15_c7_4
+	bic	x9, x9, #1
+	msr	s3_1_c15_c7_4, x9
+	isb
+	mrs	x1, s3_5_c15_c6_2
+	orr	x1, x1, #0x1
+	orr	x1, x1, #0x8000000000000000
+	msr	s3_5_c15_c6_2, x1
+1:	dsb	sy
+	isb
+	wfi
+	mov	x9, #1
+	msr	s3_5_c15_c1_1, x9
+	b	1b
+SYM_FUNC_END(apple_t6050_deep_wfi)

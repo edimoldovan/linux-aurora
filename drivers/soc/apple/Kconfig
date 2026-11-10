@@ -13,6 +13,14 @@ config APPLE_DOCKCHANNEL
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_S2R_T6050
+	bool "Apple M5 Max (t6050) suspend-to-RAM, first stage (EXPERIMENTAL)"
+	depends on ARCH_APPLE && SUSPEND && ARM64_APPLE_CPU_HOTPLUG && APPLE_AIC
+	help
+	  Deep suspend for the t6050 (J714c), opt-in with apple_s2r=1 and
+	  apple_cpu_hotplug=park on the kernel command line. The wake is a
+	  cold boot. Without the option the system keeps s2idle.
+
 config APPLE_MAILBOX
 	tristate "Apple SoC mailboxes"
 	depends on PM

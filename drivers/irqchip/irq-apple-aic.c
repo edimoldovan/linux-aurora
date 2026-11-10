@@ -1008,6 +1008,26 @@ static void build_fiq_affinity(struct aic_irq_chip *ic, struct device_node *aff)
 	}
 }
 
+/*
+ * Mask every interrupt on every die, for the suspend-to-RAM entry (drivers/soc/apple/apple-s2r-t6050.c),
+ * which runs with IRQs off on the last online CPU.
+ */
+void apple_aic_mask_all(void)
+{
+	struct aic_irq_chip *ic = aic_irqc;
+	u32 off = 0;
+	int die, i;
+
+	if (!ic)
+		return;
+	for (die = 0; die < ic->nr_die; die++) {
+		for (i = 0; i < BITS_TO_U32(ic->nr_irq); i++)
+			aic_ic_write(ic, ic->info.mask_set + off + i * 4, U32_MAX);
+		off += ic->info.die_stride;
+	}
+}
+EXPORT_SYMBOL_GPL(apple_aic_mask_all);
+
 static int __init aic_of_ic_init(struct device_node *node, struct device_node *parent)
 {
 	int i, die;
