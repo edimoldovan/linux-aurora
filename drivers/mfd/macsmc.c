@@ -20,6 +20,7 @@
 #include <linux/of_platform.h>
 #include <linux/overflow.h>
 #include <linux/platform_device.h>
+#include <linux/suspend.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/unaligned.h>
 
@@ -534,6 +535,72 @@ static int apple_smc_probe(struct platform_device *pdev)
 	return 0;
 }
 
+/*
+ * System sleep handshake, as macOS does it around a real suspend-to-RAM (t8103 traces):
+ * MBSE 'slpw' (sleep warning) about 0.9 s before the commit, WKTP = 2 about 0.3 s before,
+ * then MBSE 'slpa' and an AP-only SET_AP_POWER 0x201 just before. The SMC itself keeps
+ * running (no IOP power change). On the way back: SET_AP_POWER 0x20, MBSE 'waka', WKTP = 0.
+ * Only for "mem" (deep) suspend; s2idle is untouched.
+ */
+#define SMC_AP_POWER_IDLE	0x201
+#define SMC_AP_POWER_ON		0x20
+
+static bool apple_smc_sleep_handshake = true;
+module_param_named(sleep_handshake, apple_smc_sleep_handshake, bool, 0644);
+MODULE_PARM_DESC(sleep_handshake, "send the macOS SMC sleep/wake handshake around deep (mem) suspend");
+
+static bool apple_smc_deep_suspend(void)
+{
+	return apple_smc_sleep_handshake && pm_suspend_target_state == PM_SUSPEND_MEM;
+}
+
+static int apple_smc_suspend(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+	int ret;
+
+	if (!apple_smc_deep_suspend())
+		return 0;
+	ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(slpw));
+	dev_info(dev, "sleep handshake: MBSE slpw (%d)\n", ret);
+	return 0;
+}
+
+static int apple_smc_suspend_late(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+	int r1, r2, r3;
+
+	if (!apple_smc_deep_suspend())
+		return 0;
+	r1 = apple_smc_write_u8(smc, SMC_KEY(WKTP), 2);
+	r2 = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(slpa));
+	r3 = apple_rtkit_set_ap_power(smc->rtk, SMC_AP_POWER_IDLE);
+	dev_info(dev, "sleep handshake: WKTP=2 (%d), MBSE slpa (%d), AP power 0x201 (%d)\n",
+		 r1, r2, r3);
+	return 0;
+}
+
+static int apple_smc_resume_early(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+	int r1, r2, r3;
+
+	if (!apple_smc_deep_suspend())
+		return 0;
+	r1 = apple_rtkit_set_ap_power(smc->rtk, SMC_AP_POWER_ON);
+	r2 = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(waka));
+	r3 = apple_smc_write_u8(smc, SMC_KEY(WKTP), 0);
+	dev_info(dev, "wake handshake: AP power 0x20 (%d), MBSE waka (%d), WKTP=0 (%d)\n",
+		 r1, r2, r3);
+	return 0;
+}
+
+static const struct dev_pm_ops apple_smc_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(apple_smc_suspend, NULL)
+	LATE_SYSTEM_SLEEP_PM_OPS(apple_smc_suspend_late, apple_smc_resume_early)
+};
+
 static const struct of_device_id apple_smc_of_match[] = {
 	{ .compatible = "apple,t8103-smc" },
 	{ .compatible = "apple,smc" },
@@ -545,6 +612,7 @@ static struct platform_driver apple_smc_driver = {
 	.driver = {
 		.name = "macsmc",
 		.of_match_table = apple_smc_of_match,
+		.pm = pm_sleep_ptr(&apple_smc_pm_ops),
 	},
 	.probe = apple_smc_probe,
 };

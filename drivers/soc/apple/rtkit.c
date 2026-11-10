@@ -1539,6 +1539,17 @@ int apple_rtkit_poweroff(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_poweroff);
 
+/*
+ * Tell the co-processor what state the AP is going to (AP power state only; the
+ * co-processor itself keeps running). macOS does this with the SMC around S2R:
+ * IDLE (0x201) just before the sleep, ON (0x20) after the wake.
+ */
+int apple_rtkit_set_ap_power(struct apple_rtkit *rtk, unsigned int state)
+{
+	return apple_rtkit_set_ap_power_state(rtk, state);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_set_ap_power);
+
 int apple_rtkit_idle(struct apple_rtkit *rtk)
 {
 	int ret;
