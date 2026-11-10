@@ -58,6 +58,16 @@ static const u32 clkgen_muxes[] = { 0x90, 0x94, 0xa0, 0xa4 };
 /* MasterMini PMGR (pmgr reg[11]) */
 #define T6050_S2R_TIMER			0x288f04000ULL
 
+/*
+ * AP wake-source enables in the AOP global block (pmgr reg[59] 0x2388000000 + 0x400c, 10 words; a set
+ * bit enables that source, AppleT6050PMGR::setAPWakeupSources writes valid & ~mask). Source id n is
+ * word n / 32, bit n % 32. The power button arrives as SMC.CPUWakeupAP, id 122 (ADT ap-wake-sources).
+ */
+#define T6050_AOP_GLOBAL		0x2388000000ULL
+#define AOP_WAKE_EN(i)			(0x400c + 4 * (i))
+#define AOP_WAKE_WORDS			10
+#define WAKE_SRC_SMC			122
+
 /* AON watchdog (/arm-io/wdt reg[0]) */
 #define T6050_WDT			0x28836c000ULL
 #define WDT_WD0_CTRL			0x0c
@@ -81,7 +91,11 @@ static unsigned int stop_after;
 module_param(stop_after, uint, 0644);
 MODULE_PARM_DESC(stop_after, "bisect the entry: spin with IRQs off after step N (1 watchdogs, 2 clocks, 3 AIC, 4 S2R timer; 0 = run it all)");
 
-static void __iomem *pmgr, *clkgen, *s2r_timer, *wdt;
+static bool wake_power_only = true;
+module_param(wake_power_only, bool, 0644);
+MODULE_PARM_DESC(wake_power_only, "enable only the SMC wake source (power button) before the commit");
+
+static void __iomem *pmgr, *clkgen, *s2r_timer, *wdt, *aop;
 
 static void s2r_stop(unsigned int step)
 {
@@ -127,6 +141,11 @@ static int apple_s2r_enter(suspend_state_t state)
 		return -EINVAL;
 	if (num_online_cpus() != 1)
 		return -EBUSY;
+
+	if (wake_power_only)
+		for (i = 0; i < AOP_WAKE_WORDS; i++)
+			writel_relaxed(i == WAKE_SRC_SMC / 32 ? BIT(WAKE_SRC_SMC % 32) : 0,
+				       aop + AOP_WAKE_EN(i));
 
 	writel_relaxed(0, wdt + WDT_WD0_CTRL);
 	writel_relaxed(0, wdt + WDT_WD1_CTRL);
@@ -184,10 +203,17 @@ static int __init apple_s2r_init(void)
 	clkgen = ioremap_np(T6050_CLKGEN, SZ_4K);
 	s2r_timer = ioremap_np(T6050_S2R_TIMER, SZ_4K);
 	wdt = ioremap_np(T6050_WDT, SZ_4K);
-	if (!pmgr || !clkgen || !s2r_timer || !wdt) {
+	aop = ioremap_np(T6050_AOP_GLOBAL, SZ_32K);
+	if (!pmgr || !clkgen || !s2r_timer || !wdt || !aop) {
 		pr_err("cannot map the PMGR windows\n");
 		return -ENOMEM;
 	}
+
+	pr_info("AP wake enables now: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+		readl(aop + AOP_WAKE_EN(0)), readl(aop + AOP_WAKE_EN(1)), readl(aop + AOP_WAKE_EN(2)),
+		readl(aop + AOP_WAKE_EN(3)), readl(aop + AOP_WAKE_EN(4)), readl(aop + AOP_WAKE_EN(5)),
+		readl(aop + AOP_WAKE_EN(6)), readl(aop + AOP_WAKE_EN(7)), readl(aop + AOP_WAKE_EN(8)),
+		readl(aop + AOP_WAKE_EN(9)));
 
 	suspend_set_ops(&apple_s2r_ops);
 	pr_info("suspend-to-RAM registered (first stage: the wake is a cold boot)\n");
