@@ -168,6 +168,51 @@ static int apple_s2r_enter(suspend_state_t state)
 	return 0;
 }
 
+/*
+ * The PMP (power-management coprocessor): macOS idles it (AP and IOP power IDLE) between MBSE slpw
+ * and slpa. .prepare sits exactly there: after every device's .suspend (macsmc sends slpw), before
+ * .suspend_late (macsmc sends slpa). The PMP driver registers the hook once it runs.
+ */
+static int (*s2r_pmp_power)(bool idle);
+static bool s2r_pmp_idled;
+
+static bool idle_pmp = true;
+module_param(idle_pmp, bool, 0644);
+MODULE_PARM_DESC(idle_pmp, "idle the PMP before the commit, as macOS does");
+
+void apple_s2r_set_pmp_power(int (*fn)(bool idle))
+{
+	WRITE_ONCE(s2r_pmp_power, fn);
+}
+EXPORT_SYMBOL_GPL(apple_s2r_set_pmp_power);
+
+static int apple_s2r_prepare(void)
+{
+	int (*fn)(bool) = READ_ONCE(s2r_pmp_power);
+	int ret;
+
+	s2r_pmp_idled = false;
+	if (!idle_pmp)
+		return 0;
+	if (!fn) {
+		pr_warn("no PMP hook registered, the PMP stays up\n");
+		return 0;
+	}
+	ret = fn(true);
+	pr_info("PMP idle: %d\n", ret);
+	s2r_pmp_idled = !ret;
+	return 0;
+}
+
+static void apple_s2r_finish(void)
+{
+	int (*fn)(bool) = READ_ONCE(s2r_pmp_power);
+
+	if (s2r_pmp_idled && fn)
+		pr_info("PMP wake: %d\n", fn(false));
+	s2r_pmp_idled = false;
+}
+
 static int apple_s2r_prepare_late(void)
 {
 	WRITE_ONCE(apple_cpu_deep_park, true);
@@ -181,9 +226,11 @@ static void apple_s2r_wake(void)
 
 static const struct platform_suspend_ops apple_s2r_ops = {
 	.valid		= suspend_valid_only_mem,
+	.prepare	= apple_s2r_prepare,
 	.prepare_late	= apple_s2r_prepare_late,
 	.enter		= apple_s2r_enter,
 	.wake		= apple_s2r_wake,
+	.finish		= apple_s2r_finish,
 };
 
 static int __init apple_s2r_init(void)

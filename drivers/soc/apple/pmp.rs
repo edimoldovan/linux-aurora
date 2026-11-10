@@ -511,6 +511,12 @@ const HW_CFG_T6050: PmpHwConfig = PmpHwConfig {
 
 impl Drop for PmpDriver {
     fn drop(&mut self) {
+        #[cfg(CONFIG_APPLE_S2R_T6050)]
+        {
+            // SAFETY: removing the hook needs no state.
+            unsafe { apple_s2r_set_pmp_power(None) };
+            PMP_FOR_S2R.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
+        }
         // SAFETY: The Arc remains live until unregister has joined any caller.
         unsafe { bindings::apple_pmp_unregister(Arc::as_ptr(&self.0).cast()) };
     }
@@ -590,8 +596,54 @@ impl platform::Driver for PmpDriver {
         if ret != 0 {
             return Err(Error::from_errno(ret));
         }
+        #[cfg(CONFIG_APPLE_S2R_T6050)]
+        {
+            // Let the t6050 suspend-to-RAM entry idle the PMP between MBSE slpw and slpa, as
+            // macOS does. PmpDriver keeps `data` alive; Drop removes the hook first.
+            PMP_FOR_S2R.store(Arc::as_ptr(&data).cast_mut(), core::sync::atomic::Ordering::Release);
+            // SAFETY: the callback only uses PMP_FOR_S2R, which Drop clears.
+            unsafe { apple_s2r_set_pmp_power(Some(pmp_s2r_power)) };
+        }
         Ok(PmpDriver(data))
     }
+}
+
+/// The running PMP, for the t6050 suspend-to-RAM idle/wake hook.
+#[cfg(CONFIG_APPLE_S2R_T6050)]
+static PMP_FOR_S2R: core::sync::atomic::AtomicPtr<PmpData> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Suspend-to-RAM hook: idle the PMP (AP and IOP power IDLE) before a system sleep, or wake it
+/// again after an aborted entry. Called from the suspend path, process context.
+#[cfg(CONFIG_APPLE_S2R_T6050)]
+unsafe extern "C" fn pmp_s2r_power(idle: bool) -> core::ffi::c_int {
+    let p = PMP_FOR_S2R.load(core::sync::atomic::Ordering::Acquire);
+    if p.is_null() {
+        return ENODEV.to_errno();
+    }
+    // SAFETY: set from the PmpData that PmpDriver holds; Drop clears the pointer first.
+    let data = unsafe { &*p };
+    let mut guard = data.rtkit.lock();
+    let r = match guard.as_mut().as_pin_mut() {
+        None => Err(ENODEV),
+        Some(rtk) => {
+            if idle {
+                rtk.idle()
+            } else {
+                rtk.wake()
+            }
+        }
+    };
+    match r {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
+#[cfg(CONFIG_APPLE_S2R_T6050)]
+extern "C" {
+    /// Built-in (apple-s2r-t6050.c): the suspend-to-RAM entry's PMP idle/wake hook.
+    fn apple_s2r_set_pmp_power(f: Option<unsafe extern "C" fn(bool) -> core::ffi::c_int>);
 }
 
 module_platform_driver! {
