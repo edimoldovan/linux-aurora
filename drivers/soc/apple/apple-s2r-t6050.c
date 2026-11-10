@@ -77,7 +77,19 @@ static bool park_clocks = true;
 module_param(park_clocks, bool, 0644);
 MODULE_PARM_DESC(park_clocks, "park the SoC clkgen muxes and clear SIO auto-enable before the commit");
 
+static unsigned int stop_after;
+module_param(stop_after, uint, 0644);
+MODULE_PARM_DESC(stop_after, "bisect the entry: spin with IRQs off after step N (1 watchdogs, 2 clocks, 3 AIC, 4 S2R timer; 0 = run it all)");
+
 static void __iomem *pmgr, *clkgen, *s2r_timer, *wdt;
+
+static void s2r_stop(unsigned int step)
+{
+	if (stop_after != step)
+		return;
+	for (;;)
+		cpu_relax();
+}
 
 static int __init apple_s2r_setup(char *arg)
 {
@@ -118,16 +130,20 @@ static int apple_s2r_enter(suspend_state_t state)
 
 	writel_relaxed(0, wdt + WDT_WD0_CTRL);
 	writel_relaxed(0, wdt + WDT_WD1_CTRL);
+	s2r_stop(1);
 
 	if (park_clocks)
 		s2r_quiesce_clocks();
+	s2r_stop(2);
 
 	apple_aic_mask_all();
+	s2r_stop(3);
 
 	for (i = 0; i < 3; i++) {
 		writel_relaxed(s2r_timer_val, s2r_timer);
 		dsb(sy);
 	}
+	s2r_stop(4);
 
 	apple_t6050_deep_wfi();
 	return 0;
