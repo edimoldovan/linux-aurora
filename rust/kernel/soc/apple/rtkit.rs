@@ -292,6 +292,13 @@ impl<T: Operations> RtKit<T> {
         self.retain_shared_buffers = true;
     }
 
+    /// Sets only the AP power state the coprocessor sees (e.g. 0x201 IDLE before a system sleep,
+    /// 0x20 ON after it); the coprocessor itself keeps running.
+    pub fn set_ap_power(self: Pin<&mut Self>, state: u32) -> Result {
+        // SAFETY: `rtk` is valid per the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_set_ap_power(self.rtk, state) })
+    }
+
     /// Puts the RTKit coprocessor to idle (AP and IOP power state IDLE); wake() brings it back.
     pub fn idle(self: Pin<&mut Self>) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.

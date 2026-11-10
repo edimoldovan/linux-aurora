@@ -613,8 +613,8 @@ impl platform::Driver for PmpDriver {
 static PMP_FOR_S2R: core::sync::atomic::AtomicPtr<PmpData> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
-/// Suspend-to-RAM hook: idle the PMP (AP and IOP power IDLE) before a system sleep, or wake it
-/// again after an aborted entry. Called from the suspend path, process context.
+/// Suspend-to-RAM hook: tell the PMP the AP goes idle (AP power 0x201) before a system sleep, or
+/// back on (0x20) after an aborted entry. Called from the suspend path, process context.
 #[cfg(CONFIG_APPLE_S2R_T6050)]
 unsafe extern "C" fn pmp_s2r_power(idle: bool) -> core::ffi::c_int {
     let p = PMP_FOR_S2R.load(core::sync::atomic::Ordering::Acquire);
@@ -627,11 +627,9 @@ unsafe extern "C" fn pmp_s2r_power(idle: bool) -> core::ffi::c_int {
     let r = match guard.as_mut().as_pin_mut() {
         None => Err(ENODEV),
         Some(rtk) => {
-            if idle {
-                rtk.idle()
-            } else {
-                rtk.wake()
-            }
+            // The PMP keeps running through the sleep: it powers the clusters down itself, so
+            // only its view of the AP changes (IDLE 0x201, back to ON 0x20).
+            rtk.set_ap_power(if idle { 0x201 } else { 0x20 })
         }
     };
     match r {
