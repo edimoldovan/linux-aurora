@@ -59,13 +59,17 @@ static const u32 clkgen_muxes[] = { 0x90, 0x94, 0xa0, 0xa4 };
 #define T6050_S2R_TIMER			0x288f04000ULL
 
 /*
- * AP wake-source enables in the AOP global block (pmgr reg[59] 0x2388000000 + 0x400c, 10 words; a set
- * bit enables that source, AppleT6050PMGR::setAPWakeupSources writes valid & ~mask). Source id n is
- * word n / 32, bit n % 32. The power button arrives as SMC.CPUWakeupAP, id 122 (ADT ap-wake-sources).
+ * AP wake-source enables in die 0's AOP global block (RegMap id 0x42 = pmgr reg[12] 0x288000000,
+ * + 0x400c, 11 words; a set bit enables that source, AppleT6050PMGR::setAPWakeupSources writes
+ * valid & ~mask). Source id n is word n / 32, bit n % 32. The power button arrives as
+ * SMC.CPUWakeupAP, id 122 (ADT ap-wake-sources).
  */
-#define T6050_AOP_GLOBAL		0x2388000000ULL
+#define T6050_AOP_GLOBAL		0x288000000ULL
 #define AOP_WAKE_EN(i)			(0x400c + 4 * (i))
-#define AOP_WAKE_WORDS			10
+#define AOP_WAKE_WORDS			11
+
+/* S2R count (MiniPMGR, pmgr reg[9] 0x288300000 + 0x70a70; ApplePMGR::_getS2RLoCount) */
+#define T6050_S2R_COUNT			0x288370a70ULL
 #define WAKE_SRC_SMC			122
 
 /* AON watchdog (/arm-io/wdt reg[0]) */
@@ -95,7 +99,7 @@ static bool wake_power_only = true;
 module_param(wake_power_only, bool, 0644);
 MODULE_PARM_DESC(wake_power_only, "enable only the SMC wake source (power button) before the commit");
 
-static void __iomem *pmgr, *clkgen, *s2r_timer, *wdt, *aop;
+static void __iomem *pmgr, *clkgen, *s2r_timer, *wdt, *aop, *s2r_count;
 
 static void s2r_stop(unsigned int step)
 {
@@ -251,16 +255,17 @@ static int __init apple_s2r_init(void)
 	s2r_timer = ioremap_np(T6050_S2R_TIMER, SZ_4K);
 	wdt = ioremap_np(T6050_WDT, SZ_4K);
 	aop = ioremap_np(T6050_AOP_GLOBAL, SZ_32K);
-	if (!pmgr || !clkgen || !s2r_timer || !wdt || !aop) {
+	s2r_count = ioremap_np(T6050_S2R_COUNT, 4);
+	if (!pmgr || !clkgen || !s2r_timer || !wdt || !aop || !s2r_count) {
 		pr_err("cannot map the PMGR windows\n");
 		return -ENOMEM;
 	}
 
-	pr_info("AP wake enables now: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+	pr_info("AP wake enables now: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x; S2R count %08x\n",
 		readl(aop + AOP_WAKE_EN(0)), readl(aop + AOP_WAKE_EN(1)), readl(aop + AOP_WAKE_EN(2)),
 		readl(aop + AOP_WAKE_EN(3)), readl(aop + AOP_WAKE_EN(4)), readl(aop + AOP_WAKE_EN(5)),
 		readl(aop + AOP_WAKE_EN(6)), readl(aop + AOP_WAKE_EN(7)), readl(aop + AOP_WAKE_EN(8)),
-		readl(aop + AOP_WAKE_EN(9)));
+		readl(aop + AOP_WAKE_EN(9)), readl(aop + AOP_WAKE_EN(10)), readl(s2r_count));
 
 	/* Probe: does the wake-enable word keep a written value? Restored right after. */
 	{
