@@ -411,7 +411,9 @@ static int centauri_suspend(struct device *dev)
 	struct centauri *c = pci_get_drvdata(pdev);
 
 	guard(mutex)(&c->boot_lock);
-	if (c->boot_phase != CEN_BOOT_READY)
+	/* Only a startup in progress holds suspend off; a failed or stopped N1 has nothing running. */
+	if (c->boot_phase == CEN_BOOT_ROM || c->boot_phase == CEN_BOOT_CYCLE ||
+	    c->boot_phase == CEN_BOOT_IPC)
 		return -EBUSY;
 	return pci_save_state(pdev);
 }
