@@ -194,3 +194,24 @@ SYM_FUNC_START(apple_t6050_deep_wfi)
 	msr	s3_5_c15_c1_1, x9
 	b	1b
 SYM_FUNC_END(apple_t6050_deep_wfi)
+
+/*
+ * apple_t6050_deep_wfi_once() - as apple_t6050_deep_wfi, MMU on, but a WFI that returns acknowledges
+ * the IPI status and returns to the caller. A core that power-gates never returns from the WFI.
+ */
+SYM_FUNC_START(apple_t6050_deep_wfi_once)
+	mrs	x9, s3_1_c15_c7_4
+	bic	x9, x9, #1
+	msr	s3_1_c15_c7_4, x9
+	isb
+	mrs	x1, s3_5_c15_c6_2
+	orr	x1, x1, #0x1
+	orr	x1, x1, #0x8000000000000000
+	msr	s3_5_c15_c6_2, x1
+	dsb	sy
+	isb
+	wfi
+	mov	x9, #1
+	msr	s3_5_c15_c1_1, x9
+	ret
+SYM_FUNC_END(apple_t6050_deep_wfi_once)
