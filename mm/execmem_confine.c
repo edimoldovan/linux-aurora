@@ -36,7 +36,7 @@
 #include <asm/tlbflush.h>
 
 #include "internal.h"
-#include "vmalloc.h"
+
 
 struct confine_chunk {
 	struct vm_struct	*area;
